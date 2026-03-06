@@ -146,12 +146,19 @@ async fn run_proxy(config: Config) -> Result<()> {
     }
     
     // Create TUN device
+    let dns_servers: Vec<std::net::SocketAddr> = config
+        .effective_dns_servers()
+        .into_iter()
+        .map(|entry| entry.address)
+        .collect();
+
     let tun_device = TunDevice::new(
         &config.tun.name,
         config.tun.ip,
         config.tun.netmask,
         if ipv6_enabled { Some(config.tun.ipv6) } else { None },
         config.tun.ipv6_prefix,
+        &dns_servers,
     ).await?;
     
     info!("TUN device created: {}", config.tun.name);

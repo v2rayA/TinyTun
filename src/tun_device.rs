@@ -23,6 +23,7 @@ impl TunDevice {
         netmask: Ipv4Addr,
         ipv6: Option<Ipv6Addr>,
         ipv6_prefix: u8,
+        dns_servers: &[SocketAddr],
     ) -> Result<Self> {
         info!("Creating TUN device: {}", name);
         
@@ -65,7 +66,7 @@ impl TunDevice {
         info!("TUN device created: {}", device_name);
         
         // Set up the interface
-        Self::setup_interface(&device_name, ip, netmask, ipv6, ipv6_prefix)?;
+        Self::setup_interface(&device_name, ip, netmask, ipv6, ipv6_prefix, dns_servers)?;
         
         let (writer, reader) = device.split()?;
         let reader = Arc::new(Mutex::new(reader));
@@ -84,6 +85,7 @@ impl TunDevice {
         _netmask: Ipv4Addr,
         _ipv6: Option<Ipv6Addr>,
         _ipv6_prefix: u8,
+        _dns_servers: &[SocketAddr],
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -135,6 +137,7 @@ impl TunDevice {
             let name = _name;
             let ipv6 = _ipv6;
             let ipv6_prefix = _ipv6_prefix;
+            let dns_servers = _dns_servers;
 
             // On Windows, the interface setup is typically handled by the tun-rs library
             // or may require administrative privileges for additional configuration
@@ -160,6 +163,117 @@ impl TunDevice {
                         name,
                         String::from_utf8_lossy(&output.stderr)
                     );
+                }
+            }
+
+            let dns_v4: Vec<Ipv4Addr> = dns_servers
+                .iter()
+                .filter_map(|addr| match addr {
+                    SocketAddr::V4(v4) => Some(*v4.ip()),
+                    SocketAddr::V6(_) => None,
+                })
+                .take(2)
+                .collect();
+
+            if let Some(primary) = dns_v4.first() {
+                let output = Command::new("netsh")
+                    .args([
+                        "interface",
+                        "ipv4",
+                        "set",
+                        "dnsservers",
+                        &format!("name={}", name),
+                        "source=static",
+                        &format!("address={}", primary),
+                        "validate=no",
+                    ])
+                    .output()?;
+
+                if !output.status.success() {
+                    warn!(
+                        "Failed to set primary IPv4 DNS for {}: {}",
+                        name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                } else {
+                    if let Some(server) = dns_v4.get(1) {
+                        let output = Command::new("netsh")
+                            .args([
+                                "interface",
+                                "ipv4",
+                                "add",
+                                "dnsservers",
+                                &format!("name={}", name),
+                                &format!("address={}", server),
+                                "index=2",
+                                "validate=no",
+                            ])
+                            .output()?;
+
+                        if !output.status.success() {
+                            warn!(
+                                "Failed to add IPv4 DNS {} for {}: {}",
+                                server,
+                                name,
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                        }
+                    }
+                }
+            }
+
+            let dns_v6: Vec<Ipv6Addr> = dns_servers
+                .iter()
+                .filter_map(|addr| match addr {
+                    SocketAddr::V4(_) => None,
+                    SocketAddr::V6(v6) => Some(*v6.ip()),
+                })
+                .take(2)
+                .collect();
+
+            if let Some(primary) = dns_v6.first() {
+                let output = Command::new("netsh")
+                    .args([
+                        "interface",
+                        "ipv6",
+                        "set",
+                        "dnsservers",
+                        &format!("interface={}", name),
+                        &format!("address={}", primary),
+                        "validate=no",
+                    ])
+                    .output()?;
+
+                if !output.status.success() {
+                    warn!(
+                        "Failed to set primary IPv6 DNS for {}: {}",
+                        name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                } else {
+                    if let Some(server) = dns_v6.get(1) {
+                        let output = Command::new("netsh")
+                            .args([
+                                "interface",
+                                "ipv6",
+                                "add",
+                                "dnsservers",
+                                &format!("interface={}", name),
+                                &format!("address={}", server),
+                                "index=2",
+                                "validate=no",
+                            ])
+                            .output()?;
+
+                        if !output.status.success() {
+                            warn!(
+                                "Failed to add IPv6 DNS {} for {}: {}",
+                                server,
+                                name,
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                        }
+                    }
                 }
             }
         }
