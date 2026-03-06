@@ -56,15 +56,6 @@ jobs:
           - target: x86_64-unknown-freebsd
             runner: ubuntu-latest
             build_tool: cross
-          - target: aarch64-unknown-freebsd
-            runner: ubuntu-latest
-            build_tool: cross
-          - target: x86_64-unknown-openbsd
-            runner: ubuntu-latest
-            build_tool: cross
-          - target: aarch64-unknown-openbsd
-            runner: ubuntu-latest
-            build_tool: cross
 
     steps:
       - name: Checkout
