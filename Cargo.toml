@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
 description = "A Rust-based tun2socks implementation with SOCKS5 support and DNS handling"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 # TUN device management
