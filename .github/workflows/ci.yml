@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BIN_NAME: tinytun
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: ubuntu-latest
+            build_tool: xwin
+          - target: aarch64-pc-windows-msvc
+            runner: ubuntu-latest
+            build_tool: xwin
+          - target: x86_64-pc-windows-gnu
+            runner: ubuntu-latest
+            build_tool: cross
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+            build_tool: cross
+
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            build_tool: cross
+
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            build_tool: cargo
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            build_tool: cargo
+
+          - target: x86_64-unknown-freebsd
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: aarch64-unknown-freebsd
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: x86_64-unknown-openbsd
+            runner: ubuntu-latest
+            build_tool: cross
+          - target: aarch64-unknown-openbsd
+            runner: ubuntu-latest
+            build_tool: cross
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.build_tool == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install cargo-xwin
+        if: matrix.build_tool == 'xwin'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      - name: Build (cargo)
+        if: matrix.build_tool == 'cargo'
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.build_tool == 'cross'
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Build (xwin, static CRT)
+        if: matrix.build_tool == 'xwin'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo xwin build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="dist/${{ matrix.target }}"
+          mkdir -p "$out_dir"
+
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            artifact_bin="${BIN_NAME}-${{ matrix.target }}.exe"
+            cp "target/${{ matrix.target }}/release/${BIN_NAME}.exe" "$out_dir/$artifact_bin"
+          else
+            artifact_bin="${BIN_NAME}-${{ matrix.target }}"
+            cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$out_dir/$artifact_bin"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinytun-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Download Wintun binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+          unzip -q wintun.zip -d wintun
+
+      - name: Build release zips and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          mkdir -p release
+
+          for artifact_dir in artifacts/tinytun-*; do
+            target="${artifact_dir#artifacts/tinytun-}"
+            package_dir="pkg/tinytun-${tag}-${target}"
+            mkdir -p "$package_dir"
+
+            if [[ "$target" == *"windows"* ]]; then
+              artifact_bin="${BIN_NAME}-${target}.exe"
+              cp "$artifact_dir/$artifact_bin" "$package_dir/$artifact_bin"
+
+              if [[ "$target" == x86_64-* ]]; then
+                cp wintun/wintun/bin/amd64/wintun.dll "$package_dir/wintun.dll"
+              elif [[ "$target" == aarch64-* ]]; then
+                cp wintun/wintun/bin/arm64/wintun.dll "$package_dir/wintun.dll"
+              fi
+            else
+              artifact_bin="${BIN_NAME}-${target}"
+              cp "$artifact_dir/$artifact_bin" "$package_dir/$artifact_bin"
+            fi
+
+            (
+              cd "$package_dir"
+              zip -q -r "../../release/$(basename "$package_dir").zip" .
+            )
+          done
+
+          (
+            cd release
+            sha256sum *.zip > hash.txt
+          )
+
+      - name: Upload release bundles as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundles-${{ github.ref_name }}
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/hash.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
