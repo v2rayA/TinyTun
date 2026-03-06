@@ -1,229 +1,171 @@
 # TinyTun
 
-A Rust-based tun2socks implementation built on top of [tun-rs](https://github.com/tun-rs/tun-rs) that provides SOCKS5 proxy functionality with DNS support and IP filtering capabilities.
+TinyTun is a Rust-based `tun2socks` project that captures traffic from a TUN interface and forwards eligible traffic through a SOCKS5 proxy, with DNS forwarding and filtering support.
 
 ## Features
 
-- **SOCKS5 Proxy Support**: Connect to SOCKS5 proxies with optional authentication
-- **DNS Over SOCKS5**: Route DNS queries through the SOCKS5 proxy for enhanced privacy
-- **IP Address Filtering**: Skip defined IP addresses and networks from proxying
-- **DNS Rerouting**: Intercept and reroute DNS requests to upstream servers
-- **TUN Device Management**: Automatic TUN device creation and cleanup
-- **Configuration File Support**: JSON-based configuration with CLI overrides
+- SOCKS5 forwarding for TCP flows
+- DNS forwarding with per-server route mode (`direct` or `proxy`)
+- IP/network/port filtering rules
+- JSON configuration file with CLI overrides
+- IPv4 + optional IPv6 TUN settings
+- Optional automatic route setup/cleanup
+
+## Project Status
+
+TinyTun is functional for common SOCKS5 + DNS use cases, but it is still evolving.
+
+- DNS forwarding is supported.
+- UDP proxying is not a full generic SOCKS5 UDP implementation yet.
+- Advanced TCP edge cases may still need refinement.
 
 ## Requirements
 
-- Rust 1.70+ 
-- Administrative privileges (required for TUN device creation)
-- Linux, Windows, or macOS
+- Rust 1.70+
+- Administrator/root privileges to create and manage TUN interfaces
+- Supported OS: Windows, Linux, macOS
+- On Windows: `wintun.dll` must be available next to `tinytun.exe` or in `PATH`
 
-## Installation
+## Build
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/TinyTun.git
-cd TinyTun
-```
-
-2. Build the project:
 ```bash
 cargo build --release
 ```
 
+Binary path:
+
+- Linux/macOS: `target/release/tinytun`
+- Windows: `target/release/tinytun.exe`
+
 ## Usage
 
-### Basic Usage
+### 1) Run With Config File
 
-Run with default configuration:
 ```bash
-sudo ./target/release/tinytun run
+tinytun run --config config.json
 ```
 
-### With Configuration File
+On Linux/macOS, run with elevated privileges if required:
 
 ```bash
 sudo ./target/release/tinytun run --config config.json
 ```
 
-### With CLI Arguments
+On Windows, start PowerShell or CMD as Administrator, then run:
+
+```powershell
+.\target\release\tinytun.exe run --config .\config.json
+```
+
+### 2) Run With CLI Overrides
 
 ```bash
-sudo ./target/release/tinytun run \
+tinytun run \
   --socks5 127.0.0.1:1080 \
   --dns 8.8.8.8:53 --dns-route direct \
   --dns 1.1.1.1:53 --dns-route proxy \
   --interface tun0 \
-  --ip 10.0.0.1 \
-  --netmask 255.255.255.0
+  --ip 198.18.0.1 \
+  --netmask 255.255.255.255 \
+  --ipv6-mode auto \
+  --auto-route
 ```
 
-### With Authentication
+Notes:
+
+- `--dns` and `--dns-route` are repeatable and paired by order.
+- DNS capture on TUN path uses port `53`.
+- You can combine `--config` with CLI flags; CLI values override config values.
+
+### 3) CLI Help
 
 ```bash
-sudo ./target/release/tinytun run --config config.json
+tinytun --help
+tinytun run --help
 ```
 
-Where `config.json` contains:
-```json
-{
-  "socks5": {
-    "address": "proxy.example.com:1080",
-    "username": "your_username",
-    "password": "your_password",
-    "dns_over_socks5": true
-  }
-}
-```
+## Configuration Reference
 
-## Configuration
+Example `config.json`:
 
-The configuration file (`config.json`) supports the following options:
-
-### TUN Device Configuration
 ```json
 {
   "tun": {
     "name": "tun0",
-    "ip": "10.0.0.1",
-    "netmask": "255.255.255.0",
+    "ip": "198.18.0.1",
+    "netmask": "255.255.255.255",
+    "ipv6_mode": "auto",
+    "ipv6": "fd00::1",
+    "ipv6_prefix": 128,
+    "auto_route": false,
     "mtu": 1500
-  }
-}
-```
-
-### SOCKS5 Configuration
-```json
-{
+  },
   "socks5": {
     "address": "127.0.0.1:1080",
     "username": null,
     "password": null,
     "dns_over_socks5": true
-  }
-}
-```
-
-### DNS Configuration
-```json
-{
+  },
   "dns": {
     "upstream_server": "8.8.8.8:53",
     "servers": [
-      { "address": "8.8.8.8:53", "route": "direct" },
-      { "address": "1.1.1.1:53", "route": "proxy" }
+      {
+        "address": "8.8.8.8:53",
+        "route": "direct"
+      },
+      {
+        "address": "1.1.1.1:53",
+        "route": "proxy"
+      }
     ],
     "listen_port": 53,
     "timeout_ms": 5000
-  }
-}
-```
-
-### Filtering Configuration
-```json
-{
+  },
   "filtering": {
-    "skip_ips": ["127.0.0.1", "10.0.0.1"],
-    "skip_networks": ["192.168.0.0/16", "10.0.0.0/8"],
-    "block_ports": [22, 23, 25],
+    "skip_ips": ["127.0.0.1", "198.18.0.1"],
+    "skip_networks": [
+      "192.168.0.0/16",
+      "172.16.0.0/12",
+      "10.0.0.0/8",
+      "127.0.0.0/8",
+      "169.254.0.0/16"
+    ],
+    "block_ports": [22, 23, 25, 110, 143],
     "allow_ports": [80, 443, 53]
   }
 }
 ```
 
-## How It Works
-
-1. **TUN Device Creation**: Creates a virtual network interface that captures IP packets
-2. **Packet Processing**: Analyzes incoming packets and determines routing
-3. **Filtering**: Applies IP and port filtering rules to skip certain traffic
-4. **SOCKS5 Proxying**: Routes eligible TCP connections through the SOCKS5 proxy
-5. **DNS Handling**: Intercepts DNS requests and forwards them to configured servers
-
-## Supported Protocols
-
-- **TCP**: Full SOCKS5 proxy support with connection establishment
-- **UDP**: Basic support (DNS requests are handled, other UDP traffic is logged)
-- **DNS**: Multi-upstream DNS forwarding with per-server `direct`/`proxy` route
-
-## Limitations
-
-- UDP proxying through SOCKS5 is not fully implemented (only DNS is supported)
-- Bidirectional TCP proxying requires more complex state management
-- Requires administrative privileges for TUN device creation
-- DNS response injection path is currently IPv4 UDP-focused
-
-## Security Considerations
-
-- Always use strong authentication for SOCKS5 proxies
-- Be cautious with DNS server selection to avoid DNS hijacking
-- Filter sensitive local networks from being proxied
-- Monitor logs for any unexpected connection attempts
-
 ## Troubleshooting
 
-### Permission Errors
-Ensure you're running with sufficient privileges:
-```bash
-sudo ./target/release/tinytun run
-```
+- Permission errors: run as Administrator/root.
+- Windows `LoadLibraryExW` / `wintun.dll` error: place `wintun.dll` next to the executable or add its directory to `PATH`.
+- Linux TUN issues: ensure TUN module is loaded (`sudo modprobe tun`).
 
-On Windows, run the terminal as Administrator before starting TinyTun.
+## Copyright
 
-### Wintun Runtime Errors (Windows)
-If startup fails with `wintun.dll`/`LoadLibraryExW` errors, place `wintun.dll` in the same directory as `tinytun.exe` (for example `target/release`) or add the DLL directory to `PATH`.
+Copyright (c) 2026 TinyTun contributors.
 
-### TUN Device Issues
-On Linux, ensure the `tun` module is loaded:
-```bash
-sudo modprobe tun
-```
-
-### Network Configuration
-After starting TinyTun, you may need to configure routing:
-```bash
-# Add route for traffic to go through the TUN interface
-sudo ip route add 10.0.0.0/24 dev tun0
-```
-
-## Development
-
-### Building
-```bash
-cargo build
-```
-
-### Testing
-```bash
-cargo test
-```
-
-### Running with Debug Output
-```bash
-RUST_LOG=debug sudo ./target/debug/tinytun run
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+This project includes or links to third-party open source software. Their copyrights remain with their respective authors.
 
 ## License
 
-MIT License - see LICENSE file for details.
+TinyTun is licensed under **GNU General Public License v3.0 or later (GPL-3.0-or-later)**. See `LICENSE`.
 
-## Dependencies
+Why GPL-3.0-or-later for this project:
 
-- `tun`: TUN device management
-- `tokio`: Async runtime
-- `etherparse`: Packet parsing
-- `clap`: CLI argument parsing
-- `serde`: Configuration serialization
-- `log`: Logging framework
+- TinyTun currently depends on `socks5-impl`, which is licensed under `GPL-3.0-or-later`.
+- To keep distribution terms compliant with upstream licensing, this project adopts a compatible GPL license.
 
-## Related Projects
+If the GPL dependency is replaced in the future, relicensing options can be re-evaluated by the maintainers.
 
-- [tun-rs](https://github.com/tun-rs/tun-rs): TUN device library
-- [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust): Shadowsocks implementation
-- [badvpn](https://github.com/ambrop72/badvpn): Alternative tun2socks implementation
+## Third-Party Notices
+
+Key dependencies include:
+
+- `socks5-impl` - GPL-3.0-or-later
+- `tun` - WTFPL
+- `clap`, `serde`, `etherparse`, `trust-dns-*` - MIT OR Apache-2.0
+- `tokio` - MIT
+
+Please refer to each dependency's own repository and license text for full details.
