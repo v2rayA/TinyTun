@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use etherparse::{
     Ipv4HeaderSlice, Ipv6HeaderSlice, PacketBuilder, TcpHeaderSlice, UdpHeader, UdpHeaderSlice,
@@ -41,6 +41,8 @@ struct TcpSession {
 struct TcpFlowState {
     client_next_seq: u32,
     server_next_seq: u32,
+    server_acked_seq: u32,
+    client_window: u16,
     reorder_buffer: BTreeMap<u32, Vec<u8>>,
     reorder_bytes: usize,
     lifecycle: TcpLifecycle,
@@ -282,6 +284,8 @@ impl PacketProcessor {
                                 state: Arc::new(Mutex::new(TcpFlowState {
                                     client_next_seq: client_isn.wrapping_add(1),
                                     server_next_seq: 1,
+                                    server_acked_seq: 1,
+                                    client_window: 65535,
                                     reorder_buffer: BTreeMap::new(),
                                     reorder_bytes: 0,
                                     lifecycle: TcpLifecycle::SynReceived,
@@ -394,6 +398,12 @@ impl PacketProcessor {
         if tcp_header.ack() {
             let should_close = {
                 let mut state = session.state.lock().await;
+                // Track peer ACK/window for reverse flow-control.
+                state.client_window = tcp_header.window_size();
+                if Self::seq_at_or_after(tcp_header.acknowledgment_number(), state.server_acked_seq) {
+                    state.server_acked_seq = tcp_header.acknowledgment_number();
+                }
+
                 if state.lifecycle == TcpLifecycle::FinSent
                     && tcp_header.acknowledgment_number() == state.server_next_seq
                 {
@@ -803,6 +813,36 @@ impl PacketProcessor {
                 let payload = &buffer[..read_size];
                 let mut chunk_write_failed = false;
                 for chunk in payload.chunks(max_payload_per_packet) {
+                    // Respect the client's advertised TCP receive window to avoid
+                    // overrun-induced stalls on high-throughput downloads.
+                    loop {
+                        let (terminated, can_send) = {
+                            let state = session.state.lock().await;
+                            if state.lifecycle == TcpLifecycle::Closed || state.lifecycle == TcpLifecycle::FinSent {
+                                (true, false)
+                            } else {
+                                let in_flight = state.server_next_seq.wrapping_sub(state.server_acked_seq) as usize;
+                                let wnd = usize::from(state.client_window).max(1);
+                                (false, in_flight + chunk.len() <= wnd)
+                            }
+                        };
+
+                        if terminated {
+                            chunk_write_failed = true;
+                            break;
+                        }
+
+                        if can_send {
+                            break;
+                        }
+
+                        sleep(Duration::from_millis(2)).await;
+                    }
+
+                    if chunk_write_failed {
+                        break;
+                    }
+
                     let (sequence_number, acknowledgment_number) = {
                         let mut state = session.state.lock().await;
                         if state.lifecycle == TcpLifecycle::SynReceived {
