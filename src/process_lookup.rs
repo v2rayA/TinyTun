@@ -1,5 +1,13 @@
 use std::net::SocketAddr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Path;
+
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
+
+use netstat2::{
+    get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo,
+};
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
@@ -21,10 +29,17 @@ pub struct ProcessLookupOptions {
 
 impl ProcessLookupOptions {
     pub fn from_config(config: &crate::config::Config) -> Self {
-        let _ = config;
-        Self {
-            #[cfg(target_os = "linux")]
-            linux: config.filtering.process_lookup.clone(),
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                linux: config.filtering.process_lookup.clone(),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = config;
+            Self {}
         }
     }
 }
@@ -35,62 +50,16 @@ pub fn find_process_name_for_flow(
     src: SocketAddr,
     dst: SocketAddr,
 ) -> Option<String> {
-    let _ = options;
-    #[cfg(windows)]
-    {
-        return find_process_name_for_flow_windows(protocol, src, dst);
-    }
-
     #[cfg(target_os = "linux")]
     {
         return find_process_name_for_flow_linux(options, protocol, src, dst);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
-        return find_process_name_for_flow_macos(protocol, src, dst);
+        let _ = options;
+        find_process_name_for_flow_netstat2(protocol, src, dst)
     }
-
-    #[allow(unreachable_code)]
-    None
-}
-
-#[cfg(windows)]
-fn find_process_name_for_flow_windows(
-    protocol: TransportProtocol,
-    src: SocketAddr,
-    dst: SocketAddr,
-) -> Option<String> {
-    let script = match protocol {
-        TransportProtocol::Tcp => format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $conn = Get-NetTCPConnection -State SynSent,Established,CloseWait,FinWait1,FinWait2,TimeWait -ErrorAction SilentlyContinue | \
-                 Where-Object {{ $_.LocalPort -eq {src_port} -and $_.RemotePort -eq {dst_port} -and $_.RemoteAddress -eq '{dst_ip}' }} | \
-                 Select-Object -First 1; \
-             if ($conn) {{ \
-                 $p = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue; \
-                 if ($p) {{ $p.ProcessName }} \
-             }}",
-            src_port = src.port(),
-            dst_port = dst.port(),
-            dst_ip = ps_single_quote(&dst.ip().to_string())
-        ),
-        TransportProtocol::Udp => format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $ep = Get-NetUDPEndpoint -ErrorAction SilentlyContinue | \
-                 Where-Object {{ $_.LocalPort -eq {src_port} }} | \
-                 Select-Object -First 1; \
-             if ($ep) {{ \
-                 $p = Get-Process -Id $ep.OwningProcess -ErrorAction SilentlyContinue; \
-                 if ($p) {{ $p.ProcessName }} \
-             }}",
-            src_port = src.port(),
-        ),
-    };
-
-    run_and_capture("powershell", &["-NoProfile", "-Command", &script])
 }
 
 #[cfg(target_os = "linux")]
@@ -107,12 +76,13 @@ fn find_process_name_for_flow_linux(
     }
 
     if backend == "ss" {
-        return find_process_name_for_flow_linux_ss(protocol, src, dst);
+        // Keep backward-compatible config value, but now use netstat2 instead of shelling out to ss.
+        return find_process_name_for_flow_netstat2(protocol, src, dst);
     }
 
-    // auto: prefer eBPF cache if present, then fallback to ss.
+    // auto: prefer eBPF cache if present, then fallback to netstat2.
     find_process_name_for_flow_linux_ebpf(options, protocol, src, dst)
-        .or_else(|| find_process_name_for_flow_linux_ss(protocol, src, dst))
+        .or_else(|| find_process_name_for_flow_netstat2(protocol, src, dst))
 }
 
 #[cfg(target_os = "linux")]
@@ -163,106 +133,113 @@ fn find_process_name_for_flow_linux_ebpf(
     None
 }
 
-#[cfg(target_os = "linux")]
-fn find_process_name_for_flow_linux_ss(
+fn find_process_name_for_flow_netstat2(
     protocol: TransportProtocol,
     src: SocketAddr,
     dst: SocketAddr,
 ) -> Option<String> {
-    let output = match protocol {
-        TransportProtocol::Tcp => run_and_capture(
-            "ss",
-            &[
-                "-tnp",
-                &format!(
-                    "sport = :{} and dport = :{}",
-                    src.port(),
-                    dst.port()
-                ),
-            ],
-        ),
-        TransportProtocol::Udp => run_and_capture(
-            "ss",
-            &[
-                "-unp",
-                &format!("sport = :{}", src.port()),
-            ],
-        ),
-    }?;
-
-    parse_linux_ss_process_name(&output)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_ss_process_name(ss_output: &str) -> Option<String> {
-    let marker = "users:((\"";
-    let start = ss_output.find(marker)? + marker.len();
-    let rest = &ss_output[start..];
-    let end = rest.find('"')?;
-    let name = rest[..end].trim();
-    if name.is_empty() {
-        None
+    let af_flags = if src.is_ipv4() && dst.is_ipv4() {
+        AddressFamilyFlags::IPV4
+    } else if src.is_ipv6() && dst.is_ipv6() {
+        AddressFamilyFlags::IPV6
     } else {
-        Some(name.to_string())
-    }
-}
+        AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6
+    };
 
-#[cfg(target_os = "macos")]
-fn find_process_name_for_flow_macos(
-    protocol: TransportProtocol,
-    src: SocketAddr,
-    dst: SocketAddr,
-) -> Option<String> {
-    let output = match protocol {
-        TransportProtocol::Tcp => run_and_capture(
-            "lsof",
-            &[
-                "-nP",
-                &format!("-iTCP:{}", src.port()),
-            ],
-        ),
-        TransportProtocol::Udp => run_and_capture(
-            "lsof",
-            &[
-                "-nP",
-                &format!("-iUDP:{}", src.port()),
-            ],
-        ),
-    }?;
+    let proto_flags = match protocol {
+        TransportProtocol::Tcp => ProtocolFlags::TCP,
+        TransportProtocol::Udp => ProtocolFlags::UDP,
+    };
 
-    parse_macos_lsof_process_name(&output, protocol, dst)
-}
+    let sockets = get_sockets_info(af_flags, proto_flags).ok()?;
 
-#[cfg(target_os = "macos")]
-fn parse_macos_lsof_process_name(
-    lsof_output: &str,
-    protocol: TransportProtocol,
-    dst: SocketAddr,
-) -> Option<String> {
-    for line in lsof_output.lines().skip(1) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.is_empty() {
+    for socket in sockets {
+        let matched = match socket.protocol_socket_info {
+            ProtocolSocketInfo::Tcp(tcp) => {
+                protocol == TransportProtocol::Tcp
+                    && tcp.local_port == src.port()
+                    && tcp.remote_port == dst.port()
+                    && tcp.local_addr == src.ip()
+                    && tcp.remote_addr == dst.ip()
+            }
+            ProtocolSocketInfo::Udp(udp) => {
+                // UDP often has no stable remote endpoint in kernel tables,
+                // so local tuple match is the reliable signal.
+                protocol == TransportProtocol::Udp
+                    && udp.local_port == src.port()
+                    && udp.local_addr == src.ip()
+            }
+        };
+
+        if !matched {
             continue;
         }
 
-        let name_col = cols[0].trim();
-        if name_col.is_empty() {
-            continue;
-        }
-
-        if protocol == TransportProtocol::Tcp {
-            let target = format!("->{}:{}", dst.ip(), dst.port());
-            if !line.contains(&target) {
-                continue;
+        if let Some(pid) = socket.associated_pids.first().copied() {
+            if let Some(name) = process_name_from_pid(pid) {
+                return Some(name);
             }
         }
-
-        return Some(name_col.to_string());
     }
 
     None
 }
 
+fn process_name_from_pid(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(name) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{}/cmdline", pid)) {
+            if let Some(raw_first) = cmdline.split(|b| *b == 0).next() {
+                if let Ok(text) = std::str::from_utf8(raw_first) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        let basename = Path::new(trimmed)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(trimmed);
+                        return Some(basename.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {}", pid);
+        if let Some(output) = run_and_capture("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"]) {
+            let first_line = output.lines().next().unwrap_or("").trim();
+            if let Some(name) = parse_tasklist_image_name(first_line) {
+                return Some(name);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(output) = run_and_capture("ps", &["-p", &pid.to_string(), "-o", "comm="]) {
+            let trimmed = output.trim();
+            if !trimmed.is_empty() {
+                let basename = Path::new(trimmed)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(trimmed);
+                return Some(basename.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn run_and_capture(cmd: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(cmd).args(args).output().ok()?;
     if !output.status.success() {
@@ -278,6 +255,24 @@ fn run_and_capture(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn ps_single_quote(value: &str) -> String {
-    value.replace('\'', "''")
+fn parse_tasklist_image_name(line: &str) -> Option<String> {
+    if line.is_empty() || line.starts_with("INFO:") {
+        return None;
+    }
+
+    if let Some(rest) = line.strip_prefix('"') {
+        let end = rest.find("\",")?;
+        let name = rest[..end].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+
+    let name = line.split(',').next().unwrap_or("").trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }

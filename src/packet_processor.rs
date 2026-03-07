@@ -1369,9 +1369,9 @@ impl PacketProcessor {
         let process_name = self.resolve_process_name_for_flow(protocol, src, dst).await;
         if let Some(name) = process_name {
             if self.config.is_excluded_process_name(&name) {
-                info!(
-                    "Process exclusion matched for {} on flow {} -> {}",
-                    name, src, dst
+                debug!(
+                    "Excluded process matched: process={} protocol={:?} flow={} -> {}",
+                    name, protocol, src, dst
                 );
                 return true;
             }
