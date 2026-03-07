@@ -99,7 +99,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     env_logger::init();
     
@@ -168,6 +168,10 @@ async fn run_proxy(config: Config) -> Result<()> {
 
     let mut auto_route_applied = false;
     if config.tun.auto_route {
+        if let Err(err) = route_manager::apply_skip_ip_routes(tun_device.name(), &config.filtering.skip_ips) {
+            warn!("Failed to apply skip_ip bypass routes: {}", err);
+        }
+
         match route_manager::apply_auto_routes(tun_device.name(), ipv6_enabled) {
             Ok(()) => {
                 auto_route_applied = true;
@@ -211,6 +215,10 @@ async fn run_proxy(config: Config) -> Result<()> {
     if auto_route_applied {
         if let Err(err) = route_manager::cleanup_auto_routes(tun_device.name(), ipv6_enabled) {
             warn!("Failed to cleanup automatic routes: {}", err);
+        }
+
+        if let Err(err) = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips) {
+            warn!("Failed to cleanup skip_ip bypass routes: {}", err);
         }
     }
 

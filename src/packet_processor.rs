@@ -78,8 +78,9 @@ impl Hash for FlowKey {
 
 impl PacketProcessor {
     const TCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    const TCP_FIN_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
     const TCP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
-    const TCP_REORDER_BUFFER_LIMIT: usize = 256 * 1024;
+    const TCP_REORDER_BUFFER_LIMIT: usize = 128 * 1024;
     const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub fn new(config: Config, tun_writer: Arc<Mutex<tun::DeviceWriter>>) -> Self {
@@ -793,12 +794,14 @@ impl PacketProcessor {
         mtu: usize,
     ) {
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; 8192];
             let header_overhead = match (flow_key.dst.ip(), flow_key.src.ip()) {
                 (IpAddr::V6(_), IpAddr::V6(_)) => 60, // IPv6(40) + TCP(20)
                 _ => 40, // IPv4(20) + TCP(20)
             };
             let max_payload_per_packet = mtu.saturating_sub(header_overhead).clamp(256, 1460);
+            // Keep per-flow read buffer bounded near MTU scale to reduce memory under many flows.
+            let read_buf_len = mtu.saturating_mul(2).clamp(2048, 4096);
+            let mut buffer = vec![0u8; read_buf_len];
 
             loop {
                 let read_size = match reader.read(&mut buffer).await {
@@ -951,7 +954,10 @@ impl PacketProcessor {
 
         for (flow_key, session) in snapshot {
             let state = session.state.lock().await;
+            let is_fin_wait_expired = state.lifecycle == TcpLifecycle::FinSent
+                && now.duration_since(state.last_activity) >= Self::TCP_FIN_WAIT_TIMEOUT;
             if state.lifecycle == TcpLifecycle::Closed
+                || is_fin_wait_expired
                 || now.duration_since(state.last_activity) >= Self::TCP_SESSION_IDLE_TIMEOUT
             {
                 expired.push(flow_key);
