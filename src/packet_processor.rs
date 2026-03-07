@@ -35,6 +35,7 @@ pub struct PacketProcessor {
     tcp_sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
     pending_connections: Arc<Mutex<HashSet<FlowKey>>>,
     udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+    udp_timeout_backoff: Arc<Mutex<HashMap<UdpFlowKey, Instant>>>,
     process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
     dynamic_bypass_ips: Arc<Mutex<HashMap<IpAddr, Instant>>>,
 }
@@ -144,9 +145,10 @@ impl PacketProcessor {
     const PROCESS_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5);
     const DYNAMIC_BYPASS_ROUTE_TTL: Duration = Duration::from_secs(300);
     const DYNAMIC_BYPASS_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
-    const UDP_PROXY_TIMEOUT: Duration = Duration::from_secs(8);
+    const UDP_PROXY_TIMEOUT: Duration = Duration::from_millis(1200);
     const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
     const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+    const UDP_TIMEOUT_BACKOFF: Duration = Duration::from_secs(30);
 
     pub fn new(
         config: Config,
@@ -165,6 +167,7 @@ impl PacketProcessor {
             tcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_connections: Arc::new(Mutex::new(HashSet::new())),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            udp_timeout_backoff: Arc::new(Mutex::new(HashMap::new())),
             process_name_cache: Arc::new(Mutex::new(HashMap::new())),
             dynamic_bypass_ips: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -775,108 +778,173 @@ impl PacketProcessor {
         }
         
         if dest_port == self.config.dns.listen_port {
-            let udp_payload = &udp_data[UdpHeader::LEN..];
-            let dns_txid = Self::dns_txid(udp_payload);
-            let response_payload = match self.forward_dns_query(udp_payload).await {
-                Ok(resp) => Self::normalize_dns_response_for_query(udp_payload, resp),
-                Err(err) => {
-                    warn!(
-                        "DNS forwarding failed for {}:{}: {}; returning spoofed SERVFAIL",
-                        ip_packet.dst,
-                        dest_port,
-                        err
-                    );
-                    Self::build_dns_servfail_response(udp_payload)
-                }
-            };
+            let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
+            let socks5_client = self.socks5_client.clone();
+            let dns_config = self.config.dns.clone();
+            let tun_writer = self.tun_writer.clone();
+            let src_ip = ip_packet.src;
+            let dst_ip = ip_packet.dst;
 
-            // Build IP+UDP response back to the original requester.
-            let response_builder = match (ip_packet.dst, ip_packet.src) {
-                (IpAddr::V4(dst), IpAddr::V4(src)) => {
-                    PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
-                        .udp(dest_port, source_port)
-                }
-                (IpAddr::V6(dst), IpAddr::V6(src)) => {
-                    PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
-                        .udp(dest_port, source_port)
-                }
-                _ => return Ok(()),
-            };
+            tokio::spawn(async move {
+                let dns_txid = PacketProcessor::dns_txid(&udp_payload);
+                let response_payload = match PacketProcessor::forward_dns_query_with(
+                    socks5_client,
+                    dns_config,
+                    &udp_payload,
+                )
+                .await
+                {
+                    Ok(resp) => PacketProcessor::normalize_dns_response_for_query(&udp_payload, resp),
+                    Err(err) => {
+                        warn!(
+                            "DNS forwarding failed for {}:{}: {}; returning spoofed SERVFAIL",
+                            dst_ip,
+                            dest_port,
+                            err
+                        );
+                        PacketProcessor::build_dns_servfail_response(&udp_payload)
+                    }
+                };
 
-            let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
-            response_builder.write(&mut response_packet, &response_payload)?;
-            self.write_tun_packet(&response_packet).await?;
+                let response_builder = match (dst_ip, src_ip) {
+                    (IpAddr::V4(dst), IpAddr::V4(src)) => {
+                        PacketBuilder::ipv4(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
+                    }
+                    (IpAddr::V6(dst), IpAddr::V6(src)) => {
+                        PacketBuilder::ipv6(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
+                    }
+                    _ => return,
+                };
 
-            debug!(
-                "Captured DNS query txid={} for {}:{}; re-queried upstream and spoofed reply injected ({} bytes)",
-                dns_txid
-                    .map(|id| format!("0x{:04x}", id))
-                    .unwrap_or_else(|| "n/a".to_string()),
-                ip_packet.dst,
-                dest_port,
-                response_packet.len()
-            );
+                let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
+                if response_builder.write(&mut response_packet, &response_payload).is_err() {
+                    return;
+                }
+                if PacketProcessor::write_tun_packet_with(tun_writer, response_packet.clone())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                debug!(
+                    "Captured DNS query txid={} for {}:{}; re-queried upstream and spoofed reply injected ({} bytes)",
+                    dns_txid
+                        .map(|id| format!("0x{:04x}", id))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    dst_ip,
+                    dest_port,
+                    response_packet.len()
+                );
+            });
 
             return Ok(());
         }
 
-        let udp_payload = &udp_data[UdpHeader::LEN..];
+        let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
         let udp_flow_key = UdpFlowKey {
             src: source_addr,
             dst: target_addr,
         };
-        let response_payload = match timeout(
-            Self::UDP_PROXY_TIMEOUT,
-            self.proxy_udp_with_reused_session(udp_flow_key.clone(), udp_payload),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(err)) => {
-                warn!(
-                    "UDP proxying failed for {}:{} -> {}:{}: {}",
-                    ip_packet.src,
-                    source_port,
-                    ip_packet.dst,
-                    dest_port,
-                    err
-                );
-                return Ok(());
-            }
-            Err(_) => {
-                warn!(
-                    "UDP proxy timeout for {}:{} -> {}:{}",
-                    ip_packet.src,
-                    source_port,
-                    ip_packet.dst,
-                    dest_port
-                );
-                return Ok(());
-            }
-        };
 
-        let response_builder = match (ip_packet.dst, ip_packet.src) {
-            (IpAddr::V4(dst), IpAddr::V4(src)) => {
-                PacketBuilder::ipv4(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
-            }
-            (IpAddr::V6(dst), IpAddr::V6(src)) => {
-                PacketBuilder::ipv6(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
-            }
-            _ => return Ok(()),
-        };
+        if self.is_udp_flow_in_backoff(&udp_flow_key).await {
+            debug!(
+                "Skipping UDP proxy during backoff for {}:{} -> {}:{}",
+                ip_packet.src,
+                source_port,
+                ip_packet.dst,
+                dest_port
+            );
+            return Ok(());
+        }
 
-        let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
-        response_builder.write(&mut response_packet, &response_payload)?;
-        self.write_tun_packet(&response_packet).await?;
+        let socks5_client = self.socks5_client.clone();
+        let udp_sessions = self.udp_sessions.clone();
+        let udp_timeout_backoff = self.udp_timeout_backoff.clone();
+        let tun_writer = self.tun_writer.clone();
+        let src_ip = ip_packet.src;
+        let dst_ip = ip_packet.dst;
 
-        debug!(
-            "Proxied UDP flow {}:{} -> {}:{} and injected {} bytes back to TUN",
-            ip_packet.src,
-            source_port,
-            ip_packet.dst,
-            dest_port,
-            response_packet.len()
-        );
+        tokio::spawn(async move {
+            let response_payload = match timeout(
+                PacketProcessor::UDP_PROXY_TIMEOUT,
+                PacketProcessor::proxy_udp_with_reused_session_shared(
+                    socks5_client,
+                    udp_sessions,
+                    udp_flow_key.clone(),
+                    udp_payload,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => {
+                    PacketProcessor::clear_udp_backoff_shared(udp_timeout_backoff.clone(), &udp_flow_key)
+                        .await;
+                    resp
+                }
+                Ok(Err(err)) => {
+                    PacketProcessor::mark_udp_flow_backoff_shared(
+                        udp_timeout_backoff.clone(),
+                        udp_flow_key.clone(),
+                    )
+                    .await;
+                    warn!(
+                        "UDP proxying failed for {}:{} -> {}:{}: {}",
+                        src_ip,
+                        source_port,
+                        dst_ip,
+                        dest_port,
+                        err
+                    );
+                    return;
+                }
+                Err(_) => {
+                    PacketProcessor::mark_udp_flow_backoff_shared(
+                        udp_timeout_backoff.clone(),
+                        udp_flow_key.clone(),
+                    )
+                    .await;
+                    warn!(
+                        "UDP proxy timeout for {}:{} -> {}:{}",
+                        src_ip,
+                        source_port,
+                        dst_ip,
+                        dest_port
+                    );
+                    return;
+                }
+            };
+
+            let response_builder = match (dst_ip, src_ip) {
+                (IpAddr::V4(dst), IpAddr::V4(src)) => {
+                    PacketBuilder::ipv4(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
+                }
+                (IpAddr::V6(dst), IpAddr::V6(src)) => {
+                    PacketBuilder::ipv6(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
+                }
+                _ => return,
+            };
+
+            let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
+            if response_builder.write(&mut response_packet, &response_payload).is_err() {
+                return;
+            }
+            if PacketProcessor::write_tun_packet_with(tun_writer, response_packet.clone())
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            debug!(
+                "Proxied UDP flow {}:{} -> {}:{} and injected {} bytes back to TUN",
+                src_ip,
+                source_port,
+                dst_ip,
+                dest_port,
+                response_packet.len()
+            );
+        });
         
         Ok(())
     }
@@ -937,6 +1005,46 @@ impl PacketProcessor {
         self.exchange_udp_on_session(session, &flow_key, payload).await
     }
 
+    async fn proxy_udp_with_reused_session_shared(
+        socks5_client: Socks5Client,
+        udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+        flow_key: UdpFlowKey,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if let Some(session) = Self::get_cached_udp_session_shared(udp_sessions.clone(), &flow_key).await {
+            match Self::exchange_udp_on_session_shared(udp_sessions.clone(), session, &flow_key, &payload).await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    debug!(
+                        "Existing UDP ASSOCIATE session failed for {} -> {}: {}; recreating",
+                        flow_key.src,
+                        flow_key.dst,
+                        err
+                    );
+                    Self::remove_udp_session_shared(udp_sessions.clone(), &flow_key).await;
+                }
+            }
+        }
+
+        let session = socks5_client
+            .open_udp_session(flow_key.dst)
+            .await
+            .map(|s| Arc::new(Mutex::new(s)))?;
+
+        {
+            let mut table = udp_sessions.lock().await;
+            table.insert(
+                flow_key.clone(),
+                UdpSessionEntry {
+                    session: session.clone(),
+                    last_activity: Instant::now(),
+                },
+            );
+        }
+
+        Self::exchange_udp_on_session_shared(udp_sessions, session, &flow_key, &payload).await
+    }
+
     async fn exchange_udp_on_session(
         &self,
         session: Arc<Mutex<Socks5UdpSession>>,
@@ -963,6 +1071,33 @@ impl PacketProcessor {
         }
     }
 
+    async fn exchange_udp_on_session_shared(
+        udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+        session: Arc<Mutex<Socks5UdpSession>>,
+        flow_key: &UdpFlowKey,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let response = {
+            let mut guard = session.lock().await;
+            guard.exchange(flow_key.dst, payload).await
+        };
+
+        match response {
+            Ok(resp) => {
+                let mut table = udp_sessions.lock().await;
+                if let Some(entry) = table.get_mut(flow_key) {
+                    entry.last_activity = Instant::now();
+                }
+                Ok(resp)
+            }
+            Err(err) => {
+                let mut table = udp_sessions.lock().await;
+                table.remove(flow_key);
+                Err(err)
+            }
+        }
+    }
+
     async fn get_cached_udp_session(
         &self,
         flow_key: &UdpFlowKey,
@@ -975,8 +1110,28 @@ impl PacketProcessor {
         None
     }
 
+    async fn get_cached_udp_session_shared(
+        udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+        flow_key: &UdpFlowKey,
+    ) -> Option<Arc<Mutex<Socks5UdpSession>>> {
+        let mut table = udp_sessions.lock().await;
+        if let Some(entry) = table.get_mut(flow_key) {
+            entry.last_activity = Instant::now();
+            return Some(entry.session.clone());
+        }
+        None
+    }
+
     async fn remove_udp_session(&self, flow_key: &UdpFlowKey) {
         let mut table = self.udp_sessions.lock().await;
+        table.remove(flow_key);
+    }
+
+    async fn remove_udp_session_shared(
+        udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+        flow_key: &UdpFlowKey,
+    ) {
+        let mut table = udp_sessions.lock().await;
         table.remove(flow_key);
     }
 
@@ -992,21 +1147,73 @@ impl PacketProcessor {
         if removed > 0 {
             debug!("Cleaned up {} idle UDP ASSOCIATE sessions", removed);
         }
+
+        {
+            let mut backoff = self.udp_timeout_backoff.lock().await;
+            let now = Instant::now();
+            backoff.retain(|_, until| *until > now);
+        }
+    }
+
+    async fn is_udp_flow_in_backoff(&self, flow_key: &UdpFlowKey) -> bool {
+        let backoff = self.udp_timeout_backoff.lock().await;
+        let now = Instant::now();
+        backoff.get(flow_key).is_some_and(|until| *until > now)
+    }
+
+    async fn mark_udp_flow_backoff(&self, flow_key: UdpFlowKey) {
+        let mut backoff = self.udp_timeout_backoff.lock().await;
+        backoff.insert(flow_key, Instant::now() + Self::UDP_TIMEOUT_BACKOFF);
+    }
+
+    async fn clear_udp_backoff(&self, flow_key: &UdpFlowKey) {
+        let mut backoff = self.udp_timeout_backoff.lock().await;
+        backoff.remove(flow_key);
+    }
+
+    async fn mark_udp_flow_backoff_shared(
+        udp_timeout_backoff: Arc<Mutex<HashMap<UdpFlowKey, Instant>>>,
+        flow_key: UdpFlowKey,
+    ) {
+        let mut backoff = udp_timeout_backoff.lock().await;
+        backoff.insert(flow_key, Instant::now() + Self::UDP_TIMEOUT_BACKOFF);
+    }
+
+    async fn clear_udp_backoff_shared(
+        udp_timeout_backoff: Arc<Mutex<HashMap<UdpFlowKey, Instant>>>,
+        flow_key: &UdpFlowKey,
+    ) {
+        let mut backoff = udp_timeout_backoff.lock().await;
+        backoff.remove(flow_key);
     }
 
     async fn forward_dns_query(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        let timeout_duration = Duration::from_millis(self.config.dns.timeout_ms);
-        let servers = self.config.effective_dns_servers();
+        Self::forward_dns_query_with(self.socks5_client.clone(), self.config.dns.clone(), payload)
+            .await
+    }
+
+    async fn forward_dns_query_with(
+        socks5_client: Socks5Client,
+        dns_config: crate::config::DnsConfig,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let timeout_duration = Duration::from_millis(dns_config.timeout_ms);
+        let servers = dns_config.servers.clone();
         let mut last_error: Option<anyhow::Error> = None;
 
         for server in servers {
             let result = match server.route {
                 crate::config::DnsRoute::Direct => {
-                    self.forward_dns_query_direct(payload, server.address, timeout_duration)
+                    Self::forward_dns_query_direct(payload, server.address, timeout_duration)
                         .await
                 }
                 crate::config::DnsRoute::Proxy => {
-                    self.forward_dns_query_via_socks(payload, server.address, timeout_duration)
+                    Self::forward_dns_query_via_socks(
+                        socks5_client.clone(),
+                        payload,
+                        server.address,
+                        timeout_duration,
+                    )
                         .await
                 }
             };
@@ -1088,7 +1295,6 @@ impl PacketProcessor {
     }
 
     async fn forward_dns_query_direct(
-        &self,
         payload: &[u8],
         upstream: SocketAddr,
         timeout_duration: Duration,
@@ -1108,7 +1314,7 @@ impl PacketProcessor {
     }
 
     async fn forward_dns_query_via_socks(
-        &self,
+        socks5_client: Socks5Client,
         payload: &[u8],
         upstream: SocketAddr,
         timeout_duration: Duration,
@@ -1118,7 +1324,6 @@ impl PacketProcessor {
         // the server would log as "insufficient header > EOF").
         let handshake_timeout = timeout_duration.max(Duration::from_secs(10));
 
-        let socks5_client = self.socks5_client.clone();
         let mut stream = timeout(handshake_timeout, socks5_client.connect(upstream)).await
             .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out for DNS upstream {}", upstream))??;
 
@@ -1139,8 +1344,15 @@ impl PacketProcessor {
     }
 
     async fn write_tun_packet(&self, packet: &[u8]) -> Result<()> {
-        let mut writer = self.tun_writer.lock().await;
-        writer.write_all(packet).await?;
+        Self::write_tun_packet_with(self.tun_writer.clone(), packet.to_vec()).await
+    }
+
+    async fn write_tun_packet_with(
+        tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+        packet: Vec<u8>,
+    ) -> Result<()> {
+        let mut writer = tun_writer.lock().await;
+        writer.write_all(&packet).await?;
         Ok(())
     }
 
