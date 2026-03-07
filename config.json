@@ -10,7 +10,7 @@
     "mtu": 1500
   },
   "socks5": {
-    "address": "192.168.12.138:20170",
+    "address": "192.168.12.138:20173",
     "username": null,
     "password": null,
     "dns_over_socks5": true
@@ -31,11 +31,6 @@
       "10.0.0.1"
     ],
     "skip_networks": [
-      "192.168.0.0/16",
-      "172.16.0.0/12",
-      "10.0.0.0/8",
-      "127.0.0.0/8",
-      "169.254.0.0/16"
     ],
     "block_ports": [
       22,
@@ -48,6 +43,11 @@
       80,
       443,
       53
-    ]
+    ],
+    "exclude_processes": []
+  },
+  "route": {
+    "auto_detect_interface": true,
+    "default_interface": null
   }
 }

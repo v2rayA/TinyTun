@@ -65,18 +65,30 @@ tinytun run \
   --dns-listen-port 53 \
   --dns 8.8.8.8:53 --dns-route direct \
   --dns 1.1.1.1:53 --dns-route proxy \
+  --exclude-process chrome.exe \
+  --exclude-process code \
   --interface tun0 \
   --ip 198.18.0.1 \
   --netmask 255.255.255.255 \
   --ipv6-mode auto \
-  --auto-route
+  --auto-route \
+  --auto-detect-interface
+```
+
+Or pin bypass routing to a specific physical NIC:
+
+```bash
+tinytun run --config config.json --auto-route --auto-detect-interface false --default-interface "Ethernet"
 ```
 
 Notes:
 
 - `--dns` and `--dns-route` are repeatable and paired by order.
+- `--exclude-process` is repeatable and matched by process executable name (case-insensitive).
+- Process exclusion currently applies to TCP flows handled by TinyTun; matched flows are rejected locally instead of being proxied.
 - DNS capture on TUN path uses `dns.listen_port` from config, or `--dns-listen-port` if provided.
 - You can combine `--config` with CLI flags; CLI values override config values.
+- `--auto-detect-interface` and `--default-interface` are mutually exclusive when both enabled.
 
 ### 3) CLI Help
 
@@ -131,7 +143,12 @@ Example `config.json`:
       "169.254.0.0/16"
     ],
     "block_ports": [22, 23, 25, 110, 143],
-    "allow_ports": [80, 443, 53]
+    "allow_ports": [80, 443, 53],
+    "exclude_processes": ["chrome.exe", "curl"]
+  },
+  "route": {
+    "auto_detect_interface": true,
+    "default_interface": null
   }
 }
 ```

@@ -5,16 +5,17 @@ mod dns_handler;
 mod packet_processor;
 mod error;
 mod route_manager;
+mod process_lookup;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::{error, info, warn};
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 use crate::config::{Config, DnsRoute, DnsServerEntry, Ipv6Mode};
 use crate::tun_device::TunDevice;
@@ -96,6 +97,18 @@ enum Commands {
         /// Enable automatic route setup and cleanup
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         auto_route: Option<bool>,
+
+        /// Process names to exclude from proxy handling (repeatable)
+        #[arg(long = "exclude-process")]
+        exclude_process: Vec<String>,
+
+        /// Auto-detect outbound physical interface for bypass routes
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        auto_detect_interface: Option<bool>,
+
+        /// Manually specify outbound physical interface for bypass routes
+        #[arg(long)]
+        default_interface: Option<String>,
     },
 }
 
@@ -119,6 +132,9 @@ async fn main() -> Result<()> {
             ipv6,
             ipv6_prefix,
             auto_route,
+            exclude_process,
+            auto_detect_interface,
+            default_interface,
         } => {
             let config = load_config(
                 config,
@@ -133,6 +149,9 @@ async fn main() -> Result<()> {
                 ipv6,
                 ipv6_prefix,
                 auto_route,
+                exclude_process,
+                auto_detect_interface,
+                default_interface,
             )?;
             run_proxy(config).await
         }
@@ -151,14 +170,64 @@ async fn run_proxy(config: Config) -> Result<()> {
         info!("IPv6 mode resolved to disabled");
     }
     
+    // Apply skip routes BEFORE creating TUN device to ensure specific IPs are routed to physical port
+    let mut auto_route_applied = false;
+    let mut skip_ip_routes_applied = false;
+    let mut skip_network_routes_applied = false;
+    let mut selected_outbound_interface: Option<String> = None;
+    if config.tun.auto_route {
+        selected_outbound_interface = route_manager::resolve_route_interface(
+            config.route.auto_detect_interface,
+            config.route.default_interface.as_deref(),
+        )?;
+
+        if let Some(interface) = &selected_outbound_interface {
+            info!("Using outbound interface for bypass routes: {}", interface);
+        }
+
+        if let Err(err) = route_manager::apply_skip_ip_routes(
+            &config.filtering.skip_ips,
+            selected_outbound_interface.as_deref(),
+        ) {
+            return Err(anyhow!(
+                "failed to apply skip_ip bypass routes while auto_route is enabled: {}",
+                err
+            ));
+        }
+        skip_ip_routes_applied = true;
+
+        if let Err(err) = route_manager::apply_skip_network_routes(
+            &config.filtering.skip_networks,
+            selected_outbound_interface.as_deref(),
+        ) {
+            let _ = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips);
+            return Err(anyhow!(
+                "failed to apply skip_network bypass routes while auto_route is enabled: {}",
+                err
+            ));
+        }
+        skip_network_routes_applied = true;
+    }
+    
     // Create TUN device
-    let tun_device = TunDevice::new(
+    let tun_device = match TunDevice::new(
         &config.tun.name,
         config.tun.ip,
         config.tun.netmask,
         if ipv6_enabled { Some(config.tun.ipv6) } else { None },
         config.tun.ipv6_prefix,
-    ).await?;
+    ).await {
+        Ok(device) => device,
+        Err(err) => {
+            if skip_network_routes_applied {
+                let _ = route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks);
+            }
+            if skip_ip_routes_applied {
+                let _ = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips);
+            }
+            return Err(err);
+        }
+    };
     
     info!("TUN device created: {}", config.tun.name);
     
@@ -166,25 +235,132 @@ async fn run_proxy(config: Config) -> Result<()> {
     let tun_writer = tun_device.get_writer();
     let processor = PacketProcessor::new(config.clone(), tun_writer);
 
-    let mut auto_route_applied = false;
+    // Apply automatic routes after TUN device is created
     if config.tun.auto_route {
-        if let Err(err) = route_manager::apply_skip_ip_routes(tun_device.name(), &config.filtering.skip_ips) {
-            warn!("Failed to apply skip_ip bypass routes: {}", err);
-        }
-
         match route_manager::apply_auto_routes(tun_device.name(), ipv6_enabled) {
             Ok(()) => {
                 auto_route_applied = true;
                 info!("Automatic routing enabled for interface {}", tun_device.name());
             }
             Err(err) => {
-                warn!("Failed to apply automatic routes: {}", err);
+                if skip_network_routes_applied {
+                    let _ = route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks);
+                }
+                if skip_ip_routes_applied {
+                    let _ = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips);
+                }
+                tun_device.cleanup().await?;
+                return Err(anyhow!(
+                    "failed to apply automatic routes while auto_route is enabled: {}",
+                    err
+                ));
             }
         }
     }
     
     // Channel for graceful shutdown
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<String>(1);
+
+    let mut interface_monitor_handle = None;
+    if config.tun.auto_route {
+        if let Some(interface_name) = selected_outbound_interface.clone() {
+            let shutdown_tx = shutdown_tx.clone();
+            let skip_ips = config.filtering.skip_ips.clone();
+            let skip_networks = config.filtering.skip_networks.clone();
+            let auto_detect_interface = config.route.auto_detect_interface;
+
+            interface_monitor_handle = Some(tokio::spawn(async move {
+                let mut active_interface = interface_name;
+
+                loop {
+                    sleep(Duration::from_secs(5)).await;
+
+                    let routable = match route_manager::is_interface_routable(&active_interface) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            warn!(
+                                "Failed to check interface routability for {}: {}",
+                                active_interface, err
+                            );
+                            continue;
+                        }
+                    };
+
+                    if routable {
+                        continue;
+                    }
+
+                    if auto_detect_interface {
+                        match route_manager::resolve_route_interface(true, None) {
+                            Ok(Some(new_interface)) => {
+                                if new_interface == active_interface {
+                                    continue;
+                                }
+
+                                warn!(
+                                    "Outbound interface {} is gone, switching bypass routes to {}",
+                                    active_interface, new_interface
+                                );
+
+                                let _ = route_manager::cleanup_skip_network_routes(&skip_networks);
+                                let _ = route_manager::cleanup_skip_ip_routes(&skip_ips);
+
+                                let apply_result = route_manager::apply_skip_ip_routes(
+                                    &skip_ips,
+                                    Some(new_interface.as_str()),
+                                )
+                                .and_then(|_| {
+                                    route_manager::apply_skip_network_routes(
+                                        &skip_networks,
+                                        Some(new_interface.as_str()),
+                                    )
+                                });
+
+                                match apply_result {
+                                    Ok(()) => {
+                                        active_interface = new_interface;
+                                        info!(
+                                            "Bypass routes re-applied on outbound interface {}",
+                                            active_interface
+                                        );
+                                    }
+                                    Err(err) => {
+                                        let _ = shutdown_tx
+                                            .send(format!(
+                                                "failed to re-apply bypass routes after interface switch: {}",
+                                                err
+                                            ))
+                                            .await;
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    "Outbound interface {} is gone and no replacement is currently routable",
+                                    active_interface
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Failed to auto-detect replacement outbound interface: {}",
+                                    err
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = shutdown_tx
+                            .send(format!(
+                                "manually selected outbound interface '{}' is no longer routable",
+                                active_interface
+                            ))
+                            .await;
+                        break;
+                    }
+                }
+            }));
+        }
+    }
     
     // Start packet processing
     let tun_reader = tun_device.get_reader();
@@ -200,29 +376,46 @@ async fn run_proxy(config: Config) -> Result<()> {
         info!("Received shutdown signal");
     };
     
+    let mut shutdown_error: Option<String> = None;
     tokio::select! {
         _ = shutdown_signal => {
             info!("Shutting down...");
         }
-        _ = shutdown_rx.recv() => {
+        msg = shutdown_rx.recv() => {
             info!("Shutdown requested");
+            shutdown_error = msg;
         }
     }
     
     // Cleanup
     processor_handle.abort();
+    if let Some(handle) = interface_monitor_handle {
+        handle.abort();
+    }
 
     if auto_route_applied {
         if let Err(err) = route_manager::cleanup_auto_routes(tun_device.name(), ipv6_enabled) {
             warn!("Failed to cleanup automatic routes: {}", err);
         }
+    }
 
+    if skip_ip_routes_applied {
         if let Err(err) = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips) {
             warn!("Failed to cleanup skip_ip bypass routes: {}", err);
         }
     }
 
+    if skip_network_routes_applied {
+        if let Err(err) = route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks) {
+            warn!("Failed to cleanup skip_network bypass routes: {}", err);
+        }
+    }
+
     tun_device.cleanup().await?;
+
+    if let Some(reason) = shutdown_error {
+        return Err(anyhow!(reason));
+    }
     
     info!("TinyTun shutdown complete");
     Ok(())
@@ -241,7 +434,12 @@ fn load_config(
     ipv6: Option<Ipv6Addr>,
     ipv6_prefix: Option<u8>,
     auto_route: Option<bool>,
+    exclude_process: Vec<String>,
+    auto_detect_interface: Option<bool>,
+    default_interface: Option<String>,
 ) -> Result<Config> {
+    let default_interface_cli_provided = default_interface.is_some();
+
     let mut config = if let Some(path) = config_path {
         Config::from_file(&path)?
     } else {
@@ -282,6 +480,37 @@ fn load_config(
     }
     if let Some(v) = auto_route {
         config.tun.auto_route = v;
+    }
+    if !exclude_process.is_empty() {
+        config.filtering.exclude_processes = exclude_process;
+    }
+    if let Some(v) = auto_detect_interface {
+        config.route.auto_detect_interface = v;
+    }
+    if let Some(v) = default_interface {
+        config.route.default_interface = Some(v);
+    }
+
+    // CLI ergonomics: if user manually sets --default-interface without explicitly
+    // setting --auto-detect-interface, treat it as manual mode.
+    if default_interface_cli_provided && auto_detect_interface.is_none() {
+        config.route.auto_detect_interface = false;
+    }
+
+    if config.route.auto_detect_interface && config.route.default_interface.is_some() {
+        return Err(anyhow!(
+            "auto_detect_interface and default_interface cannot both be enabled; disable auto_detect_interface when default_interface is set"
+        ));
+    }
+
+    // Ensure tunnel local addresses are never proxied.
+    let tun_v4 = std::net::IpAddr::V4(config.tun.ip);
+    if !config.should_skip_ip(tun_v4) {
+        config.filtering.skip_ips.push(tun_v4);
+    }
+    let tun_v6 = std::net::IpAddr::V6(config.tun.ipv6);
+    if !config.should_skip_ip(tun_v6) {
+        config.filtering.skip_ips.push(tun_v6);
     }
 
     // Ensure the SOCKS5 proxy IP is never captured by the TUN device (prevents routing loops).

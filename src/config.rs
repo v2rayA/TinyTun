@@ -26,6 +26,8 @@ pub struct Config {
     pub socks5: Socks5Config,
     pub dns: DnsConfig,
     pub filtering: FilteringConfig,
+    #[serde(default)]
+    pub route: RouteConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,15 @@ pub struct FilteringConfig {
     pub skip_networks: Vec<String>, // CIDR notation
     pub block_ports: Vec<u16>,
     pub allow_ports: Vec<u16>,
+    #[serde(default)]
+    pub exclude_processes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouteConfig {
+    pub auto_detect_interface: bool,
+    pub default_interface: Option<String>,
 }
 
 impl Default for Config {
@@ -77,6 +88,7 @@ impl Default for Config {
             socks5: Socks5Config::default(),
             dns: DnsConfig::default(),
             filtering: FilteringConfig::default(),
+            route: RouteConfig::default(),
         }
     }
 }
@@ -131,6 +143,7 @@ impl Default for FilteringConfig {
         Self {
             skip_ips: vec![
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // localhost
+                IpAddr::V6(Ipv6Addr::LOCALHOST), // localhost v6
                 IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), // TUN interface
             ],
             skip_networks: vec![
@@ -139,9 +152,22 @@ impl Default for FilteringConfig {
                 "10.0.0.0/8".to_string(),
                 "127.0.0.0/8".to_string(),      // Localhost
                 "169.254.0.0/16".to_string(),   // Link-local
+                "::1/128".to_string(),          // Localhost v6
+                "fc00::/7".to_string(),         // Unique local addresses
+                "fe80::/10".to_string(),        // Link-local v6
             ],
             block_ports: vec![22, 23, 25, 110, 143], // Common blocked ports
             allow_ports: vec![80, 443, 53],           // Always allow HTTP, HTTPS, DNS
+            exclude_processes: Vec::new(),
+        }
+    }
+}
+
+impl Default for RouteConfig {
+    fn default() -> Self {
+        Self {
+            auto_detect_interface: true,
+            default_interface: None,
         }
     }
 }
@@ -200,5 +226,13 @@ impl Config {
     /// Check if a connection should be proxied
     pub fn should_proxy(&self, ip: IpAddr, port: u16) -> bool {
         !self.should_skip_ip(ip) && !self.should_skip_port(port)
+    }
+
+    pub fn is_excluded_process_name(&self, process_name: &str) -> bool {
+        let candidate = process_name.rsplit(['/', '\\']).next().unwrap_or(process_name);
+        self.filtering.exclude_processes.iter().any(|excluded| {
+            let excluded_name = excluded.rsplit(['/', '\\']).next().unwrap_or(excluded);
+            excluded_name.eq_ignore_ascii_case(candidate)
+        })
     }
 }

@@ -15,6 +15,7 @@ use etherparse::{
     Ipv4HeaderSlice, Ipv6HeaderSlice, PacketBuilder, TcpHeaderSlice, UdpHeader, UdpHeaderSlice,
 };
 use crate::config::Config;
+use crate::process_lookup::{self, TransportProtocol};
 use crate::socks5_client::Socks5Client;
 
 struct ParsedIpPacket {
@@ -30,6 +31,34 @@ pub struct PacketProcessor {
     tun_writer: Arc<Mutex<tun::DeviceWriter>>,
     tcp_sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
     pending_connections: Arc<Mutex<HashSet<FlowKey>>>,
+    process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
+}
+
+#[derive(Clone, Debug, Eq)]
+struct ProcessLookupKey {
+    protocol: TransportProtocol,
+    src: SocketAddr,
+    dst: SocketAddr,
+}
+
+impl PartialEq for ProcessLookupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.protocol == other.protocol && self.src == other.src && self.dst == other.dst
+    }
+}
+
+impl Hash for ProcessLookupKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.protocol.hash(state);
+        self.src.hash(state);
+        self.dst.hash(state);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProcessLookupEntry {
+    process_name: Option<String>,
+    recorded_at: Instant,
 }
 
 struct TcpSession {
@@ -82,6 +111,7 @@ impl PacketProcessor {
     const TCP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     const TCP_REORDER_BUFFER_LIMIT: usize = 128 * 1024;
     const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    const PROCESS_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5);
 
     pub fn new(config: Config, tun_writer: Arc<Mutex<tun::DeviceWriter>>) -> Self {
         let socks5_client = Socks5Client::new(config.socks5.clone());
@@ -92,6 +122,7 @@ impl PacketProcessor {
             tun_writer,
             tcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_connections: Arc::new(Mutex::new(HashSet::new())),
+            process_name_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     
@@ -209,6 +240,34 @@ impl PacketProcessor {
         }
 
         let payload = &tcp_data[tcp_header_len..];
+        if self
+            .should_exclude_process_flow(TransportProtocol::Tcp, source_addr, target_addr)
+            .await
+        {
+            let payload_seq_advance = (payload.len() as u32)
+                .wrapping_add(if tcp_header.syn() { 1 } else { 0 })
+                .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
+            let acknowledgment_number = tcp_header.sequence_number().wrapping_add(payload_seq_advance);
+            let _ = self
+                .inject_tcp_control_packet(
+                    &flow_key,
+                    0,
+                    acknowledgment_number,
+                    false,
+                    false,
+                    true,
+                )
+                .await;
+            debug!(
+                "Excluded process flow (TCP) {}:{} -> {}:{}",
+                ip_packet.src,
+                source_port,
+                ip_packet.dst,
+                dest_port
+            );
+            return Ok(());
+        }
+
         let is_ack_only_or_window_update = payload.is_empty()
             && !tcp_header.syn()
             && !tcp_header.fin()
@@ -733,6 +792,65 @@ impl PacketProcessor {
         let mut writer = self.tun_writer.lock().await;
         writer.write_all(packet).await?;
         Ok(())
+    }
+
+    async fn should_exclude_process_flow(
+        &self,
+        protocol: TransportProtocol,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> bool {
+        if self.config.filtering.exclude_processes.is_empty() {
+            return false;
+        }
+
+        let process_name = self.resolve_process_name_for_flow(protocol, src, dst).await;
+        if let Some(name) = process_name {
+            if self.config.is_excluded_process_name(&name) {
+                info!(
+                    "Process exclusion matched for {} on flow {} -> {}",
+                    name, src, dst
+                );
+                return true;
+            }
+        }
+
+        false
+    }
+
+    async fn resolve_process_name_for_flow(
+        &self,
+        protocol: TransportProtocol,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> Option<String> {
+        let key = ProcessLookupKey { protocol, src, dst };
+        {
+            let cache = self.process_name_cache.lock().await;
+            if let Some(entry) = cache.get(&key) {
+                if entry.recorded_at.elapsed() <= Self::PROCESS_LOOKUP_CACHE_TTL {
+                    return entry.process_name.clone();
+                }
+            }
+        }
+
+        let lookup = tokio::task::spawn_blocking(move || {
+            process_lookup::find_process_name_for_flow(protocol, src, dst)
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let mut cache = self.process_name_cache.lock().await;
+        cache.insert(
+            key,
+            ProcessLookupEntry {
+                process_name: lookup.clone(),
+                recorded_at: Instant::now(),
+            },
+        );
+
+        lookup
     }
 
     async fn inject_tcp_control_packet(
