@@ -62,6 +62,7 @@ On Windows, start PowerShell or CMD as Administrator, then run:
 ```bash
 tinytun run \
   --socks5 127.0.0.1:1080 \
+  --dns-listen-port 53 \
   --dns 8.8.8.8:53 --dns-route direct \
   --dns 1.1.1.1:53 --dns-route proxy \
   --interface tun0 \
@@ -74,7 +75,7 @@ tinytun run \
 Notes:
 
 - `--dns` and `--dns-route` are repeatable and paired by order.
-- DNS capture on TUN path uses port `53`.
+- DNS capture on TUN path uses `dns.listen_port` from config, or `--dns-listen-port` if provided.
 - You can combine `--config` with CLI flags; CLI values override config values.
 
 ### 3) CLI Help
@@ -107,7 +108,6 @@ Example `config.json`:
     "dns_over_socks5": true
   },
   "dns": {
-    "upstream_server": "8.8.8.8:53",
     "servers": [
       {
         "address": "8.8.8.8:53",

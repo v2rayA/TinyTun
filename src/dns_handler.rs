@@ -36,7 +36,9 @@ impl DnsHandler {
         
         // Forward to upstream server
         let upstream_socket = self.upstream_socket.clone();
-        let upstream_addr = self.config.upstream_server;
+        let upstream_addr = self.config.servers.first()
+            .map(|s| s.address)
+            .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))?;
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
         let response = timeout(timeout_duration, async move {
@@ -61,7 +63,9 @@ impl DnsHandler {
         let query = self.build_dns_query(domain, qtype)?;
         
         let upstream_socket = self.upstream_socket.clone();
-        let upstream_addr = self.config.upstream_server;
+        let upstream_addr = self.config.servers.first()
+            .map(|s| s.address)
+            .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))?;
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
         let response = timeout(timeout_duration, async move {
@@ -181,7 +185,7 @@ mod tests {
         // Simple test for DNS query parsing
         let handler = DnsHandler {
             config: DnsConfig {
-                upstream_server: "8.8.8.8:53".parse().unwrap(),
+                servers: vec![],
                 listen_port: 5353,
                 timeout_ms: 5000,
             },

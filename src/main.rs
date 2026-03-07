@@ -64,34 +64,38 @@ enum Commands {
         /// Route for each --dns entry: direct or proxy (repeatable)
         #[arg(long, value_enum)]
         dns_route: Vec<CliDnsRoute>,
+
+        /// Local DNS capture/forward listen port (default from config or built-in default)
+        #[arg(long)]
+        dns_listen_port: Option<u16>,
         
         /// TUN device name
-        #[arg(short, long, default_value = "tun0")]
-        interface: String,
+        #[arg(short, long)]
+        interface: Option<String>,
         
         /// TUN device IP address
-        #[arg(long, default_value = "198.18.0.1")]
-        ip: Ipv4Addr,
+        #[arg(long)]
+        ip: Option<Ipv4Addr>,
         
         /// TUN device netmask
-        #[arg(short, long, default_value = "255.255.255.255")]
-        netmask: Ipv4Addr,
+        #[arg(short, long)]
+        netmask: Option<Ipv4Addr>,
 
         /// IPv6 mode: auto enables IPv6 when system IPv6 is available
-        #[arg(long, value_enum, default_value = "auto")]
-        ipv6_mode: CliIpv6Mode,
+        #[arg(long, value_enum)]
+        ipv6_mode: Option<CliIpv6Mode>,
 
         /// TUN device IPv6 address
-        #[arg(long, default_value = "fd00::1")]
-        ipv6: Ipv6Addr,
+        #[arg(long)]
+        ipv6: Option<Ipv6Addr>,
 
         /// TUN device IPv6 prefix length
-        #[arg(long, default_value_t = 128)]
-        ipv6_prefix: u8,
+        #[arg(long)]
+        ipv6_prefix: Option<u8>,
 
         /// Enable automatic route setup and cleanup
-        #[arg(long, default_value_t = false)]
-        auto_route: bool,
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        auto_route: Option<bool>,
     },
 }
 
@@ -107,6 +111,7 @@ async fn main() -> Result<()> {
             socks5,
             dns,
             dns_route,
+            dns_listen_port,
             interface,
             ip,
             netmask,
@@ -120,10 +125,11 @@ async fn main() -> Result<()> {
                 socks5,
                 dns,
                 dns_route,
-                &interface,
+                dns_listen_port,
+                interface,
                 ip,
                 netmask,
-                ipv6_mode.into(),
+                ipv6_mode.map(|m| m.into()),
                 ipv6,
                 ipv6_prefix,
                 auto_route,
@@ -146,19 +152,12 @@ async fn run_proxy(config: Config) -> Result<()> {
     }
     
     // Create TUN device
-    let dns_servers: Vec<std::net::SocketAddr> = config
-        .effective_dns_servers()
-        .into_iter()
-        .map(|entry| entry.address)
-        .collect();
-
     let tun_device = TunDevice::new(
         &config.tun.name,
         config.tun.ip,
         config.tun.netmask,
         if ipv6_enabled { Some(config.tun.ipv6) } else { None },
         config.tun.ipv6_prefix,
-        &dns_servers,
     ).await?;
     
     info!("TUN device created: {}", config.tun.name);
@@ -226,13 +225,14 @@ fn load_config(
     socks5: Option<String>,
     dns: Vec<String>,
     dns_route: Vec<CliDnsRoute>,
-    interface: &str,
-    ip: Ipv4Addr,
-    netmask: Ipv4Addr,
-    ipv6_mode: Ipv6Mode,
-    ipv6: Ipv6Addr,
-    ipv6_prefix: u8,
-    auto_route: bool,
+    dns_listen_port: Option<u16>,
+    interface: Option<String>,
+    ip: Option<Ipv4Addr>,
+    netmask: Option<Ipv4Addr>,
+    ipv6_mode: Option<Ipv6Mode>,
+    ipv6: Option<Ipv6Addr>,
+    ipv6_prefix: Option<u8>,
+    auto_route: Option<bool>,
 ) -> Result<Config> {
     let mut config = if let Some(path) = config_path {
         Config::from_file(&path)?
@@ -247,20 +247,40 @@ fn load_config(
     
     if !dns.is_empty() {
         let dns_servers = build_dns_servers_from_cli(&dns, &dns_route)?;
-        config.dns.servers = dns_servers.clone();
-        config.dns.upstream_server = dns_servers[0].address;
+        config.dns.servers = dns_servers;
     }
 
-    // DNS requests are captured/forwarded on port 53 on the TUN path.
-    config.dns.listen_port = 53;
+    if let Some(port) = dns_listen_port {
+        config.dns.listen_port = port;
+    }
     
-    config.tun.name = interface.to_string();
-    config.tun.ip = ip;
-    config.tun.netmask = netmask;
-    config.tun.ipv6_mode = ipv6_mode;
-    config.tun.ipv6 = ipv6;
-    config.tun.ipv6_prefix = ipv6_prefix;
-    config.tun.auto_route = auto_route;
+    if let Some(name) = interface {
+        config.tun.name = name;
+    }
+    if let Some(v) = ip {
+        config.tun.ip = v;
+    }
+    if let Some(v) = netmask {
+        config.tun.netmask = v;
+    }
+    if let Some(v) = ipv6_mode {
+        config.tun.ipv6_mode = v;
+    }
+    if let Some(v) = ipv6 {
+        config.tun.ipv6 = v;
+    }
+    if let Some(v) = ipv6_prefix {
+        config.tun.ipv6_prefix = v;
+    }
+    if let Some(v) = auto_route {
+        config.tun.auto_route = v;
+    }
+
+    // Ensure the SOCKS5 proxy IP is never captured by the TUN device (prevents routing loops).
+    let proxy_ip = config.socks5.address.ip();
+    if !config.should_skip_ip(proxy_ip) {
+        config.filtering.skip_ips.push(proxy_ip);
+    }
     
     Ok(config)
 }

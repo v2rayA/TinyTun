@@ -16,7 +16,6 @@
     "dns_over_socks5": true
   },
   "dns": {
-    "upstream_server": "8.8.8.8:53",
     "servers": [
       {
         "address": "8.8.8.8:53",

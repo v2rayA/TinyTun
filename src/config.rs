@@ -51,7 +51,6 @@ pub struct Socks5Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
-    pub upstream_server: SocketAddr,
     pub servers: Vec<DnsServerEntry>,
     pub listen_port: u16,
     pub timeout_ms: u64,
@@ -117,7 +116,6 @@ impl Default for Socks5Config {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            upstream_server: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
             servers: vec![DnsServerEntry {
                 address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
                 route: DnsRoute::Direct,
@@ -150,14 +148,7 @@ impl Default for FilteringConfig {
 
 impl Config {
     pub fn effective_dns_servers(&self) -> Vec<DnsServerEntry> {
-        if !self.dns.servers.is_empty() {
-            return self.dns.servers.clone();
-        }
-
-        vec![DnsServerEntry {
-            address: self.dns.upstream_server,
-            route: DnsRoute::Direct,
-        }]
+        self.dns.servers.clone()
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {

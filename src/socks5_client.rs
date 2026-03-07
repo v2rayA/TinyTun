@@ -1,43 +1,29 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::Mutex;
+use tokio::net::TcpStream;
 
 use crate::config::Socks5Config;
 
+#[derive(Clone)]
 pub struct Socks5Client {
     config: Socks5Config,
-    stream: Option<Arc<Mutex<TcpStream>>>,
 }
 
 impl Socks5Client {
     pub fn new(config: Socks5Config) -> Self {
-        Self {
-            config,
-            stream: None,
-        }
-    }
-}
-
-impl Clone for Socks5Client {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            stream: None,
-        }
+        Self { config }
     }
 }
 
 impl Socks5Client {
-    pub async fn connect(&mut self, target_addr: SocketAddr) -> Result<TcpStream> {
-        info!("Connecting to SOCKS5 proxy: {}", self.config.address);
+    pub async fn connect(&self, target_addr: SocketAddr) -> Result<TcpStream> {
+        debug!("Connecting to SOCKS5 proxy: {}", self.config.address);
         
         let mut stream = TcpStream::connect(&self.config.address).await?;
+        stream.set_nodelay(true)?;
         
         // SOCKS5 handshake
         self.perform_handshake(&mut stream).await?;
@@ -50,26 +36,34 @@ impl Socks5Client {
     
     async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<()> {
         // SOCKS5 handshake: client greeting
-        let auth_methods = if self.config.username.is_some() && self.config.password.is_some() {
-            vec![0x02] // Username/password authentication
+        // Always offer NO AUTH; additionally offer USERNAME/PASSWORD if credentials are configured.
+        let auth_methods: Vec<u8> = if self.config.username.is_some() && self.config.password.is_some() {
+            vec![0x00, 0x02] // No auth + Username/password
         } else {
-            vec![0x00] // No authentication
+            vec![0x00] // No authentication only
         };
         
-        let mut greeting = vec![0x05, auth_methods.len() as u8];
+        let mut greeting = Vec::with_capacity(2 + auth_methods.len());
+        greeting.push(0x05); // SOCKS5 version
+        greeting.push(auth_methods.len() as u8);
         greeting.extend_from_slice(&auth_methods);
         
         stream.write_all(&greeting).await?;
+        stream.flush().await?;
         
         // Read server response
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
         
         if response[0] != 0x05 {
-            return Err(anyhow::anyhow!("Invalid SOCKS5 version in server response"));
+            return Err(anyhow::anyhow!("Invalid SOCKS5 version in server response: 0x{:02x}", response[0]));
         }
         
         let auth_method = response[1];
+        
+        if auth_method == 0xFF {
+            return Err(anyhow::anyhow!("SOCKS5 server rejected all offered authentication methods"));
+        }
         
         // Authenticate if required
         if auth_method == 0x02 {
@@ -93,6 +87,7 @@ impl Socks5Client {
         auth_request.extend_from_slice(password.as_bytes());
         
         stream.write_all(&auth_request).await?;
+        stream.flush().await?;
         
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
@@ -124,6 +119,7 @@ impl Socks5Client {
         request.extend_from_slice(&port.to_be_bytes());
         
         stream.write_all(&request).await?;
+        stream.flush().await?;
         
         // Read server response
         let mut response = vec![0u8; 4];
@@ -171,7 +167,7 @@ impl Socks5Client {
         
         // Connect to DNS server through SOCKS5
         let dns_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
-        let mut client = self.clone();
+        let client = self.clone();
         let mut stream = client.connect(dns_addr).await?;
         
         // Simple DNS query (A record)
