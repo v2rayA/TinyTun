@@ -23,6 +23,7 @@ impl TunDevice {
         netmask: Ipv4Addr,
         ipv6: Option<Ipv6Addr>,
         ipv6_prefix: u8,
+        auto_route_enabled: bool,
     ) -> Result<Self> {
         info!("Creating TUN device: {}", name);
         
@@ -33,6 +34,12 @@ impl TunDevice {
             .netmask(netmask)
             .mtu(1500)
             .up();
+
+        #[cfg(windows)]
+        if auto_route_enabled {
+            // Lower interface metric so split routes on TUN win route selection deterministically.
+            config.metric(6);
+        }
         
         let device = tun::create_as_async(&config).map_err(|err| {
             #[cfg(windows)]
@@ -60,7 +67,14 @@ impl TunDevice {
         info!("TUN device created: {}", device_name);
         
         // Set up the interface
-        Self::setup_interface(&device_name, ip, netmask, ipv6, ipv6_prefix)?;
+        Self::setup_interface(
+            &device_name,
+            ip,
+            netmask,
+            ipv6,
+            ipv6_prefix,
+            auto_route_enabled,
+        )?;
         
         let (writer, reader) = device.split()?;
         let reader = Arc::new(Mutex::new(reader));
@@ -79,6 +93,7 @@ impl TunDevice {
         _netmask: Ipv4Addr,
         _ipv6: Option<Ipv6Addr>,
         _ipv6_prefix: u8,
+        _auto_route_enabled: bool,
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -130,6 +145,7 @@ impl TunDevice {
             let name = _name;
             let ipv6 = _ipv6;
             let ipv6_prefix = _ipv6_prefix;
+            let auto_route_enabled = _auto_route_enabled;
 
             info!("TUN interface setup on Windows may require additional configuration");
 
@@ -251,6 +267,50 @@ impl TunDevice {
                             String::from_utf8_lossy(&output.stderr)
                         );
                     }
+                }
+            }
+
+            if auto_route_enabled {
+                let output = Command::new("netsh")
+                    .args([
+                        "interface",
+                        "ipv4",
+                        "set",
+                        "interface",
+                        &format!("name={}", name),
+                        "metric=6",
+                    ])
+                    .output()?;
+
+                if !output.status.success() {
+                    warn!(
+                        "Failed to set IPv4 interface metric=6 for {}: {}",
+                        name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                } else {
+                    info!("Set interface metric for {} (IPv4) to 6", name);
+                }
+
+                let output = Command::new("netsh")
+                    .args([
+                        "interface",
+                        "ipv6",
+                        "set",
+                        "interface",
+                        &format!("interface={}", name),
+                        "metric=6",
+                    ])
+                    .output()?;
+
+                if !output.status.success() {
+                    warn!(
+                        "Failed to set IPv6 interface metric=6 for {}: {}",
+                        name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                } else {
+                    info!("Set interface metric for {} (IPv6) to 6", name);
                 }
             }
         }

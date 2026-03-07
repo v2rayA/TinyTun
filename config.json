@@ -1,4 +1,7 @@
 {
+  "log": {
+    "loglevel": "warning"
+  },
   "tun": {
     "name": "tun0",
     "ip": "198.18.0.1",
@@ -44,7 +47,11 @@
       443,
       53
     ],
-    "exclude_processes": []
+    "exclude_processes": [],
+    "process_lookup": {
+      "linux_backend": "auto",
+      "linux_ebpf_cache_path": "/run/tinytun-ebpf-flow-cache.json"
+    }
   },
   "route": {
     "auto_detect_interface": true,

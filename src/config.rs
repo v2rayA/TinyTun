@@ -21,7 +21,19 @@ pub enum DnsRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub log: LogConfig,
     pub tun: TunConfig,
     pub socks5: Socks5Config,
     pub dns: DnsConfig,
@@ -72,6 +84,15 @@ pub struct FilteringConfig {
     pub allow_ports: Vec<u16>,
     #[serde(default)]
     pub exclude_processes: Vec<String>,
+    #[serde(default)]
+    pub process_lookup: ProcessLookupConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProcessLookupConfig {
+    pub linux_backend: String,
+    pub linux_ebpf_cache_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,9 +102,16 @@ pub struct RouteConfig {
     pub default_interface: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    pub loglevel: LogLevel,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            log: LogConfig::default(),
             tun: TunConfig::default(),
             socks5: Socks5Config::default(),
             dns: DnsConfig::default(),
@@ -147,9 +175,6 @@ impl Default for FilteringConfig {
                 IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), // TUN interface
             ],
             skip_networks: vec![
-                "192.168.0.0/16".to_string(),  // Private networks
-                "172.16.0.0/12".to_string(),
-                "10.0.0.0/8".to_string(),
                 "127.0.0.0/8".to_string(),      // Localhost
                 "169.254.0.0/16".to_string(),   // Link-local
                 "::1/128".to_string(),          // Localhost v6
@@ -159,6 +184,16 @@ impl Default for FilteringConfig {
             block_ports: vec![22, 23, 25, 110, 143], // Common blocked ports
             allow_ports: vec![80, 443, 53],           // Always allow HTTP, HTTPS, DNS
             exclude_processes: Vec::new(),
+            process_lookup: ProcessLookupConfig::default(),
+        }
+    }
+}
+
+impl Default for ProcessLookupConfig {
+    fn default() -> Self {
+        Self {
+            linux_backend: "auto".to_string(),
+            linux_ebpf_cache_path: Some("/run/tinytun-ebpf-flow-cache.json".to_string()),
         }
     }
 }
@@ -234,5 +269,19 @@ impl Config {
             let excluded_name = excluded.rsplit(['/', '\\']).next().unwrap_or(excluded);
             excluded_name.eq_ignore_ascii_case(candidate)
         })
+    }
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        Self::Warning
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            loglevel: LogLevel::default(),
+        }
     }
 }

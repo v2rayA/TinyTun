@@ -1,11 +1,18 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::Result;
-use log::{debug, info};
+use log::debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::Socks5Config;
+
+pub struct Socks5UdpSession {
+    // Keep the TCP control channel alive for this UDP ASSOCIATE session.
+    _control: TcpStream,
+    relay_addr: SocketAddr,
+    udp_socket: UdpSocket,
+}
 
 #[derive(Clone)]
 pub struct Socks5Client {
@@ -32,6 +39,33 @@ impl Socks5Client {
         self.connect_to_target(&mut stream, target_addr).await?;
         
         Ok(stream)
+    }
+
+    pub async fn open_udp_session(&self, target_hint: SocketAddr) -> Result<Socks5UdpSession> {
+        debug!(
+            "Opening SOCKS5 UDP ASSOCIATE session for target family {}",
+            target_hint
+        );
+
+        let mut control = TcpStream::connect(&self.config.address).await?;
+        control.set_nodelay(true)?;
+        self.perform_handshake(&mut control).await?;
+
+        let relay_addr = self.udp_associate(&mut control).await?;
+        // Bind by relay family (not destination family): an IPv4 relay can still
+        // carry IPv6 destination datagrams inside SOCKS5 UDP framing.
+        let bind_addr = if relay_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let udp_socket = UdpSocket::bind(bind_addr).await?;
+
+        Ok(Socks5UdpSession {
+            _control: control,
+            relay_addr,
+            udp_socket,
+        })
     }
     
     async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<()> {
@@ -159,6 +193,172 @@ impl Socks5Client {
         
         Ok(())
     }
+
+    async fn udp_associate(&self, stream: &mut TcpStream) -> Result<SocketAddr> {
+        let request = vec![
+            0x05, // SOCKS5
+            0x03, // UDP ASSOCIATE
+            0x00, // Reserved
+            0x01, // ATYP IPv4
+            0x00,
+            0x00,
+            0x00,
+            0x00, // 0.0.0.0
+            0x00,
+            0x00, // Port 0
+        ];
+
+        stream.write_all(&request).await?;
+        stream.flush().await?;
+
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head).await?;
+        if head[0] != 0x05 {
+            return Err(anyhow::anyhow!(
+                "Invalid SOCKS5 version in UDP ASSOCIATE response: 0x{:02x}",
+                head[0]
+            ));
+        }
+        if head[1] != 0x00 {
+            return Err(anyhow::anyhow!(
+                "SOCKS5 UDP ASSOCIATE failed with code: 0x{:02x}",
+                head[1]
+            ));
+        }
+
+        let bound = Self::read_bound_addr(stream, head[3]).await?;
+        let peer_ip = stream.peer_addr()?.ip();
+        let relay = match bound.ip() {
+            IpAddr::V4(v4) if v4.is_unspecified() => SocketAddr::new(peer_ip, bound.port()),
+            IpAddr::V6(v6) if v6.is_unspecified() => SocketAddr::new(peer_ip, bound.port()),
+            _ => bound,
+        };
+
+        Ok(relay)
+    }
+
+    async fn read_bound_addr(stream: &mut TcpStream, atyp: u8) -> Result<SocketAddr> {
+        let addr = match atyp {
+            0x01 => {
+                let mut raw = [0u8; 4];
+                stream.read_exact(&mut raw).await?;
+                IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]))
+            }
+            0x04 => {
+                let mut raw = [0u8; 16];
+                stream.read_exact(&mut raw).await?;
+                IpAddr::V6(Ipv6Addr::from(raw))
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut domain = vec![0u8; len[0] as usize];
+                stream.read_exact(&mut domain).await?;
+                let text = String::from_utf8(domain)
+                    .map_err(|_| anyhow::anyhow!("Invalid domain in SOCKS5 response"))?;
+                let resolved = tokio::net::lookup_host((text.as_str(), 0))
+                    .await?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to resolve SOCKS5 relay domain"))?;
+                resolved.ip()
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Invalid address type in SOCKS5 response: 0x{:02x}",
+                    atyp
+                ));
+            }
+        };
+
+        let mut port = [0u8; 2];
+        stream.read_exact(&mut port).await?;
+        Ok(SocketAddr::new(addr, u16::from_be_bytes(port)))
+    }
+
+    fn build_udp_request(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut request = vec![0x00, 0x00, 0x00]; // RSV(2), FRAG(1)
+        match target_addr {
+            SocketAddr::V4(v4) => {
+                request.push(0x01);
+                request.extend_from_slice(&v4.ip().octets());
+                request.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            SocketAddr::V6(v6) => {
+                request.push(0x04);
+                request.extend_from_slice(&v6.ip().octets());
+                request.extend_from_slice(&v6.port().to_be_bytes());
+            }
+        }
+        request.extend_from_slice(payload);
+        request
+    }
+
+    fn parse_udp_response(packet: &[u8]) -> Result<(SocketAddr, Vec<u8>)> {
+        if packet.len() < 4 {
+            return Err(anyhow::anyhow!("SOCKS5 UDP response too short"));
+        }
+
+        if packet[2] != 0x00 {
+            return Err(anyhow::anyhow!(
+                "SOCKS5 UDP fragmentation is not supported (FRAG={})",
+                packet[2]
+            ));
+        }
+
+        let atyp = packet[3];
+        let mut pos = 4usize;
+        let addr = match atyp {
+            0x01 => {
+                if packet.len() < pos + 4 {
+                    return Err(anyhow::anyhow!("SOCKS5 UDP IPv4 header too short"));
+                }
+                let ip = Ipv4Addr::new(packet[pos], packet[pos + 1], packet[pos + 2], packet[pos + 3]);
+                pos += 4;
+                IpAddr::V4(ip)
+            }
+            0x04 => {
+                if packet.len() < pos + 16 {
+                    return Err(anyhow::anyhow!("SOCKS5 UDP IPv6 header too short"));
+                }
+                let mut raw = [0u8; 16];
+                raw.copy_from_slice(&packet[pos..pos + 16]);
+                pos += 16;
+                IpAddr::V6(Ipv6Addr::from(raw))
+            }
+            0x03 => {
+                if packet.len() < pos + 1 {
+                    return Err(anyhow::anyhow!("SOCKS5 UDP domain header too short"));
+                }
+                let len = packet[pos] as usize;
+                pos += 1;
+                if packet.len() < pos + len {
+                    return Err(anyhow::anyhow!("SOCKS5 UDP domain bytes too short"));
+                }
+                let domain = String::from_utf8(packet[pos..pos + len].to_vec())
+                    .map_err(|_| anyhow::anyhow!("Invalid SOCKS5 UDP domain bytes"))?;
+                pos += len;
+                let resolved = std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), 0))?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to resolve SOCKS5 UDP domain"))?;
+                resolved.ip()
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Invalid SOCKS5 UDP address type: 0x{:02x}",
+                    atyp
+                ));
+            }
+        };
+
+        if packet.len() < pos + 2 {
+            return Err(anyhow::anyhow!("SOCKS5 UDP port bytes missing"));
+        }
+        let port = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        pos += 2;
+
+        let payload = packet[pos..].to_vec();
+        Ok((SocketAddr::new(addr, port), payload))
+    }
     
     pub async fn resolve_domain(&self, domain: &str) -> Result<Vec<IpAddr>> {
         if !self.config.dns_over_socks5 {
@@ -259,5 +459,19 @@ impl Socks5Client {
         }
         
         Ok(ips)
+    }
+}
+
+impl Socks5UdpSession {
+    pub async fn exchange(&mut self, target_addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+        let request = Socks5Client::build_udp_request(target_addr, payload);
+        self.udp_socket.send_to(&request, self.relay_addr).await?;
+
+        let mut recv_buf = vec![0u8; 65535];
+        let (n, _) = self.udp_socket.recv_from(&mut recv_buf).await?;
+        recv_buf.truncate(n);
+
+        let (_, response_payload) = Socks5Client::parse_udp_response(&recv_buf)?;
+        Ok(response_payload)
     }
 }

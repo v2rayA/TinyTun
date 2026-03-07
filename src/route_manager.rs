@@ -1,174 +1,85 @@
+use ::route_manager::{Route as SysRoute, RouteManager as SysRouteManager};
 use anyhow::{anyhow, Result};
 use ipnetwork::IpNetwork;
-use std::net::IpAddr;
-use std::process::Command;
+use std::cmp::Ordering;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+#[cfg(target_os = "windows")]
+use ipconfig::OperStatus;
 
 pub fn resolve_route_interface(
     auto_detect_interface: bool,
     default_interface: Option<&str>,
 ) -> Result<Option<String>> {
-    #[cfg(windows)]
-    {
-        if auto_detect_interface {
-            let script = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-                $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-                $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1; \
-                if ($r) { $r.InterfaceAlias }";
-            let iface = run_checked_capture_stdout("powershell", &["-NoProfile", "-Command", script])?;
-            let iface = iface.trim().to_string();
-            if iface.is_empty() {
-                return Err(anyhow!("failed to auto-detect a routable default interface"));
-            }
-            return Ok(Some(iface));
-        }
-
-        if let Some(interface) = default_interface {
-            let escaped = ps_single_quote(interface);
-            let script = format!(
-                "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-                 $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-                 $alias='{iface}'; \
-                 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $alias -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1; \
-                 if ($r) {{ $r.InterfaceAlias }} else {{ throw 'default route not found for selected interface' }};",
-                iface = escaped
-            );
-            let iface = run_checked_capture_stdout("powershell", &["-NoProfile", "-Command", &script])?;
-            let iface = iface.trim().to_string();
-            if iface.is_empty() {
-                return Err(anyhow!(
-                    "selected interface '{}' is not routable",
-                    interface
-                ));
-            }
-            return Ok(Some(iface));
-        }
-
-        return Ok(None);
+    if auto_detect_interface {
+        let route = find_default_route_v4(None)?
+            .ok_or_else(|| anyhow!("failed to auto-detect a routable default interface"))?;
+        let if_name = route
+            .if_name()
+            .cloned()
+            .ok_or_else(|| anyhow!("default route does not expose interface name"))?;
+        return Ok(Some(if_name));
     }
 
-    #[allow(unreachable_code)]
+    if let Some(interface) = default_interface {
+        let route = find_default_route_v4(Some(interface))?
+            .ok_or_else(|| anyhow!("selected interface '{}' is not routable", interface))?;
+        let if_name = route.if_name().cloned().unwrap_or_else(|| interface.to_string());
+        return Ok(Some(if_name));
+    }
+
     Ok(None)
 }
 
 pub fn is_interface_routable(interface: &str) -> Result<bool> {
-    #[cfg(windows)]
-    {
-        let escaped = ps_single_quote(interface);
-        let script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $alias='{iface}'; \
-             $adapter = Get-NetAdapter -InterfaceAlias $alias -ErrorAction SilentlyContinue; \
-             if (-not $adapter -or $adapter.Status -ne 'Up') {{ '0'; exit 0 }}; \
-             $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $alias -ErrorAction SilentlyContinue | Select-Object -First 1; \
-             if ($r) {{ '1' }} else {{ '0' }};",
-            iface = escaped
-        );
-        let out = run_checked_capture_stdout("powershell", &["-NoProfile", "-Command", &script])?;
-        return Ok(out.trim() == "1");
-    }
-
-    #[allow(unreachable_code)]
-    Ok(true)
+    Ok(find_default_route_v4(Some(interface))?.is_some())
 }
 
 pub fn apply_auto_routes(interface: &str, ipv6_enabled: bool) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let mut script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '{iface}' -NextHop '0.0.0.0' -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null; \
-             New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '{iface}' -NextHop '0.0.0.0' -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;",
-            iface = interface
-        );
+    let mut manager = new_route_manager()?;
 
-        if ipv6_enabled {
-            script.push_str(&format!(
-                " New-NetRoute -DestinationPrefix '::/1' -InterfaceAlias '{iface}' -NextHop '::' -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null; \
-                  New-NetRoute -DestinationPrefix '8000::/1' -InterfaceAlias '{iface}' -NextHop '::' -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;",
-                iface = interface
-            ));
-        }
+    add_or_replace(
+        &mut manager,
+        &route_with_interface(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1, interface),
+    )?;
+    add_or_replace(
+        &mut manager,
+        &route_with_interface(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1, interface),
+    )?;
 
-        run_checked("powershell", &["-NoProfile", "-Command", &script])?;
-        return Ok(());
+    if ipv6_enabled {
+        add_or_replace(
+            &mut manager,
+            &route_with_interface(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, interface),
+        )?;
+        add_or_replace(
+            &mut manager,
+            &route_with_interface(
+                "8000::".parse::<Ipv6Addr>()?.into(),
+                1,
+                interface,
+            ),
+        )?;
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        run_checked("ip", &["route", "replace", "0.0.0.0/1", "dev", interface])?;
-        run_checked("ip", &["route", "replace", "128.0.0.0/1", "dev", interface])?;
-
-        if ipv6_enabled {
-            run_checked("ip", &["-6", "route", "replace", "::/1", "dev", interface])?;
-            run_checked("ip", &["-6", "route", "replace", "8000::/1", "dev", interface])?;
-        }
-        return Ok(());
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    {
-        run_checked("route", &["-n", "add", "-net", "0.0.0.0/1", "-interface", interface])?;
-        run_checked("route", &["-n", "add", "-net", "128.0.0.0/1", "-interface", interface])?;
-
-        if ipv6_enabled {
-            run_checked("route", &["-n", "add", "-inet6", "-net", "::/1", "-interface", interface])?;
-            run_checked("route", &["-n", "add", "-inet6", "-net", "8000::/1", "-interface", interface])?;
-        }
-        return Ok(());
-    }
-
-    #[allow(unreachable_code)]
     Ok(())
 }
 
 pub fn cleanup_auto_routes(interface: &str, ipv6_enabled: bool) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let mut script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '{iface}' -Confirm:$false -ErrorAction SilentlyContinue; \
-             Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '{iface}' -Confirm:$false -ErrorAction SilentlyContinue;",
-            iface = interface
-        );
+    let mut manager = new_route_manager()?;
 
-        if ipv6_enabled {
-            script.push_str(&format!(
-                " Remove-NetRoute -DestinationPrefix '::/1' -InterfaceAlias '{iface}' -Confirm:$false -ErrorAction SilentlyContinue; \
-                  Remove-NetRoute -DestinationPrefix '8000::/1' -InterfaceAlias '{iface}' -Confirm:$false -ErrorAction SilentlyContinue;",
-                iface = interface
-            ));
-        }
+    let v4_1 = route_with_interface(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1, interface);
+    let v4_2 = route_with_interface(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1, interface);
+    let _ = manager.delete(&v4_1);
+    let _ = manager.delete(&v4_2);
 
-        run_checked("powershell", &["-NoProfile", "-Command", &script])?;
-        return Ok(());
+    if ipv6_enabled {
+        let v6_1 = route_with_interface(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, interface);
+        let v6_2 = route_with_interface("8000::".parse::<Ipv6Addr>()?.into(), 1, interface);
+        let _ = manager.delete(&v6_1);
+        let _ = manager.delete(&v6_2);
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        run_best_effort("ip", &["route", "del", "0.0.0.0/1", "dev", interface]);
-        run_best_effort("ip", &["route", "del", "128.0.0.0/1", "dev", interface]);
-
-        if ipv6_enabled {
-            run_best_effort("ip", &["-6", "route", "del", "::/1", "dev", interface]);
-            run_best_effort("ip", &["-6", "route", "del", "8000::/1", "dev", interface]);
-        }
-        return Ok(());
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    {
-        run_best_effort("route", &["-n", "delete", "-net", "0.0.0.0/1", "-interface", interface]);
-        run_best_effort("route", &["-n", "delete", "-net", "128.0.0.0/1", "-interface", interface]);
-
-        if ipv6_enabled {
-            run_best_effort("route", &["-n", "delete", "-inet6", "-net", "::/1", "-interface", interface]);
-            run_best_effort("route", &["-n", "delete", "-inet6", "-net", "8000::/1", "-interface", interface]);
-        }
-        return Ok(());
-    }
-
-    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -177,74 +88,21 @@ pub fn apply_skip_ip_routes(skip_ips: &[IpAddr], outbound_interface: Option<&str
         return Ok(());
     }
 
-    #[cfg(windows)]
-    {
-        let ipv4_targets: Vec<String> = skip_ips
-            .iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4.to_string()),
-                _ => None,
-            })
-            .collect();
-        let ipv6_targets: Vec<String> = skip_ips
-            .iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => Some(v6.to_string()),
-                _ => None,
-            })
-            .collect();
+    let targets = skip_ips
+        .iter()
+        .copied()
+        .filter(|ip| match ip {
+            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+        })
+        .collect::<Vec<_>>();
 
-        let v4_route_query = match outbound_interface {
-            Some(interface) => format!(
-                "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{iface}' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1",
-                iface = ps_single_quote(interface)
-            ),
-            None => "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1".to_string(),
-        };
-        let v6_route_query = match outbound_interface {
-            Some(interface) => format!(
-                "Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{iface}' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1",
-                iface = ps_single_quote(interface)
-            ),
-            None => "Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1".to_string(),
-        };
-
-        let mut script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $v4={v4_query}; \
-             if (({need_v4}) -and -not $v4) {{ throw 'no usable IPv4 default route found for bypass setup' }}; \
-             if ($v4) {{",
-            v4_query = v4_route_query,
-            need_v4 = if ipv4_targets.is_empty() { "$false" } else { "$true" }
-        );
-
-        for ip in &ipv4_targets {
-            script.push_str(&format!(
-                " New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex $v4.InterfaceIndex -NextHop $v4.NextHop -RouteMetric $v4.RouteMetric -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;",
-                ip = ip
-            ));
-        }
-        script.push_str(" }");
-
-        script.push_str(&format!(
-            " $v6={v6_query}; if (({need_v6}) -and -not $v6) {{ throw 'no usable IPv6 default route found for bypass setup' }}; if ($v6) {{",
-            v6_query = v6_route_query,
-            need_v6 = if ipv6_targets.is_empty() { "$false" } else { "$true" }
-        ));
-        for ip in &ipv6_targets {
-            script.push_str(&format!(
-                " New-NetRoute -DestinationPrefix '{ip}/128' -InterfaceIndex $v6.InterfaceIndex -NextHop $v6.NextHop -RouteMetric $v6.RouteMetric -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;",
-                ip = ip
-            ));
-        }
-        script.push_str(" }");
-
-        run_checked("powershell", &["-NoProfile", "-Command", &script])?;
-        return Ok(());
-    }
-
-    #[allow(unreachable_code)]
-    Ok(())
+    let mut manager = new_route_manager()?;
+    apply_skip_prefixes(
+        &mut manager,
+        targets.iter().map(|ip| (*ip, single_host_prefix(*ip))),
+        outbound_interface,
+    )
 }
 
 pub fn cleanup_skip_ip_routes(skip_ips: &[IpAddr]) -> Result<()> {
@@ -252,35 +110,20 @@ pub fn cleanup_skip_ip_routes(skip_ips: &[IpAddr]) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(windows)]
-    {
-        let mut script = String::from(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; $OutputEncoding=[System.Text.UTF8Encoding]::UTF8;",
-        );
+    let mut manager = new_route_manager()?;
 
-        for ip in skip_ips {
-            match ip {
-                IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
-                    script.push_str(&format!(
-                        " Remove-NetRoute -DestinationPrefix '{ip}/32' -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue;",
-                        ip = v4
-                    ));
-                }
-                IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => {
-                    script.push_str(&format!(
-                        " Remove-NetRoute -DestinationPrefix '{ip}/128' -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue;",
-                        ip = v6
-                    ));
-                }
-                _ => {}
-            }
+    for ip in skip_ips {
+        let valid = match ip {
+            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+        };
+        if !valid {
+            continue;
         }
-
-        run_checked("powershell", &["-NoProfile", "-Command", &script])?;
-        return Ok(());
+        let route = SysRoute::new(*ip, single_host_prefix(*ip));
+        let _ = manager.delete(&route);
     }
 
-    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -292,85 +135,30 @@ pub fn apply_skip_network_routes(
         return Ok(());
     }
 
-    #[cfg(windows)]
-    {
-        let mut v4_prefixes = Vec::new();
-        let mut v6_prefixes = Vec::new();
-
-        for net in skip_networks {
-            if let Ok(parsed) = net.parse::<IpNetwork>() {
-                match parsed {
-                    IpNetwork::V4(v4) => {
-                        // Loopback keeps its local route and should not be forced to a gateway.
-                        if !v4.contains(std::net::Ipv4Addr::LOCALHOST) {
-                            v4_prefixes.push(v4.to_string());
-                        }
+    let mut prefixes = Vec::new();
+    for net in skip_networks {
+        if let Ok(parsed) = net.parse::<IpNetwork>() {
+            match parsed {
+                IpNetwork::V4(v4) => {
+                    if !v4.contains(Ipv4Addr::LOCALHOST) {
+                        prefixes.push((IpAddr::V4(v4.ip()), v4.prefix()));
                     }
-                    IpNetwork::V6(v6) => {
-                        // Localhost keeps its local route and should not be forced to a gateway.
-                        if !v6.contains(std::net::Ipv6Addr::LOCALHOST) {
-                            v6_prefixes.push(v6.to_string());
-                        }
+                }
+                IpNetwork::V6(v6) => {
+                    if !v6.contains(Ipv6Addr::LOCALHOST) {
+                        prefixes.push((IpAddr::V6(v6.ip()), v6.prefix()));
                     }
                 }
             }
         }
+    }
 
-        if v4_prefixes.is_empty() && v6_prefixes.is_empty() {
-            return Ok(());
-        }
-
-        let v4_route_query = match outbound_interface {
-            Some(interface) => format!(
-                "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{iface}' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1",
-                iface = ps_single_quote(interface)
-            ),
-            None => "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1".to_string(),
-        };
-        let v6_route_query = match outbound_interface {
-            Some(interface) => format!(
-                "Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{iface}' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1",
-                iface = ps_single_quote(interface)
-            ),
-            None => "Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1".to_string(),
-        };
-
-        let mut script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; $OutputEncoding=[System.Text.UTF8Encoding]::UTF8; \
-             $v4={v4_query}; \
-             if (({need_v4}) -and -not $v4) {{ throw 'no usable IPv4 default route found for bypass setup' }}; \
-             if ($v4) {{",
-            v4_query = v4_route_query,
-            need_v4 = if v4_prefixes.is_empty() { "$false" } else { "$true" }
-        );
-
-        for prefix in &v4_prefixes {
-            script.push_str(&format!(
-                " New-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex $v4.InterfaceIndex -NextHop $v4.NextHop -RouteMetric $v4.RouteMetric -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;",
-                prefix = prefix
-            ));
-        }
-        script.push_str(" }");
-
-        script.push_str(&format!(
-            " $v6={v6_query}; if (({need_v6}) -and -not $v6) {{ throw 'no usable IPv6 default route found for bypass setup' }}; if ($v6) {{",
-            v6_query = v6_route_query,
-            need_v6 = if v6_prefixes.is_empty() { "$false" } else { "$true" }
-        ));
-        for prefix in &v6_prefixes {
-            script.push_str(&format!(
-                " New-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex $v6.InterfaceIndex -NextHop $v6.NextHop -RouteMetric $v6.RouteMetric -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;",
-                prefix = prefix
-            ));
-        }
-        script.push_str(" }");
-
-        run_checked("powershell", &["-NoProfile", "-Command", &script])?;
+    if prefixes.is_empty() {
         return Ok(());
     }
 
-    #[allow(unreachable_code)]
-    Ok(())
+    let mut manager = new_route_manager()?;
+    apply_skip_prefixes(&mut manager, prefixes.into_iter(), outbound_interface)
 }
 
 pub fn cleanup_skip_network_routes(skip_networks: &[String]) -> Result<()> {
@@ -378,84 +166,234 @@ pub fn cleanup_skip_network_routes(skip_networks: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(windows)]
-    {
-        let mut script = String::from(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::UTF8; $OutputEncoding=[System.Text.UTF8Encoding]::UTF8;",
-        );
-
-        for net in skip_networks {
-            if let Ok(parsed) = net.parse::<IpNetwork>() {
-                match parsed {
-                    IpNetwork::V4(v4) => {
-                        if !v4.contains(std::net::Ipv4Addr::LOCALHOST) {
-                            script.push_str(&format!(
-                                " Remove-NetRoute -DestinationPrefix '{prefix}' -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue;",
-                                prefix = v4
-                            ));
-                        }
+    let mut manager = new_route_manager()?;
+    for net in skip_networks {
+        if let Ok(parsed) = net.parse::<IpNetwork>() {
+            let route = match parsed {
+                IpNetwork::V4(v4) => {
+                    if v4.contains(Ipv4Addr::LOCALHOST) {
+                        continue;
                     }
-                    IpNetwork::V6(v6) => {
-                        if !v6.contains(std::net::Ipv6Addr::LOCALHOST) {
-                            script.push_str(&format!(
-                                " Remove-NetRoute -DestinationPrefix '{prefix}' -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue;",
-                                prefix = v6
-                            ));
-                        }
-                    }
+                    SysRoute::new(IpAddr::V4(v4.ip()), v4.prefix())
                 }
-            }
-        }
+                IpNetwork::V6(v6) => {
+                    if v6.contains(Ipv6Addr::LOCALHOST) {
+                        continue;
+                    }
+                    SysRoute::new(IpAddr::V6(v6.ip()), v6.prefix())
+                }
+            };
 
-        run_checked("powershell", &["-NoProfile", "-Command", &script])?;
-        return Ok(());
+            let _ = manager.delete(&route);
+        }
     }
 
-    #[allow(unreachable_code)]
     Ok(())
 }
 
-fn run_checked(cmd: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to execute {}: {}", cmd, err))?;
+fn apply_skip_prefixes<I>(
+    manager: &mut SysRouteManager,
+    prefixes: I,
+    outbound_interface: Option<&str>,
+) -> Result<()>
+where
+    I: IntoIterator<Item = (IpAddr, u8)>,
+{
+    let entries = prefixes.into_iter().collect::<Vec<_>>();
 
-    if output.status.success() {
+    let has_v4_targets = entries.iter().any(|(ip, _)| ip.is_ipv4());
+    let has_v6_targets = entries.iter().any(|(ip, _)| ip.is_ipv6());
+
+    let has_v4_default = find_default_route_v4(None)?.is_some();
+    let has_v6_default = find_default_route_v6(None)?.is_some();
+
+    let v4_base = select_default_with_fallback(true, outbound_interface)?;
+    let v6_base = select_default_with_fallback(false, outbound_interface)?;
+
+    if has_v4_targets && has_v4_default && v4_base.is_none() {
+        return Err(anyhow!("no usable IPv4 default route found for bypass setup"));
+    }
+    if has_v6_targets && has_v6_default && v6_base.is_none() {
+        return Err(anyhow!("no usable IPv6 default route found for bypass setup"));
+    }
+
+    for (ip, prefix) in entries {
+        let base = if ip.is_ipv4() {
+            v4_base.as_ref()
+        } else {
+            v6_base.as_ref()
+        };
+
+        let Some(base) = base else {
+            continue;
+        };
+
+        let route = build_route_from_base(ip, prefix, base);
+        add_or_replace(manager, &route)?;
+    }
+
+    Ok(())
+}
+
+fn select_default_with_fallback(is_v4: bool, outbound_interface: Option<&str>) -> Result<Option<SysRoute>> {
+    if is_v4 {
+        if let Some(route) = find_default_route_v4(outbound_interface)? {
+            return Ok(Some(route));
+        }
+        if outbound_interface.is_some() {
+            return find_default_route_v4(None);
+        }
+        return Ok(None);
+    }
+
+    if let Some(route) = find_default_route_v6(outbound_interface)? {
+        return Ok(Some(route));
+    }
+    if outbound_interface.is_some() {
+        return find_default_route_v6(None);
+    }
+    Ok(None)
+}
+
+fn find_default_route_v4(interface: Option<&str>) -> Result<Option<SysRoute>> {
+    let mut manager = new_route_manager()?;
+    let mut routes = manager.list()?;
+    routes.retain(|r| r.destination().is_ipv4() && r.prefix() == 0);
+
+    #[cfg(target_os = "windows")]
+    filter_connected_windows_routes(&mut routes, true)?;
+
+    if let Some(iface) = interface {
+        routes.retain(|r| route_matches_interface(r, iface));
+    }
+    Ok(best_route(routes))
+}
+
+fn find_default_route_v6(interface: Option<&str>) -> Result<Option<SysRoute>> {
+    let mut manager = new_route_manager()?;
+    let mut routes = manager.list()?;
+    routes.retain(|r| r.destination().is_ipv6() && r.prefix() == 0);
+
+    #[cfg(target_os = "windows")]
+    filter_connected_windows_routes(&mut routes, false)?;
+
+    if let Some(iface) = interface {
+        routes.retain(|r| route_matches_interface(r, iface));
+    }
+    Ok(best_route(routes))
+}
+
+fn route_matches_interface(route: &SysRoute, interface: &str) -> bool {
+    route
+        .if_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(interface))
+}
+
+#[cfg(target_os = "windows")]
+fn filter_connected_windows_routes(routes: &mut Vec<SysRoute>, is_v4: bool) -> Result<()> {
+    let adapters = ipconfig::get_adapters()
+        .map_err(|err| anyhow!("failed to query local adapters: {}", err))?;
+
+    let connected = adapters
+        .into_iter()
+        .filter(|adapter| adapter.oper_status() == OperStatus::IfOperStatusUp)
+        .filter(|adapter| {
+            adapter
+                .gateways()
+                .iter()
+                .any(|gateway| if is_v4 { gateway.is_ipv4() } else { gateway.is_ipv6() })
+        })
+        .map(|adapter| adapter.friendly_name().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if connected.is_empty() {
         return Ok(());
     }
 
-    Err(anyhow!(
-        "command failed: {} {} => {}",
-        cmd,
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    ))
-}
+    let filtered = routes
+        .iter()
+        .filter(|route| {
+            route.if_name().is_some_and(|name| {
+                let lowered = name.to_ascii_lowercase();
+                connected.iter().any(|candidate| candidate == &lowered)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
 
-fn run_checked_capture_stdout(cmd: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to execute {}: {}", cmd, err))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    // Keep current behavior if adapter metadata cannot narrow candidates.
+    if !filtered.is_empty() {
+        *routes = filtered;
     }
 
-    Err(anyhow!(
-        "command failed: {} {} => {}",
-        cmd,
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    ))
+    Ok(())
 }
 
-fn ps_single_quote(value: &str) -> String {
-    value.replace('\'', "''")
+fn best_route(mut routes: Vec<SysRoute>) -> Option<SysRoute> {
+    routes.sort_by(compare_routes);
+    routes.into_iter().next()
 }
 
-#[cfg(not(windows))]
-fn run_best_effort(cmd: &str, args: &[&str]) {
-    let _ = Command::new(cmd).args(args).output();
+fn compare_routes(a: &SysRoute, b: &SysRoute) -> Ordering {
+    let am = route_metric(a);
+    let bm = route_metric(b);
+    match (am, bm) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn route_metric(route: &SysRoute) -> Option<u32> {
+    route.metric()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn route_metric(_route: &SysRoute) -> Option<u32> {
+    None
+}
+
+fn build_route_from_base(destination: IpAddr, prefix: u8, base: &SysRoute) -> SysRoute {
+    let mut route = SysRoute::new(destination, prefix);
+
+    if let Some(gateway) = base.gateway() {
+        route = route.with_gateway(gateway);
+    }
+    if let Some(if_index) = base.if_index() {
+        route = route.with_if_index(if_index);
+    }
+    if let Some(if_name) = base.if_name().cloned() {
+        route = route.with_if_name(if_name);
+    }
+
+    route
+}
+
+fn add_or_replace(manager: &mut SysRouteManager, route: &SysRoute) -> Result<()> {
+    if manager.add(route).is_ok() {
+        return Ok(());
+    }
+
+    let _ = manager.delete(route);
+    manager
+        .add(route)
+        .map_err(|err| anyhow!("failed to add route {}: {}", route, err))
+}
+
+fn route_with_interface(destination: IpAddr, prefix: u8, interface: &str) -> SysRoute {
+    SysRoute::new(destination, prefix).with_if_name(interface.to_string())
+}
+
+fn single_host_prefix(ip: IpAddr) -> u8 {
+    if ip.is_ipv4() {
+        32
+    } else {
+        128
+    }
+}
+
+fn new_route_manager() -> Result<SysRouteManager> {
+    SysRouteManager::new().map_err(|err| anyhow!("failed to create route manager: {}", err))
 }

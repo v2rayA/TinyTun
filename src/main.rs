@@ -11,13 +11,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use log::{error, info, warn};
+use env_logger::Builder;
+use log::{error, info, warn, LevelFilter};
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::config::{Config, DnsRoute, DnsServerEntry, Ipv6Mode};
+use crate::config::{Config, DnsRoute, DnsServerEntry, Ipv6Mode, LogLevel};
 use crate::tun_device::TunDevice;
 use crate::packet_processor::PacketProcessor;
 
@@ -53,6 +54,10 @@ enum Commands {
         /// Configuration file path
         #[arg(short, long)]
         config: Option<String>,
+
+        /// Log level: debug, info, warning, error, none
+        #[arg(long, value_enum)]
+        loglevel: Option<CliLogLevel>,
         
         /// SOCKS5 proxy address
         #[arg(short, long)]
@@ -102,6 +107,14 @@ enum Commands {
         #[arg(long = "exclude-process")]
         exclude_process: Vec<String>,
 
+        /// Linux process lookup backend: auto, ss, or ebpf
+        #[arg(long)]
+        linux_process_backend: Option<String>,
+
+        /// Linux eBPF flow cache file path (used when backend is auto/ebpf)
+        #[arg(long)]
+        linux_ebpf_cache_path: Option<String>,
+
         /// Auto-detect outbound physical interface for bypass routes
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         auto_detect_interface: Option<bool>,
@@ -114,13 +127,12 @@ enum Commands {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    env_logger::init();
-    
     let cli = Cli::parse();
     
     match cli.command {
         Commands::Run {
             config,
+            loglevel,
             socks5,
             dns,
             dns_route,
@@ -133,11 +145,14 @@ async fn main() -> Result<()> {
             ipv6_prefix,
             auto_route,
             exclude_process,
+            linux_process_backend,
+            linux_ebpf_cache_path,
             auto_detect_interface,
             default_interface,
         } => {
             let config = load_config(
                 config,
+                loglevel.map(Into::into),
                 socks5,
                 dns,
                 dns_route,
@@ -150,9 +165,12 @@ async fn main() -> Result<()> {
                 ipv6_prefix,
                 auto_route,
                 exclude_process,
+                linux_process_backend,
+                linux_ebpf_cache_path,
                 auto_detect_interface,
                 default_interface,
             )?;
+            init_logging(config.log.loglevel.clone());
             run_proxy(config).await
         }
     }
@@ -216,6 +234,7 @@ async fn run_proxy(config: Config) -> Result<()> {
         config.tun.netmask,
         if ipv6_enabled { Some(config.tun.ipv6) } else { None },
         config.tun.ipv6_prefix,
+        config.tun.auto_route,
     ).await {
         Ok(device) => device,
         Err(err) => {
@@ -233,7 +252,12 @@ async fn run_proxy(config: Config) -> Result<()> {
     
     // Create packet processor
     let tun_writer = tun_device.get_writer();
-    let processor = PacketProcessor::new(config.clone(), tun_writer);
+    let processor = PacketProcessor::new(
+        config.clone(),
+        tun_writer,
+        selected_outbound_interface.clone(),
+    );
+    let dynamic_bypass_ips_handle = processor.dynamic_bypass_ips_handle();
 
     // Apply automatic routes after TUN device is created
     if config.tun.auto_route {
@@ -268,6 +292,7 @@ async fn run_proxy(config: Config) -> Result<()> {
             let skip_ips = config.filtering.skip_ips.clone();
             let skip_networks = config.filtering.skip_networks.clone();
             let auto_detect_interface = config.route.auto_detect_interface;
+            let dynamic_bypass_ips_handle = dynamic_bypass_ips_handle.clone();
 
             interface_monitor_handle = Some(tokio::spawn(async move {
                 let mut active_interface = interface_name;
@@ -315,6 +340,24 @@ async fn run_proxy(config: Config) -> Result<()> {
                                         Some(new_interface.as_str()),
                                     )
                                 });
+
+                                let apply_result = if apply_result.is_ok() {
+                                    let dynamic_targets: Vec<std::net::IpAddr> = {
+                                        let guard = dynamic_bypass_ips_handle.lock().await;
+                                        guard.keys().copied().collect()
+                                    };
+
+                                    if dynamic_targets.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        route_manager::apply_skip_ip_routes(
+                                            &dynamic_targets,
+                                            Some(new_interface.as_str()),
+                                        )
+                                    }
+                                } else {
+                                    apply_result
+                                };
 
                                 match apply_result {
                                     Ok(()) => {
@@ -399,6 +442,18 @@ async fn run_proxy(config: Config) -> Result<()> {
         }
     }
 
+    if config.tun.auto_route {
+        let dynamic_targets: Vec<std::net::IpAddr> = {
+            let guard = dynamic_bypass_ips_handle.lock().await;
+            guard.keys().copied().collect()
+        };
+        if !dynamic_targets.is_empty() {
+            if let Err(err) = route_manager::cleanup_skip_ip_routes(&dynamic_targets) {
+                warn!("Failed to cleanup dynamic bypass routes: {}", err);
+            }
+        }
+    }
+
     if skip_ip_routes_applied {
         if let Err(err) = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips) {
             warn!("Failed to cleanup skip_ip bypass routes: {}", err);
@@ -423,6 +478,7 @@ async fn run_proxy(config: Config) -> Result<()> {
 
 fn load_config(
     config_path: Option<String>,
+    loglevel: Option<LogLevel>,
     socks5: Option<String>,
     dns: Vec<String>,
     dns_route: Vec<CliDnsRoute>,
@@ -435,6 +491,8 @@ fn load_config(
     ipv6_prefix: Option<u8>,
     auto_route: Option<bool>,
     exclude_process: Vec<String>,
+    linux_process_backend: Option<String>,
+    linux_ebpf_cache_path: Option<String>,
     auto_detect_interface: Option<bool>,
     default_interface: Option<String>,
 ) -> Result<Config> {
@@ -447,6 +505,10 @@ fn load_config(
     };
     
     // Override with CLI arguments if provided
+    if let Some(v) = loglevel {
+        config.log.loglevel = v;
+    }
+
     if let Some(socks5_addr) = socks5 {
         config.socks5.address = socks5_addr.parse()?;
     }
@@ -483,6 +545,24 @@ fn load_config(
     }
     if !exclude_process.is_empty() {
         config.filtering.exclude_processes = exclude_process;
+    }
+    if let Some(v) = linux_process_backend {
+        config.filtering.process_lookup.linux_backend = v;
+    }
+    if let Some(v) = linux_ebpf_cache_path {
+        config.filtering.process_lookup.linux_ebpf_cache_path = Some(v);
+    }
+
+    let backend = config
+        .filtering
+        .process_lookup
+        .linux_backend
+        .to_ascii_lowercase();
+    if backend != "auto" && backend != "ss" && backend != "ebpf" {
+        return Err(anyhow!(
+            "invalid linux_process_backend '{}': expected one of auto|ss|ebpf",
+            config.filtering.process_lookup.linux_backend
+        ));
     }
     if let Some(v) = auto_detect_interface {
         config.route.auto_detect_interface = v;
@@ -650,4 +730,54 @@ impl From<CliDnsRoute> for DnsRoute {
             CliDnsRoute::Proxy => DnsRoute::Proxy,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CliLogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+    None,
+}
+
+impl From<CliLogLevel> for LogLevel {
+    fn from(value: CliLogLevel) -> Self {
+        match value {
+            CliLogLevel::Debug => LogLevel::Debug,
+            CliLogLevel::Info => LogLevel::Info,
+            CliLogLevel::Warning => LogLevel::Warning,
+            CliLogLevel::Error => LogLevel::Error,
+            CliLogLevel::None => LogLevel::None,
+        }
+    }
+}
+
+fn init_logging(level: LogLevel) {
+    let level_filter = match level {
+        LogLevel::Debug => LevelFilter::Debug,
+        LogLevel::Info => LevelFilter::Info,
+        LogLevel::Warning => LevelFilter::Warn,
+        LogLevel::Error => LevelFilter::Error,
+        LogLevel::None => LevelFilter::Off,
+    };
+
+    let mut builder = Builder::new();
+    builder.filter_level(level_filter);
+    builder.format_timestamp_secs();
+    builder.format(|buf, record| {
+        use std::io::Write;
+
+        let lvl = match record.level() {
+            log::Level::Error => "Error",
+            log::Level::Warn => "Warning",
+            log::Level::Info => "Info",
+            log::Level::Debug => "Debug",
+            log::Level::Trace => "Debug",
+        };
+
+        writeln!(buf, "{} [{}] {}", buf.timestamp(), lvl, record.args())
+    });
+
+    let _ = builder.try_init();
 }

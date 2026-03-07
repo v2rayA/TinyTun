@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::{collections::BTreeMap, collections::HashMap, collections::HashSet, hash::Hash};
 use std::time::{Duration, Instant};
@@ -15,8 +15,9 @@ use etherparse::{
     Ipv4HeaderSlice, Ipv6HeaderSlice, PacketBuilder, TcpHeaderSlice, UdpHeader, UdpHeaderSlice,
 };
 use crate::config::Config;
-use crate::process_lookup::{self, TransportProtocol};
-use crate::socks5_client::Socks5Client;
+use crate::process_lookup::{self, ProcessLookupOptions, TransportProtocol};
+use crate::route_manager;
+use crate::socks5_client::{Socks5Client, Socks5UdpSession};
 
 struct ParsedIpPacket {
     src: IpAddr,
@@ -28,10 +29,14 @@ struct ParsedIpPacket {
 pub struct PacketProcessor {
     config: Config,
     socks5_client: Socks5Client,
+    process_lookup_options: ProcessLookupOptions,
+    outbound_interface: Option<String>,
     tun_writer: Arc<Mutex<tun::DeviceWriter>>,
     tcp_sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
     pending_connections: Arc<Mutex<HashSet<FlowKey>>>,
+    udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
     process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
+    dynamic_bypass_ips: Arc<Mutex<HashMap<IpAddr, Instant>>>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -64,6 +69,31 @@ struct ProcessLookupEntry {
 struct TcpSession {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     state: Arc<Mutex<TcpFlowState>>,
+}
+
+#[derive(Clone, Debug, Eq)]
+struct UdpFlowKey {
+    src: SocketAddr,
+    dst: SocketAddr,
+}
+
+impl PartialEq for UdpFlowKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.src == other.src && self.dst == other.dst
+    }
+}
+
+impl Hash for UdpFlowKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.src.hash(state);
+        self.dst.hash(state);
+    }
+}
+
+#[derive(Clone)]
+struct UdpSessionEntry {
+    session: Arc<Mutex<Socks5UdpSession>>,
+    last_activity: Instant,
 }
 
 #[derive(Debug)]
@@ -112,18 +142,36 @@ impl PacketProcessor {
     const TCP_REORDER_BUFFER_LIMIT: usize = 128 * 1024;
     const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
     const PROCESS_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5);
+    const DYNAMIC_BYPASS_ROUTE_TTL: Duration = Duration::from_secs(300);
+    const DYNAMIC_BYPASS_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+    const UDP_PROXY_TIMEOUT: Duration = Duration::from_secs(8);
+    const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
-    pub fn new(config: Config, tun_writer: Arc<Mutex<tun::DeviceWriter>>) -> Self {
+    pub fn new(
+        config: Config,
+        tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+        outbound_interface: Option<String>,
+    ) -> Self {
         let socks5_client = Socks5Client::new(config.socks5.clone());
+        let process_lookup_options = ProcessLookupOptions::from_config(&config);
         
         Self {
             config,
             socks5_client,
+            process_lookup_options,
+            outbound_interface,
             tun_writer,
             tcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_connections: Arc::new(Mutex::new(HashSet::new())),
+            udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             process_name_cache: Arc::new(Mutex::new(HashMap::new())),
+            dynamic_bypass_ips: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn dynamic_bypass_ips_handle(&self) -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
+        self.dynamic_bypass_ips.clone()
     }
     
     pub async fn process_packets(&self, tun_reader: Arc<Mutex<tun::DeviceReader>>) -> Result<()> {
@@ -131,11 +179,21 @@ impl PacketProcessor {
         
         let mut buffer = vec![0; self.config.tun.mtu as usize];
         let mut last_cleanup_at = Instant::now();
+        let mut last_dynamic_cleanup_at = Instant::now();
+        let mut last_udp_session_cleanup_at = Instant::now();
         
         loop {
             if last_cleanup_at.elapsed() >= Self::TCP_SESSION_CLEANUP_INTERVAL {
                 self.cleanup_expired_tcp_sessions().await;
                 last_cleanup_at = Instant::now();
+            }
+            if last_dynamic_cleanup_at.elapsed() >= Self::DYNAMIC_BYPASS_CLEANUP_INTERVAL {
+                self.cleanup_expired_dynamic_bypass_routes().await;
+                last_dynamic_cleanup_at = Instant::now();
+            }
+            if last_udp_session_cleanup_at.elapsed() >= Self::UDP_SESSION_CLEANUP_INTERVAL {
+                self.cleanup_expired_udp_sessions().await;
+                last_udp_session_cleanup_at = Instant::now();
             }
 
             let bytes_read = {
@@ -244,20 +302,39 @@ impl PacketProcessor {
             .should_exclude_process_flow(TransportProtocol::Tcp, source_addr, target_addr)
             .await
         {
-            let payload_seq_advance = (payload.len() as u32)
-                .wrapping_add(if tcp_header.syn() { 1 } else { 0 })
-                .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
-            let acknowledgment_number = tcp_header.sequence_number().wrapping_add(payload_seq_advance);
-            let _ = self
-                .inject_tcp_control_packet(
-                    &flow_key,
-                    0,
-                    acknowledgment_number,
-                    false,
-                    false,
-                    true,
-                )
-                .await;
+            let mut should_reset = !self.config.tun.auto_route;
+            if tcp_header.syn() && !tcp_header.ack() && self.config.tun.auto_route {
+                if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
+                    warn!(
+                        "Failed to install dynamic bypass route for excluded flow {}:{} -> {}:{}: {}",
+                        ip_packet.src,
+                        source_port,
+                        ip_packet.dst,
+                        dest_port,
+                        err
+                    );
+                    should_reset = true;
+                }
+            }
+
+            if should_reset {
+                let payload_seq_advance = (payload.len() as u32)
+                    .wrapping_add(if tcp_header.syn() { 1 } else { 0 })
+                    .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
+                let acknowledgment_number = tcp_header
+                    .sequence_number()
+                    .wrapping_add(payload_seq_advance);
+                let _ = self
+                    .inject_tcp_control_packet(
+                        &flow_key,
+                        0,
+                        acknowledgment_number,
+                        false,
+                        false,
+                        true,
+                    )
+                    .await;
+            }
             debug!(
                 "Excluded process flow (TCP) {}:{} -> {}:{}",
                 ip_packet.src,
@@ -655,14 +732,61 @@ impl PacketProcessor {
             debug!("Skipping UDP packet to port {}", dest_port);
             return Ok(());
         }
+
+        let source_addr = SocketAddr::new(ip_packet.src, source_port);
+        let target_addr = SocketAddr::new(ip_packet.dst, dest_port);
+
+        if !Self::is_proxyable_udp_destination(target_addr.ip()) {
+            debug!(
+                "Skipping local-scope UDP flow {}:{} -> {}:{}",
+                ip_packet.src,
+                source_port,
+                ip_packet.dst,
+                dest_port
+            );
+            return Ok(());
+        }
+
+        if self
+            .should_exclude_process_flow(TransportProtocol::Udp, source_addr, target_addr)
+            .await
+        {
+            if self.config.tun.auto_route {
+                if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
+                    warn!(
+                        "Failed to install dynamic bypass route for excluded UDP flow {}:{} -> {}:{}: {}",
+                        ip_packet.src,
+                        source_port,
+                        ip_packet.dst,
+                        dest_port,
+                        err
+                    );
+                }
+            }
+
+            debug!(
+                "Excluded process flow (UDP) {}:{} -> {}:{}",
+                ip_packet.src,
+                source_port,
+                ip_packet.dst,
+                dest_port
+            );
+            return Ok(());
+        }
         
         if dest_port == self.config.dns.listen_port {
             let udp_payload = &udp_data[UdpHeader::LEN..];
+            let dns_txid = Self::dns_txid(udp_payload);
             let response_payload = match self.forward_dns_query(udp_payload).await {
-                Ok(resp) => resp,
+                Ok(resp) => Self::normalize_dns_response_for_query(udp_payload, resp),
                 Err(err) => {
-                    warn!("DNS forwarding failed for {}:{}: {}", ip_packet.dst, dest_port, err);
-                    return Ok(());
+                    warn!(
+                        "DNS forwarding failed for {}:{}: {}; returning spoofed SERVFAIL",
+                        ip_packet.dst,
+                        dest_port,
+                        err
+                    );
+                    Self::build_dns_servfail_response(udp_payload)
                 }
             };
 
@@ -684,7 +808,10 @@ impl PacketProcessor {
             self.write_tun_packet(&response_packet).await?;
 
             debug!(
-                "Forwarded DNS query for {}:{} and injected {} bytes back to TUN",
+                "Captured DNS query txid={} for {}:{}; re-queried upstream and spoofed reply injected ({} bytes)",
+                dns_txid
+                    .map(|id| format!("0x{:04x}", id))
+                    .unwrap_or_else(|| "n/a".to_string()),
                 ip_packet.dst,
                 dest_port,
                 response_packet.len()
@@ -693,14 +820,178 @@ impl PacketProcessor {
             return Ok(());
         }
 
-        // Other UDP proxying is still pending full SOCKS5 UDP ASSOCIATE support.
-        warn!(
-            "UDP packet to port {} not proxied (only DNS UDP/{} is currently forwarded)",
+        let udp_payload = &udp_data[UdpHeader::LEN..];
+        let udp_flow_key = UdpFlowKey {
+            src: source_addr,
+            dst: target_addr,
+        };
+        let response_payload = match timeout(
+            Self::UDP_PROXY_TIMEOUT,
+            self.proxy_udp_with_reused_session(udp_flow_key.clone(), udp_payload),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => {
+                warn!(
+                    "UDP proxying failed for {}:{} -> {}:{}: {}",
+                    ip_packet.src,
+                    source_port,
+                    ip_packet.dst,
+                    dest_port,
+                    err
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(
+                    "UDP proxy timeout for {}:{} -> {}:{}",
+                    ip_packet.src,
+                    source_port,
+                    ip_packet.dst,
+                    dest_port
+                );
+                return Ok(());
+            }
+        };
+
+        let response_builder = match (ip_packet.dst, ip_packet.src) {
+            (IpAddr::V4(dst), IpAddr::V4(src)) => {
+                PacketBuilder::ipv4(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
+            }
+            (IpAddr::V6(dst), IpAddr::V6(src)) => {
+                PacketBuilder::ipv6(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
+            }
+            _ => return Ok(()),
+        };
+
+        let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
+        response_builder.write(&mut response_packet, &response_payload)?;
+        self.write_tun_packet(&response_packet).await?;
+
+        debug!(
+            "Proxied UDP flow {}:{} -> {}:{} and injected {} bytes back to TUN",
+            ip_packet.src,
+            source_port,
+            ip_packet.dst,
             dest_port,
-            self.config.dns.listen_port
+            response_packet.len()
         );
         
         Ok(())
+    }
+
+    fn is_proxyable_udp_destination(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                !(v4.is_multicast()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4 == Ipv4Addr::new(255, 255, 255, 255))
+            }
+            IpAddr::V6(v6) => {
+                !(v6.is_multicast()
+                    || v6.is_unicast_link_local()
+                    || v6.is_unspecified())
+            }
+        }
+    }
+
+    async fn proxy_udp_with_reused_session(
+        &self,
+        flow_key: UdpFlowKey,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        if let Some(session) = self.get_cached_udp_session(&flow_key).await {
+            match self.exchange_udp_on_session(session, &flow_key, payload).await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    debug!(
+                        "Existing UDP ASSOCIATE session failed for {} -> {}: {}; recreating",
+                        flow_key.src,
+                        flow_key.dst,
+                        err
+                    );
+                    self.remove_udp_session(&flow_key).await;
+                }
+            }
+        }
+
+        let session = self
+            .socks5_client
+            .open_udp_session(flow_key.dst)
+            .await
+            .map(|s| Arc::new(Mutex::new(s)))?;
+
+        {
+            let mut table = self.udp_sessions.lock().await;
+            table.insert(
+                flow_key.clone(),
+                UdpSessionEntry {
+                    session: session.clone(),
+                    last_activity: Instant::now(),
+                },
+            );
+        }
+
+        self.exchange_udp_on_session(session, &flow_key, payload).await
+    }
+
+    async fn exchange_udp_on_session(
+        &self,
+        session: Arc<Mutex<Socks5UdpSession>>,
+        flow_key: &UdpFlowKey,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let response = {
+            let mut guard = session.lock().await;
+            guard.exchange(flow_key.dst, payload).await
+        };
+
+        match response {
+            Ok(resp) => {
+                let mut table = self.udp_sessions.lock().await;
+                if let Some(entry) = table.get_mut(flow_key) {
+                    entry.last_activity = Instant::now();
+                }
+                Ok(resp)
+            }
+            Err(err) => {
+                self.remove_udp_session(flow_key).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn get_cached_udp_session(
+        &self,
+        flow_key: &UdpFlowKey,
+    ) -> Option<Arc<Mutex<Socks5UdpSession>>> {
+        let mut table = self.udp_sessions.lock().await;
+        if let Some(entry) = table.get_mut(flow_key) {
+            entry.last_activity = Instant::now();
+            return Some(entry.session.clone());
+        }
+        None
+    }
+
+    async fn remove_udp_session(&self, flow_key: &UdpFlowKey) {
+        let mut table = self.udp_sessions.lock().await;
+        table.remove(flow_key);
+    }
+
+    async fn cleanup_expired_udp_sessions(&self) {
+        let removed = {
+            let mut table = self.udp_sessions.lock().await;
+            let now = Instant::now();
+            let before = table.len();
+            table.retain(|_, entry| now.duration_since(entry.last_activity) < Self::UDP_SESSION_IDLE_TIMEOUT);
+            before.saturating_sub(table.len())
+        };
+
+        if removed > 0 {
+            debug!("Cleaned up {} idle UDP ASSOCIATE sessions", removed);
+        }
     }
 
     async fn forward_dns_query(&self, payload: &[u8]) -> Result<Vec<u8>> {
@@ -735,6 +1026,65 @@ impl PacketProcessor {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No DNS upstream server configured")))
+    }
+
+    fn dns_txid(payload: &[u8]) -> Option<u16> {
+        if payload.len() >= 2 {
+            Some(u16::from_be_bytes([payload[0], payload[1]]))
+        } else {
+            None
+        }
+    }
+
+    fn normalize_dns_response_for_query(query: &[u8], mut response: Vec<u8>) -> Vec<u8> {
+        if query.len() >= 2 && response.len() >= 2 {
+            // Force transaction id to match original captured request.
+            response[0] = query[0];
+            response[1] = query[1];
+        }
+
+        if response.len() >= 4 {
+            // Ensure QR=1 (response), keep the rest of flags from upstream.
+            response[2] |= 0x80;
+        }
+
+        response
+    }
+
+    fn build_dns_servfail_response(query: &[u8]) -> Vec<u8> {
+        let mut resp = Vec::with_capacity(query.len().max(12));
+
+        let txid = if query.len() >= 2 {
+            [query[0], query[1]]
+        } else {
+            [0x00, 0x00]
+        };
+
+        let qdcount = if query.len() >= 6 {
+            u16::from_be_bytes([query[4], query[5]])
+        } else {
+            0
+        };
+
+        // Header: QR=1, RD copied, RA=1, RCODE=2(SERVFAIL)
+        let rd = if query.len() >= 3 { query[2] & 0x01 } else { 0 };
+        let flags_hi = 0x80 | rd;
+        let flags_lo = 0x80 | 0x02;
+
+        resp.extend_from_slice(&txid);
+        resp.push(flags_hi);
+        resp.push(flags_lo);
+        resp.extend_from_slice(&qdcount.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+        resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+        if qdcount > 0 && query.len() > 12 {
+            // Echo original question section so client can correlate the failure quickly.
+            resp.extend_from_slice(&query[12..]);
+        }
+
+        resp
     }
 
     async fn forward_dns_query_direct(
@@ -818,6 +1168,83 @@ impl PacketProcessor {
         false
     }
 
+    async fn ensure_dynamic_bypass_for_ip(&self, ip: IpAddr) -> Result<()> {
+        if !self.config.tun.auto_route || self.config.should_skip_ip(ip) {
+            return Ok(());
+        }
+
+        {
+            let mut dynamic = self.dynamic_bypass_ips.lock().await;
+            if let Some(last_seen) = dynamic.get_mut(&ip) {
+                *last_seen = Instant::now();
+                return Ok(());
+            }
+        }
+
+        let outbound_interface = self.outbound_interface.clone();
+        let install_result = tokio::task::spawn_blocking(move || {
+            route_manager::apply_skip_ip_routes(&[ip], outbound_interface.as_deref())
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("dynamic bypass task join error: {}", err))?;
+
+        install_result?;
+
+        let mut dynamic = self.dynamic_bypass_ips.lock().await;
+        dynamic.insert(ip, Instant::now());
+        info!("Installed dynamic bypass route for excluded process destination {}", ip);
+        Ok(())
+    }
+
+    async fn cleanup_expired_dynamic_bypass_routes(&self) {
+        if !self.config.tun.auto_route {
+            return;
+        }
+
+        let expired_ips: Vec<IpAddr> = {
+            let mut dynamic = self.dynamic_bypass_ips.lock().await;
+            let now = Instant::now();
+            let expired: Vec<IpAddr> = dynamic
+                .iter()
+                .filter_map(|(ip, inserted_at)| {
+                    if now.duration_since(*inserted_at) >= Self::DYNAMIC_BYPASS_ROUTE_TTL {
+                        Some(*ip)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for ip in &expired {
+                dynamic.remove(ip);
+            }
+            expired
+        };
+
+        if expired_ips.is_empty() {
+            return;
+        }
+
+        let expired_count = expired_ips.len();
+        let cleanup_targets = expired_ips;
+        let cleanup_result = tokio::task::spawn_blocking(move || {
+            route_manager::cleanup_skip_ip_routes(&cleanup_targets)
+        })
+        .await;
+
+        match cleanup_result {
+            Ok(Ok(())) => {
+                debug!("Cleaned up {} expired dynamic bypass routes", expired_count);
+            }
+            Ok(Err(err)) => {
+                warn!("Failed to cleanup expired dynamic bypass routes: {}", err);
+            }
+            Err(err) => {
+                warn!("Dynamic bypass cleanup task join error: {}", err);
+            }
+        }
+    }
+
     async fn resolve_process_name_for_flow(
         &self,
         protocol: TransportProtocol,
@@ -834,8 +1261,9 @@ impl PacketProcessor {
             }
         }
 
+        let options = self.process_lookup_options.clone();
         let lookup = tokio::task::spawn_blocking(move || {
-            process_lookup::find_process_name_for_flow(protocol, src, dst)
+            process_lookup::find_process_name_for_flow(&options, protocol, src, dst)
         })
         .await
         .ok()
