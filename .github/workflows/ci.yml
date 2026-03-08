@@ -89,7 +89,9 @@ jobs:
           msystem: CLANG64
           update: true
           install: >-
-            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-llvm
 
       - name: Install MSYS2 toolchain (gnullvm aarch64)
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'aarch64-pc-windows-gnullvm'
@@ -100,6 +102,7 @@ jobs:
           install: >-
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-lld
+            mingw-w64-clang-aarch64-llvm
 
       - name: Install musl toolchain
         if: matrix.build_tool == 'cargo-musl'
@@ -131,6 +134,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: C:\msys64\clang64\bin\x86_64-w64-mingw32-clang.exe
         run: |
+          $env:PATH += ";C:\msys64\clang64\bin"
           if (-not (Test-Path $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER)) {
             throw "missing linker: $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER"
           }
@@ -142,6 +146,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER: C:\msys64\clangarm64\bin\aarch64-w64-mingw32-clang.exe
         run: |
+          $env:PATH += ";C:\msys64\clangarm64\bin"
           if (-not (Test-Path $env:CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER)) {
             throw "missing linker: $env:CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER"
           }
