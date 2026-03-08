@@ -300,11 +300,23 @@ async fn run_proxy(config: Config) -> Result<()> {
                 loop {
                     sleep(Duration::from_secs(5)).await;
 
-                    let routable = match route_manager::is_interface_routable(&active_interface) {
-                        Ok(v) => v,
-                        Err(err) => {
+                    let active_for_check = active_interface.clone();
+                    let routable = match tokio::task::spawn_blocking(move || {
+                        route_manager::is_interface_routable(&active_for_check)
+                    })
+                    .await
+                    {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(err)) => {
                             warn!(
                                 "Failed to check interface routability for {}: {}",
+                                active_interface, err
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Interface routability check task failed for {}: {}",
                                 active_interface, err
                             );
                             continue;
@@ -316,8 +328,12 @@ async fn run_proxy(config: Config) -> Result<()> {
                     }
 
                     if auto_detect_interface {
-                        match route_manager::resolve_route_interface(true, None) {
-                            Ok(Some(new_interface)) => {
+                        match tokio::task::spawn_blocking(|| {
+                            route_manager::resolve_route_interface(true, None)
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some(new_interface))) => {
                                 if new_interface == active_interface {
                                     continue;
                                 }
@@ -327,19 +343,39 @@ async fn run_proxy(config: Config) -> Result<()> {
                                     active_interface, new_interface
                                 );
 
-                                let _ = route_manager::cleanup_skip_network_routes(&skip_networks);
-                                let _ = route_manager::cleanup_skip_ip_routes(&skip_ips);
+                                let skip_networks_for_cleanup = skip_networks.clone();
+                                let skip_ips_for_cleanup = skip_ips.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = route_manager::cleanup_skip_network_routes(&skip_networks_for_cleanup);
+                                    let _ = route_manager::cleanup_skip_ip_routes(&skip_ips_for_cleanup);
+                                })
+                                .await;
 
-                                let apply_result = route_manager::apply_skip_ip_routes(
-                                    &skip_ips,
-                                    Some(new_interface.as_str()),
-                                )
-                                .and_then(|_| {
-                                    route_manager::apply_skip_network_routes(
-                                        &skip_networks,
-                                        Some(new_interface.as_str()),
+                                let skip_ips_for_apply = skip_ips.clone();
+                                let skip_networks_for_apply = skip_networks.clone();
+                                let apply_iface = new_interface.clone();
+                                let apply_result = match tokio::task::spawn_blocking(move || {
+                                    route_manager::apply_skip_ip_routes(
+                                        &skip_ips_for_apply,
+                                        Some(apply_iface.as_str()),
                                     )
-                                });
+                                    .and_then(|_| {
+                                        route_manager::apply_skip_network_routes(
+                                            &skip_networks_for_apply,
+                                            Some(apply_iface.as_str()),
+                                        )
+                                    })
+                                })
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(err) => {
+                                        Err(anyhow!(
+                                            "route switch apply task join error: {}",
+                                            err
+                                        ))
+                                    }
+                                };
 
                                 let apply_result = if apply_result.is_ok() {
                                     let dynamic_targets: Vec<std::net::IpAddr> = {
@@ -350,10 +386,21 @@ async fn run_proxy(config: Config) -> Result<()> {
                                     if dynamic_targets.is_empty() {
                                         Ok(())
                                     } else {
-                                        route_manager::apply_skip_ip_routes(
-                                            &dynamic_targets,
-                                            Some(new_interface.as_str()),
-                                        )
+                                        let dynamic_iface = new_interface.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            route_manager::apply_skip_ip_routes(
+                                                &dynamic_targets,
+                                                Some(dynamic_iface.as_str()),
+                                            )
+                                        })
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(err) => Err(anyhow!(
+                                                "dynamic bypass re-apply task join error: {}",
+                                                err
+                                            )),
+                                        }
                                     }
                                 } else {
                                     apply_result
@@ -378,15 +425,21 @@ async fn run_proxy(config: Config) -> Result<()> {
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            Ok(Ok(None)) => {
                                 warn!(
                                     "Outbound interface {} is gone and no replacement is currently routable",
                                     active_interface
                                 );
                             }
-                            Err(err) => {
+                            Ok(Err(err)) => {
                                 warn!(
                                     "Failed to auto-detect replacement outbound interface: {}",
+                                    err
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Auto-detect replacement interface task failed: {}",
                                     err
                                 );
                             }

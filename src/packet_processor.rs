@@ -8,7 +8,7 @@ use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{sleep, timeout};
 
 use etherparse::{
@@ -31,13 +31,16 @@ pub struct PacketProcessor {
     socks5_client: Socks5Client,
     process_lookup_options: ProcessLookupOptions,
     outbound_interface: Option<String>,
-    tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+    tun_packet_tx: mpsc::Sender<Vec<u8>>,
     tcp_sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
     pending_connections: Arc<Mutex<HashSet<FlowKey>>>,
     udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
     udp_timeout_backoff: Arc<Mutex<HashMap<UdpFlowKey, Instant>>>,
     process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
+    process_lookup_inflight: Arc<Mutex<HashSet<ProcessLookupKey>>>,
     dynamic_bypass_ips: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    dns_task_limiter: Arc<Semaphore>,
+    udp_task_limiter: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -149,6 +152,10 @@ impl PacketProcessor {
     const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
     const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
     const UDP_TIMEOUT_BACKOFF: Duration = Duration::from_secs(30);
+    const DNS_TASK_CONCURRENCY_LIMIT: usize = 256;
+    const UDP_TASK_CONCURRENCY_LIMIT: usize = 512;
+    const TUN_WRITE_QUEUE_CAPACITY: usize = 2048;
+    const TUN_WRITE_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(5);
 
     pub fn new(
         config: Config,
@@ -157,19 +164,36 @@ impl PacketProcessor {
     ) -> Self {
         let socks5_client = Socks5Client::new(config.socks5.clone());
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
+        let (tun_packet_tx, mut tun_packet_rx) = mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
+
+        tokio::spawn(async move {
+            while let Some(packet) = tun_packet_rx.recv().await {
+                let write_result = {
+                    let mut writer = tun_writer.lock().await;
+                    writer.write_all(&packet).await
+                };
+
+                if let Err(err) = write_result {
+                    warn!("Failed to write packet to TUN from writer queue: {}", err);
+                }
+            }
+        });
         
         Self {
             config,
             socks5_client,
             process_lookup_options,
             outbound_interface,
-            tun_writer,
+            tun_packet_tx,
             tcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_connections: Arc::new(Mutex::new(HashSet::new())),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             udp_timeout_backoff: Arc::new(Mutex::new(HashMap::new())),
             process_name_cache: Arc::new(Mutex::new(HashMap::new())),
+            process_lookup_inflight: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bypass_ips: Arc::new(Mutex::new(HashMap::new())),
+            dns_task_limiter: Arc::new(Semaphore::new(Self::DNS_TASK_CONCURRENCY_LIMIT)),
+            udp_task_limiter: Arc::new(Semaphore::new(Self::UDP_TASK_CONCURRENCY_LIMIT)),
         }
     }
 
@@ -396,7 +420,7 @@ impl PacketProcessor {
                 drop(pending);
 
                 let socks5_client = self.socks5_client.clone();
-                let tun_writer = self.tun_writer.clone();
+                let tun_packet_tx = self.tun_packet_tx.clone();
                 let tcp_sessions = self.tcp_sessions.clone();
                 let pending_connections = self.pending_connections.clone();
                 let mtu = self.config.tun.mtu as usize;
@@ -451,12 +475,12 @@ impl PacketProcessor {
                                 reader,
                                 session,
                                 tcp_sessions,
-                                tun_writer.clone(),
+                                tun_packet_tx.clone(),
                                 mtu,
                             );
 
                             let _ = PacketProcessor::inject_tcp_control(
-                                &tun_writer, &fk,
+                                &tun_packet_tx, &fk,
                                 syn_ack_seq, client_isn.wrapping_add(1),
                                 true, false, false,
                             ).await;
@@ -464,7 +488,7 @@ impl PacketProcessor {
                         Ok(Err(err)) => {
                             warn!("SOCKS5 connect failed for {:?}: {}", fk, err);
                             let _ = PacketProcessor::inject_tcp_control(
-                                &tun_writer, &fk,
+                                &tun_packet_tx, &fk,
                                 0, client_isn.wrapping_add(1),
                                 false, false, true,
                             ).await;
@@ -472,7 +496,7 @@ impl PacketProcessor {
                         Err(_) => {
                             warn!("SOCKS5 connect timed out for {:?}", fk);
                             let _ = PacketProcessor::inject_tcp_control(
-                                &tun_writer, &fk,
+                                &tun_packet_tx, &fk,
                                 0, client_isn.wrapping_add(1),
                                 false, false, true,
                             ).await;
@@ -778,14 +802,30 @@ impl PacketProcessor {
         }
         
         if dest_port == self.config.dns.listen_port {
+            let dns_permit = match self.dns_task_limiter.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    debug!(
+                        "Dropping DNS packet due to task concurrency limit {}:{} -> {}:{}",
+                        ip_packet.src,
+                        source_port,
+                        ip_packet.dst,
+                        dest_port
+                    );
+                    return Ok(());
+                }
+            };
+
             let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
             let socks5_client = self.socks5_client.clone();
             let dns_config = self.config.dns.clone();
-            let tun_writer = self.tun_writer.clone();
+            let tun_packet_tx = self.tun_packet_tx.clone();
             let src_ip = ip_packet.src;
             let dst_ip = ip_packet.dst;
 
             tokio::spawn(async move {
+                let _permit = dns_permit;
+
                 let dns_txid = PacketProcessor::dns_txid(&udp_payload);
                 let response_payload = match PacketProcessor::forward_dns_query_with(
                     socks5_client,
@@ -820,7 +860,8 @@ impl PacketProcessor {
                 if response_builder.write(&mut response_packet, &response_payload).is_err() {
                     return;
                 }
-                if PacketProcessor::write_tun_packet_with(tun_writer, response_packet.clone())
+                let response_len = response_packet.len();
+                if PacketProcessor::write_tun_packet_with(tun_packet_tx, response_packet)
                     .await
                     .is_err()
                 {
@@ -834,7 +875,7 @@ impl PacketProcessor {
                         .unwrap_or_else(|| "n/a".to_string()),
                     dst_ip,
                     dest_port,
-                    response_packet.len()
+                    response_len
                 );
             });
 
@@ -858,14 +899,30 @@ impl PacketProcessor {
             return Ok(());
         }
 
+        let udp_permit = match self.udp_task_limiter.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                debug!(
+                    "Dropping UDP packet due to task concurrency limit {}:{} -> {}:{}",
+                    ip_packet.src,
+                    source_port,
+                    ip_packet.dst,
+                    dest_port
+                );
+                return Ok(());
+            }
+        };
+
         let socks5_client = self.socks5_client.clone();
         let udp_sessions = self.udp_sessions.clone();
         let udp_timeout_backoff = self.udp_timeout_backoff.clone();
-        let tun_writer = self.tun_writer.clone();
+        let tun_packet_tx = self.tun_packet_tx.clone();
         let src_ip = ip_packet.src;
         let dst_ip = ip_packet.dst;
 
         tokio::spawn(async move {
+            let _permit = udp_permit;
+
             let response_payload = match timeout(
                 PacketProcessor::UDP_PROXY_TIMEOUT,
                 PacketProcessor::proxy_udp_with_reused_session_shared(
@@ -929,7 +986,8 @@ impl PacketProcessor {
             if response_builder.write(&mut response_packet, &response_payload).is_err() {
                 return;
             }
-            if PacketProcessor::write_tun_packet_with(tun_writer, response_packet.clone())
+            let response_len = response_packet.len();
+            if PacketProcessor::write_tun_packet_with(tun_packet_tx, response_packet)
                 .await
                 .is_err()
             {
@@ -942,7 +1000,7 @@ impl PacketProcessor {
                 source_port,
                 dst_ip,
                 dest_port,
-                response_packet.len()
+                response_len
             );
         });
         
@@ -1344,16 +1402,30 @@ impl PacketProcessor {
     }
 
     async fn write_tun_packet(&self, packet: &[u8]) -> Result<()> {
-        Self::write_tun_packet_with(self.tun_writer.clone(), packet.to_vec()).await
+        Self::write_tun_packet_with(self.tun_packet_tx.clone(), packet.to_vec()).await
     }
 
     async fn write_tun_packet_with(
-        tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+        tun_packet_tx: mpsc::Sender<Vec<u8>>,
         packet: Vec<u8>,
     ) -> Result<()> {
-        let mut writer = tun_writer.lock().await;
-        writer.write_all(&packet).await?;
-        Ok(())
+        Self::enqueue_tun_packet_with_timeout(tun_packet_tx, packet).await
+    }
+
+    async fn enqueue_tun_packet_with_timeout(
+        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        packet: Vec<u8>,
+    ) -> Result<()> {
+        match timeout(Self::TUN_WRITE_ENQUEUE_TIMEOUT, tun_packet_tx.send(packet)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(anyhow::anyhow!(
+                "failed to enqueue packet for TUN write: {}",
+                err
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "timed out enqueuing packet for TUN write"
+            )),
+        }
     }
 
     async fn should_exclude_process_flow(
@@ -1366,8 +1438,19 @@ impl PacketProcessor {
             return false;
         }
 
-        let process_name = self.resolve_process_name_for_flow(protocol, src, dst).await;
-        if let Some(name) = process_name {
+        let key = ProcessLookupKey { protocol, src, dst };
+        let cached_name = {
+            let cache = self.process_name_cache.lock().await;
+            cache.get(&key).and_then(|entry| {
+                if entry.recorded_at.elapsed() <= Self::PROCESS_LOOKUP_CACHE_TTL {
+                    entry.process_name.clone()
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(name) = cached_name {
             if self.config.is_excluded_process_name(&name) {
                 debug!(
                     "Excluded process matched: process={} protocol={:?} flow={} -> {}",
@@ -1375,9 +1458,51 @@ impl PacketProcessor {
                 );
                 return true;
             }
+
+            return false;
         }
 
+        self.schedule_process_lookup_refresh(key).await;
+
         false
+    }
+
+    async fn schedule_process_lookup_refresh(&self, key: ProcessLookupKey) {
+        let should_schedule = {
+            let mut inflight = self.process_lookup_inflight.lock().await;
+            inflight.insert(key.clone())
+        };
+
+        if !should_schedule {
+            return;
+        }
+
+        let cache = self.process_name_cache.clone();
+        let inflight = self.process_lookup_inflight.clone();
+        let options = self.process_lookup_options.clone();
+
+        tokio::spawn(async move {
+            let lookup = tokio::task::spawn_blocking(move || {
+                process_lookup::find_process_name_for_flow(&options, key.protocol, key.src, key.dst)
+            })
+            .await
+            .ok()
+            .flatten();
+
+            {
+                let mut table = cache.lock().await;
+                table.insert(
+                    key.clone(),
+                    ProcessLookupEntry {
+                        process_name: lookup,
+                        recorded_at: Instant::now(),
+                    },
+                );
+            }
+
+            let mut active = inflight.lock().await;
+            active.remove(&key);
+        });
     }
 
     async fn ensure_dynamic_bypass_for_ip(&self, ip: IpAddr) -> Result<()> {
@@ -1457,42 +1582,6 @@ impl PacketProcessor {
         }
     }
 
-    async fn resolve_process_name_for_flow(
-        &self,
-        protocol: TransportProtocol,
-        src: SocketAddr,
-        dst: SocketAddr,
-    ) -> Option<String> {
-        let key = ProcessLookupKey { protocol, src, dst };
-        {
-            let cache = self.process_name_cache.lock().await;
-            if let Some(entry) = cache.get(&key) {
-                if entry.recorded_at.elapsed() <= Self::PROCESS_LOOKUP_CACHE_TTL {
-                    return entry.process_name.clone();
-                }
-            }
-        }
-
-        let options = self.process_lookup_options.clone();
-        let lookup = tokio::task::spawn_blocking(move || {
-            process_lookup::find_process_name_for_flow(&options, protocol, src, dst)
-        })
-        .await
-        .ok()
-        .flatten();
-
-        let mut cache = self.process_name_cache.lock().await;
-        cache.insert(
-            key,
-            ProcessLookupEntry {
-                process_name: lookup.clone(),
-                recorded_at: Instant::now(),
-            },
-        );
-
-        lookup
-    }
-
     async fn inject_tcp_control_packet(
         &self,
         flow_key: &FlowKey,
@@ -1503,12 +1592,12 @@ impl PacketProcessor {
         rst: bool,
     ) -> Result<()> {
         Self::inject_tcp_control(
-            &self.tun_writer, flow_key, sequence_number, acknowledgment_number, syn, fin, rst,
+            &self.tun_packet_tx, flow_key, sequence_number, acknowledgment_number, syn, fin, rst,
         ).await
     }
 
     async fn inject_tcp_control(
-        tun_writer: &Arc<Mutex<tun::DeviceWriter>>,
+        tun_packet_tx: &mpsc::Sender<Vec<u8>>,
         flow_key: &FlowKey,
         sequence_number: u32,
         acknowledgment_number: u32,
@@ -1538,8 +1627,12 @@ impl PacketProcessor {
 
         let mut packet = Vec::with_capacity(builder.size(0));
         builder.write(&mut packet, &[])?;
-        let mut writer = tun_writer.lock().await;
-        writer.write_all(&packet).await?;
+        Self::enqueue_tun_packet_with_timeout(tun_packet_tx.clone(), packet)
+            .await
+            .map_err(|err| anyhow::anyhow!(
+                "failed to enqueue tcp control packet for TUN write: {}",
+                err
+            ))?;
         Ok(())
     }
 
@@ -1548,7 +1641,7 @@ impl PacketProcessor {
         mut reader: OwnedReadHalf,
         session: Arc<TcpSession>,
         sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
-        tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+        tun_packet_tx: mpsc::Sender<Vec<u8>>,
         mtu: usize,
     ) {
         tokio::spawn(async move {
@@ -1634,10 +1727,7 @@ impl PacketProcessor {
                         continue;
                     }
 
-                    let write_result = {
-                        let mut writer = tun_writer.lock().await;
-                        writer.write_all(&packet).await
-                    };
+                    let write_result = tun_packet_tx.send(packet).await;
 
                     if let Err(err) = write_result {
                         warn!("Failed to write reverse TCP packet to TUN for flow {:?}: {}", flow_key, err);
@@ -1679,10 +1769,7 @@ impl PacketProcessor {
 
                 let mut fin_packet = Vec::with_capacity(builder.size(0));
                 if builder.write(&mut fin_packet, &[]).is_ok() {
-                    let _ = {
-                        let mut writer = tun_writer.lock().await;
-                        writer.write_all(&fin_packet).await
-                    };
+                    let _ = tun_packet_tx.send(fin_packet).await;
                 }
             }
 
