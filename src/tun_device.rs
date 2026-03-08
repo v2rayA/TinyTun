@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use tun::{AbstractDevice, Configuration, DeviceReader, DeviceWriter};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct MacosDnsRestoreInfo {
     service: String,
     ipv4_servers: Vec<String>,
@@ -74,6 +75,11 @@ impl TunDevice {
         let device_name = device.tun_name()?;
         
         info!("TUN device created: {}", device_name);
+
+        #[cfg(target_os = "macos")]
+        if let Err(err) = Self::try_restore_macos_dns_from_persisted_state() {
+            warn!("Failed to restore stale macOS DNS state at startup: {}", err);
+        }
         
         // Set up the interface
         let setup_state = Self::setup_interface(
@@ -410,11 +416,27 @@ impl TunDevice {
                 }
             };
 
+            if let Some(state) = &restore {
+                if let Err(err) = Self::persist_macos_dns_restore_state(state) {
+                    warn!("Failed to persist macOS DNS restore state: {}", err);
+                }
+            }
+
             if let Err(err) = Self::configure_macos_dns_servers(
                 google_v4,
                 if ipv6.is_some() { Some(google_v6) } else { None },
             ) {
                 warn!("Failed to configure macOS DNS servers: {}", err);
+
+                if let Some(state) = &restore {
+                    if let Err(restore_err) = Self::restore_macos_dns_servers(state) {
+                        warn!("Failed to rollback macOS DNS after setup failure: {}", restore_err);
+                    }
+                }
+
+                if let Err(clear_err) = Self::clear_macos_dns_restore_state() {
+                    warn!("Failed to clear persisted macOS DNS restore state: {}", clear_err);
+                }
             }
 
             if restore.is_some() {
@@ -450,56 +472,7 @@ impl TunDevice {
     ) -> Result<()> {
         use std::process::Command;
 
-        let default_route = Command::new("route")
-            .args(["-n", "get", "default"])
-            .output()?;
-        if !default_route.status.success() {
-            return Err(anyhow::anyhow!(
-                "route get default failed: {}",
-                String::from_utf8_lossy(&default_route.stderr)
-            ));
-        }
-
-        let route_text = String::from_utf8_lossy(&default_route.stdout);
-        let default_device = route_text
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("interface: "))
-            .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("could not determine default route interface"))?;
-
-        let hw_ports = Command::new("networksetup")
-            .args(["-listallhardwareports"])
-            .output()?;
-        if !hw_ports.status.success() {
-            return Err(anyhow::anyhow!(
-                "networksetup -listallhardwareports failed: {}",
-                String::from_utf8_lossy(&hw_ports.stderr)
-            ));
-        }
-
-        let mut service_name: Option<String> = None;
-        let mut pending_port: Option<String> = None;
-        for raw in String::from_utf8_lossy(&hw_ports.stdout).lines() {
-            let line = raw.trim();
-            if let Some(port) = line.strip_prefix("Hardware Port: ") {
-                pending_port = Some(port.trim().to_string());
-                continue;
-            }
-
-            if let Some(device) = line.strip_prefix("Device: ") {
-                if device.trim() == default_device {
-                    service_name = pending_port.clone();
-                    break;
-                }
-            }
-        }
-
-        let service = service_name.ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not map default interface '{}' to a macOS network service",
-                default_device
-            )
-        })?;
+        let (service, default_device) = Self::resolve_active_macos_network_service()?;
 
         let set_v4 = Command::new("networksetup")
             .args([
@@ -547,6 +520,24 @@ impl TunDevice {
     fn capture_macos_dns_restore_info(
         v6_servers: Option<[Ipv6Addr; 2]>,
     ) -> Result<MacosDnsRestoreInfo> {
+        let (service, _) = Self::resolve_active_macos_network_service()?;
+
+        let ipv4_servers = Self::read_macos_dns_servers(&service, false)?;
+        let ipv6_servers = if v6_servers.is_some() {
+            Self::read_macos_dns_servers(&service, true)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(MacosDnsRestoreInfo {
+            service,
+            ipv4_servers,
+            ipv6_servers,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resolve_active_macos_network_service() -> Result<(String, String)> {
         use std::process::Command;
 
         let default_route = Command::new("route")
@@ -554,7 +545,7 @@ impl TunDevice {
             .output()?;
         if !default_route.status.success() {
             return Err(anyhow::anyhow!(
-                "route get default failed while capturing DNS restore state: {}",
+                "route get default failed: {}",
                 String::from_utf8_lossy(&default_route.stderr)
             ));
         }
@@ -564,14 +555,56 @@ impl TunDevice {
             .lines()
             .find_map(|line| line.trim().strip_prefix("interface: "))
             .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("could not determine default route interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("could not determine default route interface"))?
+            .to_string();
 
+        // Prefer service-order output because it respects user-renamed service names.
+        let service_order = Command::new("networksetup")
+            .args(["-listnetworkserviceorder"])
+            .output()?;
+        if service_order.status.success() {
+            let mut pending_service: Option<String> = None;
+            for raw in String::from_utf8_lossy(&service_order.stdout).lines() {
+                let line = raw.trim();
+
+                if line.starts_with('(') {
+                    if let Some(idx) = line.find(')') {
+                        let service = line[idx + 1..].trim();
+                        if !service.is_empty() && !service.starts_with('*') {
+                            pending_service = Some(service.to_string());
+                        } else {
+                            pending_service = None;
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(device_pos) = line.find("Device: ") {
+                    let device_part = &line[device_pos + "Device: ".len()..];
+                    let device = device_part
+                        .trim_end_matches(')')
+                        .trim()
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+
+                    if device == default_device {
+                        if let Some(service) = pending_service.take() {
+                            return Ok((service, default_device));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback for older layouts.
         let hw_ports = Command::new("networksetup")
             .args(["-listallhardwareports"])
             .output()?;
         if !hw_ports.status.success() {
             return Err(anyhow::anyhow!(
-                "networksetup -listallhardwareports failed while capturing DNS restore state: {}",
+                "networksetup service mapping failed: {}",
                 String::from_utf8_lossy(&hw_ports.stderr)
             ));
         }
@@ -599,19 +632,7 @@ impl TunDevice {
                 default_device
             )
         })?;
-
-        let ipv4_servers = Self::read_macos_dns_servers(&service, false)?;
-        let ipv6_servers = if v6_servers.is_some() {
-            Self::read_macos_dns_servers(&service, true)?
-        } else {
-            Vec::new()
-        };
-
-        Ok(MacosDnsRestoreInfo {
-            service,
-            ipv4_servers,
-            ipv6_servers,
-        })
+        Ok((service, default_device))
     }
 
     #[cfg(target_os = "macos")]
@@ -689,6 +710,57 @@ impl TunDevice {
         info!("Restored macOS DNS on service '{}'", state.service);
         Ok(())
     }
+
+    #[cfg(target_os = "macos")]
+    fn macos_dns_state_file_path() -> std::path::PathBuf {
+        std::env::temp_dir().join("tinytun-macos-dns-restore.json")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persist_macos_dns_restore_state(state: &MacosDnsRestoreInfo) -> Result<()> {
+        let path = Self::macos_dns_state_file_path();
+        let serialized = serde_json::to_vec(state)?;
+        std::fs::write(&path, serialized)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_macos_dns_restore_state() -> Result<Option<MacosDnsRestoreInfo>> {
+        let path = Self::macos_dns_state_file_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let data = std::fs::read(&path)?;
+        let state: MacosDnsRestoreInfo = serde_json::from_slice(&data)?;
+        Ok(Some(state))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn clear_macos_dns_restore_state() -> Result<()> {
+        let path = Self::macos_dns_state_file_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_restore_macos_dns_from_persisted_state() -> Result<()> {
+        let Some(state) = Self::load_macos_dns_restore_state()? else {
+            return Ok(());
+        };
+
+        if let Err(err) = Self::restore_macos_dns_servers(&state) {
+            // Keep state file for retry on next startup if restore still fails.
+            return Err(err);
+        }
+
+        Self::clear_macos_dns_restore_state()?;
+        Ok(())
+    }
     
     pub fn get_reader(&self) -> Arc<Mutex<DeviceReader>> {
         self.reader.clone()
@@ -734,6 +806,10 @@ impl TunDevice {
                 if let Err(err) = Self::restore_macos_dns_servers(state) {
                     warn!("Failed to restore macOS DNS settings: {}", err);
                 }
+            }
+
+            if let Err(err) = Self::clear_macos_dns_restore_state() {
+                warn!("Failed to clear persisted macOS DNS restore state: {}", err);
             }
 
             // utun devices are usually released when handle closes; mark down best-effort.
