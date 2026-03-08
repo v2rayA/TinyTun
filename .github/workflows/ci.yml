@@ -29,9 +29,8 @@ jobs:
             runner: windows-latest
             build_tool: cargo-gnullvm
           - target: aarch64-pc-windows-gnullvm
-            runner: windows-latest
+            runner: windows-11-arm
             build_tool: cargo-gnullvm
-
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             build_tool: cargo
@@ -59,10 +58,6 @@ jobs:
             runner: macos-latest
             build_tool: cargo
 
-          - target: x86_64-unknown-freebsd
-            runner: ubuntu-24.04
-            build_tool: cross
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,15 +82,24 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
 
-      - name: Install MSYS2 toolchains (gnullvm)
-        if: matrix.build_tool == 'cargo-gnullvm'
+      - name: Install MSYS2 toolchain (gnullvm x86_64)
+        if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'x86_64-pc-windows-gnullvm'
         uses: msys2/setup-msys2@v2
         with:
           msystem: CLANG64
           update: true
           install: >-
             mingw-w64-clang-x86_64-toolchain
-            mingw-w64-clang-aarch64-toolchain
+
+      - name: Install MSYS2 toolchain (gnullvm aarch64)
+        if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'aarch64-pc-windows-gnullvm'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-lld
 
       - name: Install musl toolchain
         if: matrix.build_tool == 'cargo-musl'
@@ -136,7 +140,7 @@ jobs:
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'aarch64-pc-windows-gnullvm'
         shell: pwsh
         env:
-          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER: C:\msys64\clang64\bin\aarch64-w64-mingw32-clang.exe
+          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER: C:\msys64\clangarm64\bin\aarch64-w64-mingw32-clang.exe
         run: |
           if (-not (Test-Path $env:CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER)) {
             throw "missing linker: $env:CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER"
