@@ -39,6 +39,11 @@ thiserror = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 ipconfig = "0.3"
+windows = { version = "0.61", features = [
+	"Win32_Foundation",
+	"Win32_System_Com",
+	"Win32_NetworkManagement_WindowsFirewall",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"

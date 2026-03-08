@@ -35,11 +35,43 @@ pub struct Config {
     #[serde(default)]
     pub log: LogConfig,
     pub tun: TunConfig,
+    #[serde(default)]
+    pub inbound: InboundConfig,
     pub socks5: Socks5Config,
     pub dns: DnsConfig,
     pub filtering: FilteringConfig,
     #[serde(default)]
     pub route: RouteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InboundMode {
+    Tun,
+    LinuxEbpf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InboundConfig {
+    pub mode: InboundMode,
+    pub linux_ebpf: LinuxEbpfIngressConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LinuxEbpfIngressConfig {
+    pub enabled: bool,
+    pub interface: Option<String>,
+    pub bpf_object: String,
+    pub bpf_section: String,
+    pub skip_map_path: String,
+    pub skip_map_v6_path: String,
+    pub mark: u32,
+    pub table_id: u32,
+    pub redirect_port: u16,
+    pub redirect_tcp: bool,
+    pub redirect_udp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +100,17 @@ pub struct DnsConfig {
     pub servers: Vec<DnsServerEntry>,
     pub listen_port: u16,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub hijack: DnsHijackConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsHijackConfig {
+    pub enabled: bool,
+    pub mark: u32,
+    pub table_id: u32,
+    pub capture_tcp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +156,7 @@ impl Default for Config {
         Self {
             log: LogConfig::default(),
             tun: TunConfig::default(),
+            inbound: InboundConfig::default(),
             socks5: Socks5Config::default(),
             dns: DnsConfig::default(),
             filtering: FilteringConfig::default(),
@@ -162,6 +206,18 @@ impl Default for DnsConfig {
             }],
             listen_port: 53,
             timeout_ms: 5000,
+            hijack: DnsHijackConfig::default(),
+        }
+    }
+}
+
+impl Default for DnsHijackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mark: 0x1,
+            table_id: 100,
+            capture_tcp: true,
         }
     }
 }
@@ -282,6 +338,39 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             loglevel: LogLevel::default(),
+        }
+    }
+}
+
+impl Default for InboundMode {
+    fn default() -> Self {
+        Self::Tun
+    }
+}
+
+impl Default for InboundConfig {
+    fn default() -> Self {
+        Self {
+            mode: InboundMode::Tun,
+            linux_ebpf: LinuxEbpfIngressConfig::default(),
+        }
+    }
+}
+
+impl Default for LinuxEbpfIngressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interface: None,
+            bpf_object: "/etc/tinytun/tinytun_ingress.bpf.o".to_string(),
+            bpf_section: "classifier/ingress".to_string(),
+            skip_map_path: "/sys/fs/bpf/tinytun/skip_v4".to_string(),
+            skip_map_v6_path: "/sys/fs/bpf/tinytun/skip_v6".to_string(),
+            mark: 0x233,
+            table_id: 233,
+            redirect_port: 15080,
+            redirect_tcp: true,
+            redirect_udp: true,
         }
     }
 }

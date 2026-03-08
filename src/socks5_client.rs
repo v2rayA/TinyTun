@@ -467,11 +467,9 @@ impl Socks5UdpSession {
         let request = Socks5Client::build_udp_request(target_addr, payload);
         self.udp_socket.send_to(&request, self.relay_addr).await?;
 
-        let mut recv_buf = vec![0u8; 65535];
+        let mut recv_buf = vec![0u8; 8192];
         let (n, _) = self.udp_socket.recv_from(&mut recv_buf).await?;
-        recv_buf.truncate(n);
-
-        let (_, response_payload) = Socks5Client::parse_udp_response(&recv_buf)?;
+        let (_, response_payload) = Socks5Client::parse_udp_response(&recv_buf[..n])?;
         Ok(response_payload)
     }
 }

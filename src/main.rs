@@ -6,8 +6,10 @@ mod packet_processor;
 mod error;
 mod route_manager;
 mod process_lookup;
+mod dns_hijack;
+mod ebpf_ingress;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -18,7 +20,8 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::config::{Config, DnsRoute, DnsServerEntry, Ipv6Mode, LogLevel};
+use crate::config::{Config, DnsRoute, DnsServerEntry, InboundMode, Ipv6Mode, LogLevel};
+use crate::dns_hijack::DnsHijackState;
 use crate::tun_device::TunDevice;
 use crate::packet_processor::PacketProcessor;
 
@@ -62,6 +65,18 @@ enum Commands {
         /// SOCKS5 proxy address
         #[arg(short, long)]
         socks5: Option<String>,
+
+        /// SOCKS5 username
+        #[arg(long)]
+        socks5_username: Option<String>,
+
+        /// SOCKS5 password
+        #[arg(long)]
+        socks5_password: Option<String>,
+
+        /// Use SOCKS5 path for DNS where applicable
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        socks5_dns_over_socks5: Option<bool>,
         
         /// DNS server address (repeatable)
         #[arg(long)]
@@ -74,6 +89,26 @@ enum Commands {
         /// Local DNS capture/forward listen port (default from config or built-in default)
         #[arg(long)]
         dns_listen_port: Option<u16>,
+
+        /// DNS upstream timeout in milliseconds
+        #[arg(long)]
+        dns_timeout_ms: Option<u64>,
+
+        /// Enable DNS hijack
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        dns_hijack_enabled: Option<bool>,
+
+        /// DNS hijack firewall mark (Linux)
+        #[arg(long)]
+        dns_hijack_mark: Option<u32>,
+
+        /// DNS hijack routing table id (Linux)
+        #[arg(long)]
+        dns_hijack_table_id: Option<u32>,
+
+        /// Capture TCP/53 in DNS hijack
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        dns_hijack_capture_tcp: Option<bool>,
         
         /// TUN device name
         #[arg(short, long)]
@@ -103,6 +138,26 @@ enum Commands {
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         auto_route: Option<bool>,
 
+        /// TUN MTU
+        #[arg(long)]
+        mtu: Option<u32>,
+
+        /// Skip IPs from proxy handling (repeatable)
+        #[arg(long = "skip-ip")]
+        skip_ip: Vec<IpAddr>,
+
+        /// Skip CIDR networks from proxy handling (repeatable)
+        #[arg(long = "skip-network")]
+        skip_network: Vec<String>,
+
+        /// Block destination ports (repeatable)
+        #[arg(long = "block-port")]
+        block_port: Vec<u16>,
+
+        /// Allow destination ports (repeatable)
+        #[arg(long = "allow-port")]
+        allow_port: Vec<u16>,
+
         /// Process names to exclude from proxy handling (repeatable)
         #[arg(long = "exclude-process")]
         exclude_process: Vec<String>,
@@ -115,6 +170,54 @@ enum Commands {
         #[arg(long)]
         linux_ebpf_cache_path: Option<String>,
 
+        /// Inbound traffic capture mode: tun or linux-ebpf
+        #[arg(long, value_enum)]
+        inbound_mode: Option<CliInboundMode>,
+
+        /// Enable Linux eBPF ingress mode settings
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        linux_ebpf_ingress_enabled: Option<bool>,
+
+        /// Linux ingress interface for eBPF attach (auto when omitted)
+        #[arg(long)]
+        linux_ebpf_ingress_interface: Option<String>,
+
+        /// Linux eBPF tc object file path
+        #[arg(long)]
+        linux_ebpf_bpf_object: Option<String>,
+
+        /// Linux eBPF tc section name
+        #[arg(long)]
+        linux_ebpf_bpf_section: Option<String>,
+
+        /// Linux pinned skip-map path for eBPF (LPM trie IPv4)
+        #[arg(long)]
+        linux_ebpf_skip_map_path: Option<String>,
+
+        /// Linux pinned skip-map path for eBPF (LPM trie IPv6)
+        #[arg(long)]
+        linux_ebpf_skip_map_v6_path: Option<String>,
+
+        /// Linux eBPF ingress fwmark value
+        #[arg(long)]
+        linux_ebpf_ingress_mark: Option<u32>,
+
+        /// Linux eBPF ingress policy routing table id
+        #[arg(long)]
+        linux_ebpf_ingress_table_id: Option<u32>,
+
+        /// Linux eBPF ingress redirect target port
+        #[arg(long)]
+        linux_ebpf_ingress_redirect_port: Option<u16>,
+
+        /// Redirect TCP in Linux eBPF ingress mode
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        linux_ebpf_ingress_redirect_tcp: Option<bool>,
+
+        /// Redirect UDP in Linux eBPF ingress mode
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        linux_ebpf_ingress_redirect_udp: Option<bool>,
+
         /// Auto-detect outbound physical interface for bypass routes
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         auto_detect_interface: Option<bool>,
@@ -125,7 +228,7 @@ enum Commands {
     },
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     
@@ -134,9 +237,17 @@ async fn main() -> Result<()> {
             config,
             loglevel,
             socks5,
+            socks5_username,
+            socks5_password,
+            socks5_dns_over_socks5,
             dns,
             dns_route,
             dns_listen_port,
+            dns_timeout_ms,
+            dns_hijack_enabled,
+            dns_hijack_mark,
+            dns_hijack_table_id,
+            dns_hijack_capture_tcp,
             interface,
             ip,
             netmask,
@@ -144,9 +255,26 @@ async fn main() -> Result<()> {
             ipv6,
             ipv6_prefix,
             auto_route,
+            mtu,
+            skip_ip,
+            skip_network,
+            block_port,
+            allow_port,
             exclude_process,
             linux_process_backend,
             linux_ebpf_cache_path,
+            inbound_mode,
+            linux_ebpf_ingress_enabled,
+            linux_ebpf_ingress_interface,
+            linux_ebpf_bpf_object,
+            linux_ebpf_bpf_section,
+            linux_ebpf_skip_map_path,
+            linux_ebpf_skip_map_v6_path,
+            linux_ebpf_ingress_mark,
+            linux_ebpf_ingress_table_id,
+            linux_ebpf_ingress_redirect_port,
+            linux_ebpf_ingress_redirect_tcp,
+            linux_ebpf_ingress_redirect_udp,
             auto_detect_interface,
             default_interface,
         } => {
@@ -154,9 +282,17 @@ async fn main() -> Result<()> {
                 config,
                 loglevel.map(Into::into),
                 socks5,
+                socks5_username,
+                socks5_password,
+                socks5_dns_over_socks5,
                 dns,
                 dns_route,
                 dns_listen_port,
+                dns_timeout_ms,
+                dns_hijack_enabled,
+                dns_hijack_mark,
+                dns_hijack_table_id,
+                dns_hijack_capture_tcp,
                 interface,
                 ip,
                 netmask,
@@ -164,9 +300,26 @@ async fn main() -> Result<()> {
                 ipv6,
                 ipv6_prefix,
                 auto_route,
+                mtu,
+                skip_ip,
+                skip_network,
+                block_port,
+                allow_port,
                 exclude_process,
                 linux_process_backend,
                 linux_ebpf_cache_path,
+                inbound_mode.map(Into::into),
+                linux_ebpf_ingress_enabled,
+                linux_ebpf_ingress_interface,
+                linux_ebpf_bpf_object,
+                linux_ebpf_bpf_section,
+                linux_ebpf_skip_map_path,
+                linux_ebpf_skip_map_v6_path,
+                linux_ebpf_ingress_mark,
+                linux_ebpf_ingress_table_id,
+                linux_ebpf_ingress_redirect_port,
+                linux_ebpf_ingress_redirect_tcp,
+                linux_ebpf_ingress_redirect_udp,
                 auto_detect_interface,
                 default_interface,
             )?;
@@ -180,6 +333,10 @@ async fn run_proxy(config: Config) -> Result<()> {
     info!("Starting TinyTun with configuration: {:?}", config);
 
     preflight_checks(&config).await?;
+
+    if matches!(config.inbound.mode, InboundMode::LinuxEbpf) {
+        return run_linux_ebpf_mode(config).await;
+    }
 
     let ipv6_enabled = resolve_ipv6_enabled(config.tun.ipv6_mode.clone());
     if ipv6_enabled {
@@ -278,6 +435,33 @@ async fn run_proxy(config: Config) -> Result<()> {
                     "failed to apply automatic routes while auto_route is enabled: {}",
                     err
                 ));
+            }
+        }
+    }
+
+    let mut dns_hijack_state: Option<DnsHijackState> = None;
+    if config.dns.hijack.enabled {
+        match dns_hijack::apply_dns_hijack(&config, tun_device.name()) {
+            Ok(state) => {
+                dns_hijack_state = state;
+                info!(
+                    "DNS hijack enabled (mark=0x{:x}, table={})",
+                    config.dns.hijack.mark,
+                    config.dns.hijack.table_id
+                );
+            }
+            Err(err) => {
+                if auto_route_applied {
+                    let _ = route_manager::cleanup_auto_routes(tun_device.name(), ipv6_enabled);
+                }
+                if skip_network_routes_applied {
+                    let _ = route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks);
+                }
+                if skip_ip_routes_applied {
+                    let _ = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips);
+                }
+                tun_device.cleanup().await?;
+                return Err(anyhow!("failed to apply DNS hijack: {}", err));
             }
         }
     }
@@ -495,6 +679,12 @@ async fn run_proxy(config: Config) -> Result<()> {
         }
     }
 
+    if config.dns.hijack.enabled {
+        if let Err(err) = dns_hijack::cleanup_dns_hijack(dns_hijack_state.as_ref()) {
+            warn!("Failed to cleanup DNS hijack rules: {}", err);
+        }
+    }
+
     if config.tun.auto_route {
         let dynamic_targets: Vec<std::net::IpAddr> = {
             let guard = dynamic_bypass_ips_handle.lock().await;
@@ -529,13 +719,48 @@ async fn run_proxy(config: Config) -> Result<()> {
     Ok(())
 }
 
+async fn run_linux_ebpf_mode(config: Config) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+        return Err(anyhow!("inbound.mode=linux-ebpf is only supported on Linux"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let state = ebpf_ingress::apply_ebpf_ingress(&config)?;
+
+        info!(
+            "Linux eBPF ingress mode is active on {} (redirect port {})",
+            state.interface, state.redirect_port
+        );
+
+        signal::ctrl_c().await?;
+        info!("Received shutdown signal");
+
+        if let Err(err) = ebpf_ingress::cleanup_ebpf_ingress(Some(&state)) {
+            warn!("Failed to cleanup eBPF ingress state: {}", err);
+        }
+
+        return Ok(());
+    }
+}
+
 fn load_config(
     config_path: Option<String>,
     loglevel: Option<LogLevel>,
     socks5: Option<String>,
+    socks5_username: Option<String>,
+    socks5_password: Option<String>,
+    socks5_dns_over_socks5: Option<bool>,
     dns: Vec<String>,
     dns_route: Vec<CliDnsRoute>,
     dns_listen_port: Option<u16>,
+    dns_timeout_ms: Option<u64>,
+    dns_hijack_enabled: Option<bool>,
+    dns_hijack_mark: Option<u32>,
+    dns_hijack_table_id: Option<u32>,
+    dns_hijack_capture_tcp: Option<bool>,
     interface: Option<String>,
     ip: Option<Ipv4Addr>,
     netmask: Option<Ipv4Addr>,
@@ -543,9 +768,26 @@ fn load_config(
     ipv6: Option<Ipv6Addr>,
     ipv6_prefix: Option<u8>,
     auto_route: Option<bool>,
+    mtu: Option<u32>,
+    skip_ip: Vec<IpAddr>,
+    skip_network: Vec<String>,
+    block_port: Vec<u16>,
+    allow_port: Vec<u16>,
     exclude_process: Vec<String>,
     linux_process_backend: Option<String>,
     linux_ebpf_cache_path: Option<String>,
+    inbound_mode: Option<InboundMode>,
+    linux_ebpf_ingress_enabled: Option<bool>,
+    linux_ebpf_ingress_interface: Option<String>,
+    linux_ebpf_bpf_object: Option<String>,
+    linux_ebpf_bpf_section: Option<String>,
+    linux_ebpf_skip_map_path: Option<String>,
+    linux_ebpf_skip_map_v6_path: Option<String>,
+    linux_ebpf_ingress_mark: Option<u32>,
+    linux_ebpf_ingress_table_id: Option<u32>,
+    linux_ebpf_ingress_redirect_port: Option<u16>,
+    linux_ebpf_ingress_redirect_tcp: Option<bool>,
+    linux_ebpf_ingress_redirect_udp: Option<bool>,
     auto_detect_interface: Option<bool>,
     default_interface: Option<String>,
 ) -> Result<Config> {
@@ -565,6 +807,15 @@ fn load_config(
     if let Some(socks5_addr) = socks5 {
         config.socks5.address = socks5_addr.parse()?;
     }
+    if let Some(v) = socks5_username {
+        config.socks5.username = Some(v);
+    }
+    if let Some(v) = socks5_password {
+        config.socks5.password = Some(v);
+    }
+    if let Some(v) = socks5_dns_over_socks5 {
+        config.socks5.dns_over_socks5 = v;
+    }
     
     if !dns.is_empty() {
         let dns_servers = build_dns_servers_from_cli(&dns, &dns_route)?;
@@ -573,6 +824,21 @@ fn load_config(
 
     if let Some(port) = dns_listen_port {
         config.dns.listen_port = port;
+    }
+    if let Some(v) = dns_timeout_ms {
+        config.dns.timeout_ms = v;
+    }
+    if let Some(v) = dns_hijack_enabled {
+        config.dns.hijack.enabled = v;
+    }
+    if let Some(v) = dns_hijack_mark {
+        config.dns.hijack.mark = v;
+    }
+    if let Some(v) = dns_hijack_table_id {
+        config.dns.hijack.table_id = v;
+    }
+    if let Some(v) = dns_hijack_capture_tcp {
+        config.dns.hijack.capture_tcp = v;
     }
     
     if let Some(name) = interface {
@@ -596,6 +862,21 @@ fn load_config(
     if let Some(v) = auto_route {
         config.tun.auto_route = v;
     }
+    if let Some(v) = mtu {
+        config.tun.mtu = v;
+    }
+    if !skip_ip.is_empty() {
+        config.filtering.skip_ips = skip_ip;
+    }
+    if !skip_network.is_empty() {
+        config.filtering.skip_networks = skip_network;
+    }
+    if !block_port.is_empty() {
+        config.filtering.block_ports = block_port;
+    }
+    if !allow_port.is_empty() {
+        config.filtering.allow_ports = allow_port;
+    }
     if !exclude_process.is_empty() {
         config.filtering.exclude_processes = exclude_process;
     }
@@ -604,6 +885,42 @@ fn load_config(
     }
     if let Some(v) = linux_ebpf_cache_path {
         config.filtering.process_lookup.linux_ebpf_cache_path = Some(v);
+    }
+    if let Some(v) = inbound_mode {
+        config.inbound.mode = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_enabled {
+        config.inbound.linux_ebpf.enabled = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_interface {
+        config.inbound.linux_ebpf.interface = Some(v);
+    }
+    if let Some(v) = linux_ebpf_bpf_object {
+        config.inbound.linux_ebpf.bpf_object = v;
+    }
+    if let Some(v) = linux_ebpf_bpf_section {
+        config.inbound.linux_ebpf.bpf_section = v;
+    }
+    if let Some(v) = linux_ebpf_skip_map_path {
+        config.inbound.linux_ebpf.skip_map_path = v;
+    }
+    if let Some(v) = linux_ebpf_skip_map_v6_path {
+        config.inbound.linux_ebpf.skip_map_v6_path = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_mark {
+        config.inbound.linux_ebpf.mark = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_table_id {
+        config.inbound.linux_ebpf.table_id = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_redirect_port {
+        config.inbound.linux_ebpf.redirect_port = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_redirect_tcp {
+        config.inbound.linux_ebpf.redirect_tcp = v;
+    }
+    if let Some(v) = linux_ebpf_ingress_redirect_udp {
+        config.inbound.linux_ebpf.redirect_udp = v;
     }
 
     let backend = config
@@ -711,6 +1028,10 @@ async fn preflight_checks(config: &Config) -> Result<()> {
                 "Windows administrator privileges are required to create a Wintun adapter. Please run the terminal as Administrator and retry."
             ));
         }
+    }
+
+    if matches!(config.inbound.mode, InboundMode::LinuxEbpf) {
+        return Ok(());
     }
 
     let socks_addr = config.socks5.address;
@@ -833,4 +1154,20 @@ fn init_logging(level: LogLevel) {
     });
 
     let _ = builder.try_init();
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CliInboundMode {
+    Tun,
+    #[value(name = "linux-ebpf")]
+    LinuxEbpf,
+}
+
+impl From<CliInboundMode> for InboundMode {
+    fn from(value: CliInboundMode) -> Self {
+        match value {
+            CliInboundMode::Tun => InboundMode::Tun,
+            CliInboundMode::LinuxEbpf => InboundMode::LinuxEbpf,
+        }
+    }
 }

@@ -143,19 +143,21 @@ impl PacketProcessor {
     const TCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
     const TCP_FIN_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
     const TCP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
-    const TCP_REORDER_BUFFER_LIMIT: usize = 128 * 1024;
+    const TCP_REORDER_BUFFER_LIMIT: usize = 64 * 1024;
     const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
     const PROCESS_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5);
     const DYNAMIC_BYPASS_ROUTE_TTL: Duration = Duration::from_secs(300);
     const DYNAMIC_BYPASS_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
     const UDP_PROXY_TIMEOUT: Duration = Duration::from_millis(1200);
-    const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
     const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
     const UDP_TIMEOUT_BACKOFF: Duration = Duration::from_secs(30);
-    const DNS_TASK_CONCURRENCY_LIMIT: usize = 256;
-    const UDP_TASK_CONCURRENCY_LIMIT: usize = 512;
-    const TUN_WRITE_QUEUE_CAPACITY: usize = 2048;
+    const DNS_TASK_CONCURRENCY_LIMIT: usize = 32;
+    const UDP_TASK_CONCURRENCY_LIMIT: usize = 64;
+    const TUN_WRITE_QUEUE_CAPACITY: usize = 512;
     const TUN_WRITE_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(5);
+    const PROCESS_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+    const PROCESS_CACHE_MAX_ENTRIES: usize = 1024;
 
     pub fn new(
         config: Config,
@@ -208,6 +210,7 @@ impl PacketProcessor {
         let mut last_cleanup_at = Instant::now();
         let mut last_dynamic_cleanup_at = Instant::now();
         let mut last_udp_session_cleanup_at = Instant::now();
+        let mut last_process_cache_cleanup_at = Instant::now();
         
         loop {
             if last_cleanup_at.elapsed() >= Self::TCP_SESSION_CLEANUP_INTERVAL {
@@ -221,6 +224,10 @@ impl PacketProcessor {
             if last_udp_session_cleanup_at.elapsed() >= Self::UDP_SESSION_CLEANUP_INTERVAL {
                 self.cleanup_expired_udp_sessions().await;
                 last_udp_session_cleanup_at = Instant::now();
+            }
+            if last_process_cache_cleanup_at.elapsed() >= Self::PROCESS_CACHE_CLEANUP_INTERVAL {
+                self.cleanup_process_lookup_cache().await;
+                last_process_cache_cleanup_at = Instant::now();
             }
 
             let bytes_read = {
@@ -1210,6 +1217,39 @@ impl PacketProcessor {
             let mut backoff = self.udp_timeout_backoff.lock().await;
             let now = Instant::now();
             backoff.retain(|_, until| *until > now);
+        }
+    }
+
+    async fn cleanup_process_lookup_cache(&self) {
+        let now = Instant::now();
+
+        {
+            let mut cache = self.process_name_cache.lock().await;
+            cache.retain(|_, entry| now.duration_since(entry.recorded_at) <= Self::PROCESS_LOOKUP_CACHE_TTL);
+
+            if cache.len() > Self::PROCESS_CACHE_MAX_ENTRIES {
+                let overflow = cache.len() - Self::PROCESS_CACHE_MAX_ENTRIES;
+                let mut entries = cache
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.recorded_at))
+                    .collect::<Vec<_>>();
+
+                entries.sort_by_key(|(_, recorded_at)| *recorded_at);
+
+                for (key, _) in entries.into_iter().take(overflow) {
+                    cache.remove(&key);
+                }
+            }
+        }
+
+        {
+            let cache_keys = {
+                let cache = self.process_name_cache.lock().await;
+                cache.keys().cloned().collect::<HashSet<_>>()
+            };
+
+            let mut inflight = self.process_lookup_inflight.lock().await;
+            inflight.retain(|key| !cache_keys.contains(key));
         }
     }
 

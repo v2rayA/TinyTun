@@ -12,6 +12,22 @@
     "auto_route": false,
     "mtu": 1500
   },
+  "inbound": {
+    "mode": "tun",
+    "linux_ebpf": {
+      "enabled": false,
+      "interface": null,
+      "bpf_object": "/etc/tinytun/tinytun_ingress.bpf.o",
+      "bpf_section": "classifier/ingress",
+      "skip_map_path": "/sys/fs/bpf/tinytun/skip_v4",
+      "skip_map_v6_path": "/sys/fs/bpf/tinytun/skip_v6",
+      "mark": 563,
+      "table_id": 233,
+      "redirect_port": 15080,
+      "redirect_tcp": true,
+      "redirect_udp": true
+    }
+  },
   "socks5": {
     "address": "192.168.12.138:20173",
     "username": null,
@@ -26,7 +42,13 @@
       }
     ],
     "listen_port": 53,
-    "timeout_ms": 5000
+    "timeout_ms": 5000,
+    "hijack": {
+      "enabled": false,
+      "mark": 1,
+      "table_id": 100,
+      "capture_tcp": true
+    }
   },
   "filtering": {
     "skip_ips": [
