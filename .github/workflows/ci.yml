@@ -134,7 +134,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: x86_64-w64-mingw32-clang.exe
         run: |
-          $env:PATH += ";C:\msys64\clang64\bin
+          $env:PATH += ";C:\msys64\clang64\bin"
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cargo, windows gnullvm aarch64)
