@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -42,7 +42,7 @@ impl DnsHandler {
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
         let response = timeout(timeout_duration, async move {
-            let mut socket = upstream_socket.lock().await;
+            let socket = upstream_socket.lock().await;
             socket.send_to(buffer, upstream_addr).await?;
             
             let mut response_buffer = vec![0; 512];
@@ -69,7 +69,7 @@ impl DnsHandler {
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
         let response = timeout(timeout_duration, async move {
-            let mut socket = upstream_socket.lock().await;
+            let socket = upstream_socket.lock().await;
             socket.send_to(&query, upstream_addr).await?;
             
             let mut response_buffer = vec![0; 512];
@@ -140,7 +140,7 @@ impl DnsHandler {
             
             let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
             let qclass = u16::from_be_bytes([response[pos + 2], response[pos + 3]]);
-            let ttl = u32::from_be_bytes([response[pos + 4], response[pos + 5], response[pos + 6], response[pos + 7]]);
+            let _ttl = u32::from_be_bytes([response[pos + 4], response[pos + 5], response[pos + 6], response[pos + 7]]);
             let data_len = u16::from_be_bytes([response[pos + 8], response[pos + 9]]);
             
             pos += 10;

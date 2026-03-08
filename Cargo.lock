@@ -1415,6 +1415,7 @@ dependencies = [
  "ipconfig",
  "ipnet",
  "ipnetwork",
+ "libc",
  "log",
  "netstat2",
  "route_manager",

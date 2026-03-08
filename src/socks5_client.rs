@@ -443,7 +443,7 @@ impl Socks5Client {
             
             let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
             let qclass = u16::from_be_bytes([response[pos + 2], response[pos + 3]]);
-            let ttl = u32::from_be_bytes([response[pos + 4], response[pos + 5], response[pos + 6], response[pos + 7]]);
+            let _ttl = u32::from_be_bytes([response[pos + 4], response[pos + 5], response[pos + 6], response[pos + 7]]);
             let data_len = u16::from_be_bytes([response[pos + 8], response[pos + 9]]);
             
             pos += 10;

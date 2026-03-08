@@ -24,8 +24,8 @@ pub enum TinyTunError {
     Dns(String),
 }
 
-impl From<etherparse::ReadError> for TinyTunError {
-    fn from(err: etherparse::ReadError) -> Self {
+impl From<etherparse::err::ReadError> for TinyTunError {
+    fn from(err: etherparse::err::ReadError) -> Self {
         TinyTunError::PacketParsing(format!("Etherparse error: {}", err))
     }
 }
