@@ -92,6 +92,7 @@ jobs:
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-lld
             mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-rust
 
       - name: Install MSYS2 toolchain (gnullvm aarch64)
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'aarch64-pc-windows-gnullvm'
@@ -103,6 +104,7 @@ jobs:
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-lld
             mingw-w64-clang-aarch64-llvm
+            mingw-w64-clang-aarch64-rust 
 
       - name: Install musl toolchain
         if: matrix.build_tool == 'cargo-musl'
@@ -130,20 +132,14 @@ jobs:
 
       - name: Build (cargo, windows gnullvm x86_64)
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'x86_64-pc-windows-gnullvm'
-        shell: pwsh
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: x86_64-w64-mingw32-clang.exe
+        shell: msys2 {0}
         run: |
-          $env:PATH += ";C:\msys64\clang64\bin"
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cargo, windows gnullvm aarch64)
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'aarch64-pc-windows-gnullvm'
-        shell: pwsh
-        env:
-          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER: aarch64-w64-mingw32-clang.exe
+        shell: msys2 {0}
         run: |
-          $env:PATH += ";C:\msys64\clangarm64\bin"
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cargo, musl)
