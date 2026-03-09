@@ -42,10 +42,18 @@ fn main() {
 
     // Standard Linux userspace API headers (linux/bpf.h, linux/if_ether.h …).
     // These ship with linux-libc-dev which is present on virtually every Linux
-    // development machine.  Prefer the multiarch path if it exists.
+    // development machine.
+    //
+    // IMPORTANT: BPF programs are *always compiled on the build host*, not on
+    // the cross-compilation target.  We therefore use the HOST triple (not
+    // CARGO_CFG_TARGET_ARCH) to find the correct multiarch include directory.
+    // For example, when cross-compiling for armv7 on an x86_64 host, clang
+    // compiles BPF code on x86_64 and needs /usr/include/x86_64-linux-gnu/
+    // (not /usr/include/arm-linux-gnueabihf/).
     let linux_inc = "/usr/include";
-    let rust_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let multiarch_prefix = match rust_arch.as_str() {
+    let host = std::env::var("HOST").unwrap_or_default();
+    let host_arch = host.split('-').next().unwrap_or("x86_64");
+    let multiarch_prefix = match host_arch {
         "x86_64"  => "x86_64-linux-gnu",
         "aarch64" => "aarch64-linux-gnu",
         "arm"     => "arm-linux-gnueabihf",
