@@ -63,10 +63,6 @@ pub struct InboundConfig {
 pub struct LinuxEbpfIngressConfig {
     pub enabled: bool,
     pub interface: Option<String>,
-    pub bpf_object: String,
-    pub bpf_section: String,
-    pub skip_map_path: String,
-    pub skip_map_v6_path: String,
     pub mark: u32,
     pub table_id: u32,
     pub redirect_port: u16,
@@ -362,15 +358,11 @@ impl Default for LinuxEbpfIngressConfig {
         Self {
             enabled: false,
             interface: None,
-            bpf_object: "/etc/tinytun/tinytun_ingress.bpf.o".to_string(),
-            bpf_section: "classifier/ingress".to_string(),
-            skip_map_path: "/sys/fs/bpf/tinytun/skip_v4".to_string(),
-            skip_map_v6_path: "/sys/fs/bpf/tinytun/skip_v6".to_string(),
             mark: 0x233,
             table_id: 233,
             redirect_port: 15080,
             redirect_tcp: true,
-            redirect_udp: true,
+            redirect_udp: false,
         }
     }
 }

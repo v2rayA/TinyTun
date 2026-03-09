@@ -8,6 +8,8 @@ mod route_manager;
 mod process_lookup;
 mod dns_hijack;
 mod ebpf_ingress;
+#[cfg(target_os = "linux")]
+mod ebpf_mode;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -182,22 +184,6 @@ enum Commands {
         #[arg(long)]
         linux_ebpf_ingress_interface: Option<String>,
 
-        /// Linux eBPF tc object file path
-        #[arg(long)]
-        linux_ebpf_bpf_object: Option<String>,
-
-        /// Linux eBPF tc section name
-        #[arg(long)]
-        linux_ebpf_bpf_section: Option<String>,
-
-        /// Linux pinned skip-map path for eBPF (LPM trie IPv4)
-        #[arg(long)]
-        linux_ebpf_skip_map_path: Option<String>,
-
-        /// Linux pinned skip-map path for eBPF (LPM trie IPv6)
-        #[arg(long)]
-        linux_ebpf_skip_map_v6_path: Option<String>,
-
         /// Linux eBPF ingress fwmark value
         #[arg(long)]
         linux_ebpf_ingress_mark: Option<u32>,
@@ -206,15 +192,15 @@ enum Commands {
         #[arg(long)]
         linux_ebpf_ingress_table_id: Option<u32>,
 
-        /// Linux eBPF ingress redirect target port
+        /// Linux eBPF ingress redirect target port (internal transparent listener)
         #[arg(long)]
         linux_ebpf_ingress_redirect_port: Option<u16>,
 
-        /// Redirect TCP in Linux eBPF ingress mode
+        /// Redirect TCP in Linux eBPF mode
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         linux_ebpf_ingress_redirect_tcp: Option<bool>,
 
-        /// Redirect UDP in Linux eBPF ingress mode
+        /// Redirect UDP in Linux eBPF mode
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         linux_ebpf_ingress_redirect_udp: Option<bool>,
 
@@ -266,10 +252,6 @@ async fn main() -> Result<()> {
             inbound_mode,
             linux_ebpf_ingress_enabled,
             linux_ebpf_ingress_interface,
-            linux_ebpf_bpf_object,
-            linux_ebpf_bpf_section,
-            linux_ebpf_skip_map_path,
-            linux_ebpf_skip_map_v6_path,
             linux_ebpf_ingress_mark,
             linux_ebpf_ingress_table_id,
             linux_ebpf_ingress_redirect_port,
@@ -311,10 +293,6 @@ async fn main() -> Result<()> {
                 inbound_mode.map(Into::into),
                 linux_ebpf_ingress_enabled,
                 linux_ebpf_ingress_interface,
-                linux_ebpf_bpf_object,
-                linux_ebpf_bpf_section,
-                linux_ebpf_skip_map_path,
-                linux_ebpf_skip_map_v6_path,
                 linux_ebpf_ingress_mark,
                 linux_ebpf_ingress_table_id,
                 linux_ebpf_ingress_redirect_port,
@@ -728,21 +706,7 @@ async fn run_linux_ebpf_mode(config: Config) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let state = ebpf_ingress::apply_ebpf_ingress(&config)?;
-
-        info!(
-            "Linux eBPF ingress mode is active on {} (redirect port {})",
-            state.interface, state.redirect_port
-        );
-
-        signal::ctrl_c().await?;
-        info!("Received shutdown signal");
-
-        if let Err(err) = ebpf_ingress::cleanup_ebpf_ingress(Some(&state)) {
-            warn!("Failed to cleanup eBPF ingress state: {}", err);
-        }
-
-        return Ok(());
+        ebpf_mode::run(config).await
     }
 }
 
@@ -773,16 +737,12 @@ fn load_config(
     skip_network: Vec<String>,
     block_port: Vec<u16>,
     allow_port: Vec<u16>,
-    exclude_process: Vec<String>,
+    linux_exclude_process: Vec<String>,
     linux_process_backend: Option<String>,
     linux_ebpf_cache_path: Option<String>,
     inbound_mode: Option<InboundMode>,
     linux_ebpf_ingress_enabled: Option<bool>,
     linux_ebpf_ingress_interface: Option<String>,
-    linux_ebpf_bpf_object: Option<String>,
-    linux_ebpf_bpf_section: Option<String>,
-    linux_ebpf_skip_map_path: Option<String>,
-    linux_ebpf_skip_map_v6_path: Option<String>,
     linux_ebpf_ingress_mark: Option<u32>,
     linux_ebpf_ingress_table_id: Option<u32>,
     linux_ebpf_ingress_redirect_port: Option<u16>,
@@ -798,7 +758,7 @@ fn load_config(
     } else {
         Config::default()
     };
-    
+
     // Override with CLI arguments if provided
     if let Some(v) = loglevel {
         config.log.loglevel = v;
@@ -816,7 +776,7 @@ fn load_config(
     if let Some(v) = socks5_dns_over_socks5 {
         config.socks5.dns_over_socks5 = v;
     }
-    
+
     if !dns.is_empty() {
         let dns_servers = build_dns_servers_from_cli(&dns, &dns_route)?;
         config.dns.servers = dns_servers;
@@ -840,7 +800,7 @@ fn load_config(
     if let Some(v) = dns_hijack_capture_tcp {
         config.dns.hijack.capture_tcp = v;
     }
-    
+
     if let Some(name) = interface {
         config.tun.name = name;
     }
@@ -877,8 +837,8 @@ fn load_config(
     if !allow_port.is_empty() {
         config.filtering.allow_ports = allow_port;
     }
-    if !exclude_process.is_empty() {
-        config.filtering.exclude_processes = exclude_process;
+    if !linux_exclude_process.is_empty() {
+        config.filtering.exclude_processes = linux_exclude_process;
     }
     if let Some(v) = linux_process_backend {
         config.filtering.process_lookup.linux_backend = v;
@@ -894,18 +854,6 @@ fn load_config(
     }
     if let Some(v) = linux_ebpf_ingress_interface {
         config.inbound.linux_ebpf.interface = Some(v);
-    }
-    if let Some(v) = linux_ebpf_bpf_object {
-        config.inbound.linux_ebpf.bpf_object = v;
-    }
-    if let Some(v) = linux_ebpf_bpf_section {
-        config.inbound.linux_ebpf.bpf_section = v;
-    }
-    if let Some(v) = linux_ebpf_skip_map_path {
-        config.inbound.linux_ebpf.skip_map_path = v;
-    }
-    if let Some(v) = linux_ebpf_skip_map_v6_path {
-        config.inbound.linux_ebpf.skip_map_v6_path = v;
     }
     if let Some(v) = linux_ebpf_ingress_mark {
         config.inbound.linux_ebpf.mark = v;
