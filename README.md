@@ -13,15 +13,21 @@ TinyTun is a Rust-based transparent proxy runner with two inbound modes:
 - Linux/macOS/Windows supported
 - Windows requires `wintun.dll` beside `tinytun.exe` or in `PATH`
 
-### Additional build requirements for `linux-ebpf` mode
+### Additional build requirements for `linux-ebpf` mode (Linux only)
+
+The eBPF programs are only compiled when building on/for Linux.
 
 - `clang` (any version with `-target bpf` support, e.g. clang-15+)
-- `libbpf-dev` (provides `/usr/include/bpf/bpf_helpers.h`)
-- Linux kernel headers (`linux-headers-$(uname -r)`)
+- Standard Linux userspace API headers (`linux-libc-dev` on Debian/Ubuntu;
+  present by default on most Linux development machines)
+
+> **Note:** `libbpf-dev` is **not** required — the necessary libbpf helper
+> headers (`bpf_helpers.h`, `bpf_endian.h`, `bpf_helper_defs.h`) are vendored
+> in `bpf/include/` and used automatically during the build.
 
 Example (Ubuntu/Debian):
 ```bash
-sudo apt-get install clang libbpf-dev linux-headers-$(uname -r)
+sudo apt-get install clang
 ```
 
 ## Build
