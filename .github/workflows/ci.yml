@@ -64,6 +64,7 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        if: matrix.target != 'x86_64-pc-windows-gnullvm' && matrix.target != 'aarch64-pc-windows-gnullvm'
         with:
           targets: ${{ matrix.target }}
 
