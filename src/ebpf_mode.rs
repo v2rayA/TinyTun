@@ -89,14 +89,12 @@ pub async fn run(config: Config) -> Result<()> {
     );
 
     // Spawn the accept/proxy loop.
-    let redirect_port = state.redirect_port;
     let socks5_config = config.socks5.clone();
     let skip_ips: Vec<IpAddr> = config.filtering.skip_ips.clone();
     let skip_networks: Vec<String> = config.filtering.skip_networks.clone();
 
     // Build a Tokio listener from the raw fd that is already in the sockmap.
     let raw_fd = state._listener.as_raw_fd();
-    let _ = redirect_port; // port info already set on the socket
 
     // Clone the raw fd into a non-owning duplicate so Tokio can own its copy
     // while `_listener` in `state` keeps the original alive (and the
@@ -542,8 +540,18 @@ async fn proxy_tcp(
     let p2c = tokio::io::copy(&mut pr, &mut cw);
 
     tokio::select! {
-        res = c2p => { let _ = pw.shutdown().await; res?; }
-        res = p2c => { let _ = cw.shutdown().await; res?; }
+        res = c2p => {
+            if let Err(e) = pw.shutdown().await {
+                log::debug!("proxy write shutdown error for {}: {}", original_dst, e);
+            }
+            res?;
+        }
+        res = p2c => {
+            if let Err(e) = cw.shutdown().await {
+                log::debug!("client write shutdown error for {}: {}", original_dst, e);
+            }
+            res?;
+        }
     }
 
     Ok(())

@@ -33,15 +33,17 @@ fn main() {
     let linux_inc = "/usr/include";
 
     // For cross-compiled or multiarch systems the kernel headers can live in
-    // an arch-specific subdirectory.
-    let multiarch_inc = format!(
-        "/usr/include/{}-linux-gnu",
-        std::env::var("CARGO_CFG_TARGET_ARCH")
-            .as_deref()
-            .unwrap_or("x86_64")
-            .replace("x86_64", "x86_64")
-            .replace("aarch64", "aarch64")
-    );
+    // an arch-specific subdirectory.  Map Rust target arch names to their
+    // multiarch tuple prefixes.
+    let rust_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let multiarch_prefix = match rust_arch.as_str() {
+        "x86_64" => "x86_64-linux-gnu",
+        "aarch64" => "aarch64-linux-gnu",
+        "arm" => "arm-linux-gnueabihf",
+        "riscv64" => "riscv64-linux-gnu",
+        _ => "x86_64-linux-gnu", // sensible fallback
+    };
+    let multiarch_inc = format!("/usr/include/{}", multiarch_prefix);
 
     let status = Command::new(&clang)
         .args([
