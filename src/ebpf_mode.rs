@@ -81,7 +81,17 @@ pub struct EbpfModeState {
 /// Entry point: set up eBPF, policy routing, transparent proxy listener,
 /// then run the accept loop until a shutdown signal is received.
 pub async fn run(config: Config) -> Result<()> {
-    let state = setup(&config)?;
+    // Extract fields needed after setup before moving config into the closure.
+    let socks5_config = config.socks5.clone();
+    let skip_ips: Vec<IpAddr> = config.filtering.skip_ips.clone();
+    let skip_networks: Vec<String> = config.filtering.skip_networks.clone();
+
+    // Run the synchronous setup (BPF load + map init) on a blocking thread so
+    // tokio worker threads are not starved and the BPF loader sees a clean
+    // single-threaded call stack.
+    let state = tokio::task::spawn_blocking(move || setup(&config))
+        .await
+        .map_err(|e| anyhow!("setup task panicked: {e}"))??;
 
     info!(
         "Linux eBPF mode active on {} (mark=0x{:x}, table={}, port={})",
@@ -89,9 +99,6 @@ pub async fn run(config: Config) -> Result<()> {
     );
 
     // Spawn the accept/proxy loop.
-    let socks5_config = config.socks5.clone();
-    let skip_ips: Vec<IpAddr> = config.filtering.skip_ips.clone();
-    let skip_networks: Vec<String> = config.filtering.skip_networks.clone();
 
     // Build a Tokio listener from the raw fd that is already in the sockmap.
     let raw_fd = state._listener.as_raw_fd();
@@ -171,7 +178,11 @@ fn setup(config: &Config) -> Result<EbpfModeState> {
     let listener_std = create_transparent_listener(ingress.redirect_port)?;
 
     // Load the embedded BPF object.
-    let mut bpf = Ebpf::load(BPF_OBJECT).map_err(|e| anyhow!("failed to load BPF object: {}", e))?;
+    // Copy to a heap Vec first – aya 0.13.x can misparse static &[u8] slices in
+    // multi-threaded tokio contexts; heap-allocated bytes parse reliably.
+    let bpf_bytes: Vec<u8> = BPF_OBJECT.to_vec();
+    let mut bpf = Ebpf::load(&bpf_bytes)
+        .map_err(|e| anyhow!("failed to load BPF object: {e:#}"))?;
 
     // Populate CONFIG map: [0] = fwmark, [1] = lo ifindex.
     {

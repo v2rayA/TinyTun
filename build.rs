@@ -74,7 +74,10 @@ fn main() {
             "-target",
             "bpf",
             "-O2",
+            // Keep BTF debug info enabled (required by aya map/program parsing)
+            // while disabling addrsig metadata for compatibility.
             "-g",
+            "-fno-addrsig",
             "-Wall",
             "-Wno-unused-value",
             "-Wno-pointer-sign",
