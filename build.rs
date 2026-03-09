@@ -32,6 +32,7 @@ fn main() {
     println!("cargo:rerun-if-changed=bpf/include/bpf/bpf_helpers.h");
     println!("cargo:rerun-if-changed=bpf/include/bpf/bpf_helper_defs.h");
     println!("cargo:rerun-if-changed=bpf/include/bpf/bpf_endian.h");
+    println!("cargo:rerun-if-changed=bpf/include/linux/bpf.h");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let out_obj = PathBuf::from(&out_dir).join("tinytun.bpf.o");
