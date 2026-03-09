@@ -1,17 +1,20 @@
+//! Legacy eBPF ingress module — superseded by `ebpf_mode`.
+//!
+//! This module is retained for reference.  It used external BPF object files
+//! and iptables rules.  The new implementation in `ebpf_mode` embeds the BPF
+//! object and uses sk_lookup + policy routing instead of iptables.
+#![allow(dead_code)]
+
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
-#[cfg(target_os = "linux")]
-use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
 #[cfg(target_os = "linux")]
 use ipnetwork::IpNetwork;
-#[cfg(target_os = "linux")]
-use log::info;
 
 use crate::config::Config;
 
@@ -41,193 +44,12 @@ pub struct EbpfIngressState {
 
 #[cfg(target_os = "linux")]
 pub fn apply_ebpf_ingress(config: &Config) -> Result<EbpfIngressState> {
-    let ingress = &config.inbound.linux_ebpf;
-    if !ingress.enabled {
-        return Err(anyhow!("linux eBPF ingress mode requires inbound.linux_ebpf.enabled=true"));
-    }
-
-    let interface = if let Some(name) = ingress.interface.clone() {
-        name
-    } else {
-        crate::route_manager::resolve_route_interface(
-            config.route.auto_detect_interface,
-            config.route.default_interface.as_deref(),
-        )?
-        .ok_or_else(|| anyhow!("failed to resolve outbound interface for eBPF ingress"))?
-    };
-
-    let state = EbpfIngressState {
-        interface,
-        mark: ingress.mark,
-        table_id: ingress.table_id,
-        redirect_port: ingress.redirect_port,
-    };
-
-    let apply_result = (|| -> Result<()> {
-        if !Path::new(&ingress.bpf_object).exists() {
-            return Err(anyhow!(
-                "eBPF object file not found: {}",
-                ingress.bpf_object
-            ));
-        }
-
-        ensure_tool("tc")?;
-        ensure_tool("ip")?;
-        ensure_tool("iptables")?;
-        ensure_tool("ip6tables")?;
-        ensure_tool("bpftool")?;
-
-        // Ensure clsact exists, then flip active tc handle to reduce reload disruption.
-        let _ = Command::new("tc")
-            .args(["qdisc", "add", "dev", state.interface.as_str(), "clsact"])
-            .output();
-
-        flip_tc_ingress_filter(
-            state.interface.as_str(),
-            ingress.bpf_object.as_str(),
-            ingress.bpf_section.as_str(),
-        )?;
-
-        sync_skip_maps(
-            &ingress.skip_map_path,
-            &ingress.skip_map_v6_path,
-            &config.filtering.skip_ips,
-            &config.filtering.skip_networks,
-        )?;
-
-        let mark_hex = format!("0x{:x}", state.mark);
-        let table_id_s = state.table_id.to_string();
-
-        let _ = Command::new("ip")
-            .args([
-                "rule",
-                "del",
-                "fwmark",
-                mark_hex.as_str(),
-                "lookup",
-                table_id_s.as_str(),
-                "priority",
-                PRIO,
-            ])
-            .output();
-        let _ = Command::new("ip")
-            .args([
-                "-6",
-                "rule",
-                "del",
-                "fwmark",
-                mark_hex.as_str(),
-                "lookup",
-                table_id_s.as_str(),
-                "priority",
-                PRIO,
-            ])
-            .output();
-        let _ = Command::new("ip")
-            .args(["route", "flush", "table", table_id_s.as_str()])
-            .output();
-        let _ = Command::new("ip")
-            .args(["-6", "route", "flush", "table", table_id_s.as_str()])
-            .output();
-
-        run_cmd(
-            "ip",
-            &[
-                "route",
-                "add",
-                "local",
-                "default",
-                "dev",
-                "lo",
-                "table",
-                table_id_s.as_str(),
-            ],
-            "install local policy route for eBPF ingress hijack",
-        )?;
-
-        run_cmd(
-            "ip",
-            &[
-                "-6",
-                "route",
-                "add",
-                "local",
-                "default",
-                "dev",
-                "lo",
-                "table",
-                table_id_s.as_str(),
-            ],
-            "install IPv6 local policy route for eBPF ingress hijack",
-        )?;
-
-        run_cmd(
-            "ip",
-            &[
-                "rule",
-                "add",
-                "fwmark",
-                mark_hex.as_str(),
-                "lookup",
-                table_id_s.as_str(),
-                "priority",
-                PRIO,
-            ],
-            "install policy rule for eBPF ingress hijack",
-        )?;
-
-        run_cmd(
-            "ip",
-            &[
-                "-6",
-                "rule",
-                "add",
-                "fwmark",
-                mark_hex.as_str(),
-                "lookup",
-                table_id_s.as_str(),
-                "priority",
-                PRIO,
-            ],
-            "install IPv6 policy rule for eBPF ingress hijack",
-        )?;
-
-        apply_nat_flip(
-            "iptables",
-            true,
-            mark_hex.as_str(),
-            state.redirect_port,
-            ingress.redirect_tcp,
-            ingress.redirect_udp,
-            &config.filtering.skip_ips,
-            &config.filtering.skip_networks,
-        )?;
-
-        apply_nat_flip(
-            "ip6tables",
-            false,
-            mark_hex.as_str(),
-            state.redirect_port,
-            ingress.redirect_tcp,
-            ingress.redirect_udp,
-            &config.filtering.skip_ips,
-            &config.filtering.skip_networks,
-        )?;
-
-        Ok(())
-    })();
-
-    if let Err(err) = apply_result {
-        let _ = cleanup_ebpf_ingress(Some(&state));
-        return Err(anyhow!("failed to apply eBPF ingress (rolled back): {}", err));
-    }
-
-    info!(
-        "Linux eBPF ingress enabled on {} (mark=0x{:x}, table={}, redirect_port={})",
-        state.interface, state.mark, state.table_id, state.redirect_port
-    );
-
-    Ok(state)
+    // This legacy implementation has been superseded by ebpf_mode::run().
+    // It is retained for reference only and is no longer invoked at runtime.
+    let _ = config;
+    Err(anyhow!(
+        "apply_ebpf_ingress is deprecated; use ebpf_mode::run() instead"
+    ))
 }
 
 #[cfg(target_os = "linux")]

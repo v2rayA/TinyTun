@@ -17,15 +17,11 @@
     "linux_ebpf": {
       "enabled": false,
       "interface": null,
-      "bpf_object": "/etc/tinytun/tinytun_ingress.bpf.o",
-      "bpf_section": "classifier/ingress",
-      "skip_map_path": "/sys/fs/bpf/tinytun/skip_v4",
-      "skip_map_v6_path": "/sys/fs/bpf/tinytun/skip_v6",
       "mark": 563,
       "table_id": 233,
       "redirect_port": 15080,
       "redirect_tcp": true,
-      "redirect_udp": true
+      "redirect_udp": false
     }
   },
   "socks5": {
