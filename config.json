@@ -1,31 +1,9 @@
 {
-  "log": {
-    "loglevel": "warning"
-  },
   "tun": {
-    "name": "tun0",
-    "ip": "198.18.0.1",
-    "netmask": "255.255.255.255",
-    "ipv6_mode": "auto",
-    "ipv6": "fd00::1",
-    "ipv6_prefix": 128,
-    "auto_route": false,
-    "mtu": 1500
-  },
-  "inbound": {
-    "mode": "tun",
-    "linux_ebpf": {
-      "enabled": false,
-      "interface": null,
-      "mark": 563,
-      "table_id": 233,
-      "redirect_port": 15080,
-      "redirect_tcp": true,
-      "redirect_udp": false
-    }
+    "auto_route": true
   },
   "socks5": {
-    "address": "192.168.12.138:20173",
+    "address": "127.0.0.1:1080",
     "username": null,
     "password": null,
     "dns_over_socks5": true
@@ -38,41 +16,16 @@
       }
     ],
     "listen_port": 53,
-    "timeout_ms": 5000,
-    "hijack": {
-      "enabled": false,
-      "mark": 1,
-      "table_id": 100,
-      "capture_tcp": true
-    }
+    "timeout_ms": 5000
   },
   "filtering": {
     "skip_ips": [
-      "127.0.0.1",
-      "10.0.0.1"
+      "127.0.0.1"
     ],
     "skip_networks": [
+      "127.0.0.0/8"
     ],
-    "block_ports": [
-      22,
-      23,
-      25,
-      110,
-      143
-    ],
-    "allow_ports": [
-      80,
-      443,
-      53
-    ],
-    "exclude_processes": [],
-    "process_lookup": {
-      "linux_backend": "auto",
-      "linux_ebpf_cache_path": "/run/tinytun-ebpf-flow-cache.json"
-    }
-  },
-  "route": {
-    "auto_detect_interface": true,
-    "default_interface": null
+    "block_ports": [],
+    "allow_ports": []
   }
 }

@@ -17,13 +17,14 @@ TinyTun is a Rust-based transparent proxy runner with two inbound modes:
 
 The eBPF programs are only compiled when building on/for Linux.
 
-- `clang` (any version with `-target bpf` support, e.g. clang-15+)
-- Standard Linux userspace API headers (`linux-libc-dev` on Debian/Ubuntu;
-  present by default on most Linux development machines)
+- `clang` (any version with `-target bpf` support, e.g. clang-14+)
 
-> **Note:** `libbpf-dev` is **not** required — the necessary libbpf helper
-> headers (`bpf_helpers.h`, `bpf_endian.h`, `bpf_helper_defs.h`) are vendored
-> in `bpf/include/` and used automatically during the build.
+> **Note:** Neither `libbpf-dev` nor a specific `linux-libc-dev` version is
+> required.  The libbpf helper headers (`bpf_helpers.h`, `bpf_endian.h`,
+> `bpf_helper_defs.h`) and a complete self-contained `linux/bpf.h`
+> replacement are all vendored in `bpf/include/` and used automatically.
+> Only the basic `linux/types.h` (from `linux-libc-dev`) is pulled from the
+> system, and it is present on virtually every Linux development machine.
 
 Example (Ubuntu/Debian):
 ```bash
@@ -45,16 +46,8 @@ cargo build --release
 
 ```json
 {
-  "inbound": { "mode": "tun" },
   "tun": {
-    "name": "tun0",
-    "ip": "198.18.0.1",
-    "netmask": "255.255.255.255",
-    "ipv6_mode": "off",
-    "ipv6": "fd00::1",
-    "ipv6_prefix": 128,
-    "auto_route": true,
-    "mtu": 1500
+    "auto_route": true
   },
   "socks5": {
     "address": "127.0.0.1:1080",
@@ -65,21 +58,19 @@ cargo build --release
   "dns": {
     "servers": [{ "address": "8.8.8.8:53", "route": "direct" }],
     "listen_port": 53,
-    "timeout_ms": 5000,
-    "hijack": { "enabled": false, "mark": 1, "table_id": 100, "capture_tcp": true }
+    "timeout_ms": 5000
   },
   "filtering": {
     "skip_ips": ["127.0.0.1"],
     "skip_networks": ["127.0.0.0/8"],
     "block_ports": [],
-    "allow_ports": [],
-    "exclude_processes": [],
-    "process_lookup": { "linux_backend": "auto", "linux_ebpf_cache_path": null }
-  },
-  "route": { "auto_detect_interface": true, "default_interface": null },
-  "log": { "loglevel": "warning" }
+    "allow_ports": []
+  }
 }
 ```
+
+All other `tun` fields (`name`, `ip`, `netmask`, `ipv6_mode`, `mtu`, …) use
+built-in defaults when omitted.
 
 Run:
 
@@ -97,14 +88,10 @@ sudo ./target/release/tinytun run --config config.tun.min.json
     "mode": "linux-ebpf",
     "linux_ebpf": {
       "enabled": true,
-      "interface": "eth0",
-      "mark": 563,
-      "table_id": 233,
-      "redirect_port": 15080,
-      "redirect_tcp": true,
-      "redirect_udp": false
+      "interface": "eth0"
     }
   },
+  "tun": {},
   "socks5": {
     "address": "127.0.0.1:1080",
     "username": null,
@@ -114,21 +101,21 @@ sudo ./target/release/tinytun run --config config.tun.min.json
   "dns": {
     "servers": [{ "address": "8.8.8.8:53", "route": "direct" }],
     "listen_port": 53,
-    "timeout_ms": 5000,
-    "hijack": { "enabled": false, "mark": 1, "table_id": 100, "capture_tcp": true }
+    "timeout_ms": 5000
   },
   "filtering": {
-    "skip_ips": ["127.0.0.1", "10.0.0.1"],
-    "skip_networks": ["10.0.0.0/8", "fc00::/7"],
+    "skip_ips": ["127.0.0.1"],
+    "skip_networks": ["127.0.0.0/8"],
     "block_ports": [],
-    "allow_ports": [],
-    "exclude_processes": [],
-    "process_lookup": { "linux_backend": "auto", "linux_ebpf_cache_path": null }
-  },
-  "route": { "auto_detect_interface": true, "default_interface": null },
-  "log": { "loglevel": "warning" }
+    "allow_ports": []
+  }
 }
 ```
+
+Replace `"interface": "eth0"` with your actual outbound network interface
+(e.g. `enp3s0`, `wlan0`).  All other `linux_ebpf` fields (`mark`, `table_id`,
+`redirect_port`, …) use built-in defaults when omitted.  The `"tun": {}`
+block is required by the parser even in eBPF mode but all its fields default.
 
 Run:
 
