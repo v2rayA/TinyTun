@@ -31,6 +31,10 @@ socks5-impl = "0.1.0"
 trust-dns-client = "0.23"
 trust-dns-resolver = "0.23"
 
+# DNS routing
+lru = "0.12"
+regex = "1"
+
 # Configuration and utilities
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

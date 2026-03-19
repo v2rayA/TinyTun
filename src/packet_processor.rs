@@ -7,7 +7,6 @@ use anyhow::Result;
 use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{sleep, timeout};
 
@@ -15,6 +14,7 @@ use etherparse::{
     Ipv4HeaderSlice, Ipv6HeaderSlice, PacketBuilder, TcpHeaderSlice, UdpHeader, UdpHeaderSlice,
 };
 use crate::config::Config;
+use crate::dns_router::DnsRouter;
 use crate::process_lookup::{self, ProcessLookupOptions, TransportProtocol};
 use crate::route_manager;
 use crate::socks5_client::{Socks5Client, Socks5UdpSession};
@@ -29,6 +29,7 @@ struct ParsedIpPacket {
 pub struct PacketProcessor {
     config: Config,
     socks5_client: Socks5Client,
+    dns_router: Arc<DnsRouter>,
     process_lookup_options: ProcessLookupOptions,
     outbound_interface: Option<String>,
     tun_packet_tx: mpsc::Sender<Vec<u8>>,
@@ -163,8 +164,9 @@ impl PacketProcessor {
         config: Config,
         tun_writer: Arc<Mutex<tun::DeviceWriter>>,
         outbound_interface: Option<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let socks5_client = Socks5Client::new(config.socks5.clone());
+        let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), socks5_client.clone())?);
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
         let (tun_packet_tx, mut tun_packet_rx) = mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
 
@@ -181,9 +183,10 @@ impl PacketProcessor {
             }
         });
         
-        Self {
+        Ok(Self {
             config,
             socks5_client,
+            dns_router,
             process_lookup_options,
             outbound_interface,
             tun_packet_tx,
@@ -196,7 +199,7 @@ impl PacketProcessor {
             dynamic_bypass_ips: Arc::new(Mutex::new(HashMap::new())),
             dns_task_limiter: Arc::new(Semaphore::new(Self::DNS_TASK_CONCURRENCY_LIMIT)),
             udp_task_limiter: Arc::new(Semaphore::new(Self::UDP_TASK_CONCURRENCY_LIMIT)),
-        }
+        })
     }
 
     pub fn dynamic_bypass_ips_handle(&self) -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
@@ -824,8 +827,7 @@ impl PacketProcessor {
             };
 
             let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
-            let socks5_client = self.socks5_client.clone();
-            let dns_config = self.config.dns.clone();
+            let dns_router = self.dns_router.clone();
             let tun_packet_tx = self.tun_packet_tx.clone();
             let src_ip = ip_packet.src;
             let dst_ip = ip_packet.dst;
@@ -834,13 +836,7 @@ impl PacketProcessor {
                 let _permit = dns_permit;
 
                 let dns_txid = PacketProcessor::dns_txid(&udp_payload);
-                let response_payload = match PacketProcessor::forward_dns_query_with(
-                    socks5_client,
-                    dns_config,
-                    &udp_payload,
-                )
-                .await
-                {
+                let response_payload = match dns_router.resolve(&udp_payload).await {
                     Ok(resp) => PacketProcessor::normalize_dns_response_for_query(&udp_payload, resp),
                     Err(err) => {
                         warn!(
@@ -1285,54 +1281,6 @@ impl PacketProcessor {
         backoff.remove(flow_key);
     }
 
-    async fn forward_dns_query(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        Self::forward_dns_query_with(self.socks5_client.clone(), self.config.dns.clone(), payload)
-            .await
-    }
-
-    async fn forward_dns_query_with(
-        socks5_client: Socks5Client,
-        dns_config: crate::config::DnsConfig,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        let timeout_duration = Duration::from_millis(dns_config.timeout_ms);
-        let servers = dns_config.servers.clone();
-        let mut last_error: Option<anyhow::Error> = None;
-
-        for server in servers {
-            let result = match server.route {
-                crate::config::DnsRoute::Direct => {
-                    Self::forward_dns_query_direct(payload, server.address, timeout_duration)
-                        .await
-                }
-                crate::config::DnsRoute::Proxy => {
-                    Self::forward_dns_query_via_socks(
-                        socks5_client.clone(),
-                        payload,
-                        server.address,
-                        timeout_duration,
-                    )
-                        .await
-                }
-            };
-
-            match result {
-                Ok(response) => return Ok(response),
-                Err(err) => {
-                    warn!(
-                        "DNS upstream {} via {:?} failed: {}",
-                        server.address,
-                        server.route,
-                        err
-                    );
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No DNS upstream server configured")))
-    }
-
     fn dns_txid(payload: &[u8]) -> Option<u16> {
         if payload.len() >= 2 {
             Some(u16::from_be_bytes([payload[0], payload[1]]))
@@ -1390,55 +1338,6 @@ impl PacketProcessor {
         }
 
         resp
-    }
-
-    async fn forward_dns_query_direct(
-        payload: &[u8],
-        upstream: SocketAddr,
-        timeout_duration: Duration,
-    ) -> Result<Vec<u8>> {
-        let bind_addr = match upstream {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
-        };
-
-        let socket = UdpSocket::bind(bind_addr).await?;
-        timeout(timeout_duration, socket.send_to(payload, upstream)).await??;
-
-        let mut response = vec![0u8; 4096];
-        let (size, _) = timeout(timeout_duration, socket.recv_from(&mut response)).await??;
-        response.truncate(size);
-        Ok(response)
-    }
-
-    async fn forward_dns_query_via_socks(
-        socks5_client: Socks5Client,
-        payload: &[u8],
-        upstream: SocketAddr,
-        timeout_duration: Duration,
-    ) -> Result<Vec<u8>> {
-        // Give the SOCKS5 handshake its own generous timeout so that a slow
-        // proxy negotiation doesn't leave a half-open TCP connection (which
-        // the server would log as "insufficient header > EOF").
-        let handshake_timeout = timeout_duration.max(Duration::from_secs(10));
-
-        let mut stream = timeout(handshake_timeout, socks5_client.connect(upstream)).await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out for DNS upstream {}", upstream))??;
-
-        // DNS-over-TCP framing: two-byte big-endian payload length prefix.
-        let mut framed_query = Vec::with_capacity(payload.len() + 2);
-        framed_query.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        framed_query.extend_from_slice(payload);
-        timeout(timeout_duration, stream.write_all(&framed_query)).await??;
-        timeout(timeout_duration, stream.flush()).await??;
-
-        let mut len_buf = [0u8; 2];
-        timeout(timeout_duration, stream.read_exact(&mut len_buf)).await??;
-        let response_len = u16::from_be_bytes(len_buf) as usize;
-
-        let mut response = vec![0u8; response_len];
-        timeout(timeout_duration, stream.read_exact(&mut response)).await??;
-        Ok(response)
     }
 
     async fn write_tun_packet(&self, packet: &[u8]) -> Result<()> {

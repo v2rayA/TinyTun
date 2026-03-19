@@ -2,6 +2,8 @@ mod config;
 mod tun_device;
 mod socks5_client;
 mod dns_handler;
+mod dns_router;
+mod geosite;
 mod packet_processor;
 mod error;
 mod route_manager;
@@ -19,7 +21,7 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::config::{Config, DnsRoute, DnsServerEntry, Ipv6Mode, LogLevel};
+use crate::config::{Config, DnsGroup, DnsQueryStrategy, DnsUpstream, Ipv6Mode, LogLevel};
 use crate::dns_hijack::DnsHijackState;
 use crate::tun_device::TunDevice;
 use crate::packet_processor::PacketProcessor;
@@ -84,6 +86,10 @@ enum Commands {
         /// Route for each --dns entry: direct or proxy (repeatable)
         #[arg(long, value_enum)]
         dns_route: Vec<CliDnsRoute>,
+
+        /// Query strategy applied to all CLI-defined DNS groups
+        #[arg(long, value_enum)]
+        dns_strategy: Option<CliDnsStrategy>,
 
         /// Local DNS capture/forward listen port (default from config or built-in default)
         #[arg(long)]
@@ -185,6 +191,7 @@ async fn main() -> Result<()> {
             socks5_dns_over_socks5,
             dns,
             dns_route,
+            dns_strategy,
             dns_listen_port,
             dns_timeout_ms,
             dns_hijack_enabled,
@@ -216,6 +223,7 @@ async fn main() -> Result<()> {
                 socks5_dns_over_socks5,
                 dns,
                 dns_route,
+                dns_strategy,
                 dns_listen_port,
                 dns_timeout_ms,
                 dns_hijack_enabled,
@@ -320,11 +328,23 @@ async fn run_proxy(config: Config) -> Result<()> {
     
     // Create packet processor
     let tun_writer = tun_device.get_writer();
-    let processor = PacketProcessor::new(
+    let processor = match PacketProcessor::new(
         config.clone(),
         tun_writer,
         selected_outbound_interface.clone(),
-    );
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            if skip_network_routes_applied {
+                let _ = route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks);
+            }
+            if skip_ip_routes_applied {
+                let _ = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips);
+            }
+            tun_device.cleanup().await?;
+            return Err(err);
+        }
+    };
     let dynamic_bypass_ips_handle = processor.dynamic_bypass_ips_handle();
 
     // Apply automatic routes after TUN device is created
@@ -639,6 +659,7 @@ fn load_config(
     socks5_dns_over_socks5: Option<bool>,
     dns: Vec<String>,
     dns_route: Vec<CliDnsRoute>,
+    dns_strategy: Option<CliDnsStrategy>,
     dns_listen_port: Option<u16>,
     dns_timeout_ms: Option<u64>,
     dns_hijack_enabled: Option<bool>,
@@ -688,8 +709,9 @@ fn load_config(
     }
 
     if !dns.is_empty() {
-        let dns_servers = build_dns_servers_from_cli(&dns, &dns_route)?;
-        config.dns.servers = dns_servers;
+        let strategy = dns_strategy.map(Into::into).unwrap_or(DnsQueryStrategy::Sequential);
+        let groups = build_dns_groups_from_cli(&dns, &dns_route, strategy)?;
+        config.dns.groups = groups;
     }
 
     if let Some(port) = dns_listen_port {
@@ -788,34 +810,52 @@ fn load_config(
     Ok(config)
 }
 
-fn build_dns_servers_from_cli(dns: &[String], dns_route: &[CliDnsRoute]) -> Result<Vec<DnsServerEntry>> {
+fn build_dns_groups_from_cli(
+    dns: &[String],
+    dns_route: &[CliDnsRoute],
+    strategy: DnsQueryStrategy,
+) -> Result<Vec<DnsGroup>> {
     if dns.is_empty() {
         return Ok(Vec::new());
     }
 
-    let routes: Vec<DnsRoute> = if dns_route.is_empty() {
-        vec![DnsRoute::Direct; dns.len()]
+    let routes: Vec<CliDnsRoute> = if dns_route.is_empty() {
+        vec![CliDnsRoute::Direct; dns.len()]
     } else if dns_route.len() == 1 && dns.len() > 1 {
-        vec![dns_route[0].into(); dns.len()]
+        vec![dns_route[0]; dns.len()]
     } else if dns_route.len() == dns.len() {
-        dns_route.iter().copied().map(Into::into).collect()
+        dns_route.to_vec()
     } else {
         return Err(anyhow::anyhow!(
-            "--dns and --dns-route count mismatch: got {} dns servers and {} routes",
+            "--dns and --dns-route count mismatch: got {} dns entries and {} routes",
             dns.len(),
             dns_route.len()
         ));
     };
 
-    let mut out = Vec::with_capacity(dns.len());
-    for (idx, dns_addr) in dns.iter().enumerate() {
-        out.push(DnsServerEntry {
-            address: dns_addr.parse()?,
-            route: routes[idx].clone(),
-        });
+    // Accumulate servers per group name, preserving insertion order.
+    let mut order: Vec<(&str, CliDnsRoute)> = Vec::new();
+    let mut by_name: std::collections::HashMap<&str, Vec<std::net::SocketAddr>> =
+        std::collections::HashMap::new();
+
+    for (addr_str, route) in dns.iter().zip(routes.iter()) {
+        let addr: std::net::SocketAddr = addr_str.parse()?;
+        let name = route.group_name();
+        if !by_name.contains_key(name) {
+            order.push((name, *route));
+        }
+        by_name.entry(name).or_default().push(addr);
     }
 
-    Ok(out)
+    Ok(order
+        .into_iter()
+        .map(|(name, route)| DnsGroup {
+            name: name.to_string(),
+            servers: by_name.remove(name).unwrap_or_default(),
+            strategy,
+            upstream: route.upstream(),
+        })
+        .collect())
 }
 
 fn resolve_ipv6_enabled(mode: Ipv6Mode) -> bool {
@@ -909,11 +949,37 @@ enum CliDnsRoute {
     Proxy,
 }
 
-impl From<CliDnsRoute> for DnsRoute {
-    fn from(value: CliDnsRoute) -> Self {
-        match value {
-            CliDnsRoute::Direct => DnsRoute::Direct,
-            CliDnsRoute::Proxy => DnsRoute::Proxy,
+impl CliDnsRoute {
+    fn group_name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+        }
+    }
+    fn upstream(self) -> DnsUpstream {
+        match self {
+            Self::Direct => DnsUpstream::Direct,
+            Self::Proxy => DnsUpstream::Proxy,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CliDnsStrategy {
+    /// Send to all servers simultaneously; use the first successful response.
+    Concurrent,
+    /// Try each server top-to-bottom; advance to the next only on failure.
+    Sequential,
+    /// Shuffle the server list randomly, then try sequentially on that order.
+    Random,
+}
+
+impl From<CliDnsStrategy> for DnsQueryStrategy {
+    fn from(v: CliDnsStrategy) -> Self {
+        match v {
+            CliDnsStrategy::Concurrent => DnsQueryStrategy::Concurrent,
+            CliDnsStrategy::Sequential => DnsQueryStrategy::Sequential,
+            CliDnsStrategy::Random => DnsQueryStrategy::Random,
         }
     }
 }

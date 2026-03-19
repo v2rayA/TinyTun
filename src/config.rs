@@ -13,11 +13,45 @@ pub enum Ipv6Mode {
     Off,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+/// Transport used by a [`DnsGroup`] when forwarding queries to upstream servers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum DnsRoute {
+pub enum DnsUpstream {
+    /// Send directly via UDP (or plain TCP).
+    #[default]
     Direct,
+    /// Tunnel through the configured SOCKS5 proxy (DNS-over-TCP framing).
     Proxy,
+}
+
+/// Strategy controlling how a [`DnsGroup`] picks which server(s) to query.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsQueryStrategy {
+    /// Send to **all** servers simultaneously; use the first successful response.
+    Concurrent,
+    /// Try each server top-to-bottom; advance to the next only on failure.
+    #[default]
+    Sequential,
+    /// Shuffle the server list randomly, then try sequentially on that order.
+    Random,
+}
+
+/// A named group of DNS upstream servers sharing a query strategy and transport.
+///
+/// Routing rules (in [`DnsRoutingConfig`]) reference groups by `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsGroup {
+    /// Unique identifier referenced by routing rules (e.g. `"direct"`, `"proxy"`).
+    pub name: String,
+    /// Upstream DNS server addresses (host:port).
+    pub servers: Vec<SocketAddr>,
+    /// How to select which server(s) to query within this group.
+    #[serde(default)]
+    pub strategy: DnsQueryStrategy,
+    /// Whether to query servers directly or via the SOCKS5 proxy.
+    #[serde(default)]
+    pub upstream: DnsUpstream,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,11 +99,77 @@ pub struct Socks5Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
-    pub servers: Vec<DnsServerEntry>,
+    /// Named upstream groups.  At least one group is required.
+    pub groups: Vec<DnsGroup>,
     pub listen_port: u16,
     pub timeout_ms: u64,
     #[serde(default)]
     pub hijack: DnsHijackConfig,
+    #[serde(default)]
+    pub routing: DnsRoutingConfig,
+}
+
+/// A DNS domain-matching rule.
+///
+/// When a rule matches:
+/// - if `reject` is `true` — the query is answered with NXDOMAIN immediately;
+/// - otherwise — the query is forwarded to the DNS group named by `group`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsRoutingRule {
+    pub matcher: DnsMatcher,
+    /// Name of the [`DnsGroup`] to forward matching queries to.
+    /// This field is ignored when `reject` is `true`.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Return NXDOMAIN for matching domains (blocks the domain).
+    /// Takes priority over `group`.
+    #[serde(default)]
+    pub reject: bool,
+}
+
+/// Matcher variants, serialised with a `"type"` tag and an optional `"value"`.
+///
+/// JSON examples:
+/// ```json
+/// {"type": "domain_suffix",  "value": "cn"}
+/// {"type": "domain_keyword", "value": "google"}
+/// {"type": "domain_full",    "value": "example.com"}
+/// {"type": "domain_regex",   "value": "^ads?[0-9]*\\."}
+/// {"type": "geosite",        "file": "/etc/v2ray/geosite.dat", "tag": "cn"}
+/// {"type": "wildcard"}
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DnsMatcher {
+    /// Exact domain match (e.g. `"example.com"` but not `"www.example.com"`).
+    DomainFull { value: String },
+    /// Suffix match — matches the domain itself and all its sub-domains.
+    DomainSuffix { value: String },
+    /// Sub-string match anywhere in the domain label.
+    DomainKeyword { value: String },
+    /// Full regex match against the FQDN (excluding the trailing dot).
+    DomainRegex { value: String },
+    /// Match against a v2ray geosite.dat category.
+    ///
+    /// `file` is the absolute path to the `geosite.dat` file.
+    /// `tag`  is the category name (case-insensitive, e.g. `"cn"`,
+    /// `"google"`, `"category-ads-all"`).
+    Geosite { file: String, tag: String },
+    /// Unconditionally matches every domain (catch-all / default).
+    Wildcard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsRoutingConfig {
+    /// Ordered list of routing rules; first match wins.
+    pub rules: Vec<DnsRoutingRule>,
+    /// Name of the [`DnsGroup`] to use when no rule matches.
+    pub fallback_group: String,
+    /// Enable TTL-aware LRU response cache.
+    pub enable_cache: bool,
+    /// Maximum number of cached DNS responses.
+    pub cache_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,12 +179,6 @@ pub struct DnsHijackConfig {
     pub mark: u32,
     pub table_id: u32,
     pub capture_tcp: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsServerEntry {
-    pub address: SocketAddr,
-    pub route: DnsRoute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,13 +252,41 @@ impl Default for Socks5Config {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            servers: vec![DnsServerEntry {
-                address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                route: DnsRoute::Direct,
-            }],
+            groups: vec![
+                DnsGroup {
+                    name: "direct".to_string(),
+                    servers: vec![
+                        "114.114.114.114:53".parse().unwrap(),
+                        "223.5.5.5:53".parse().unwrap(),
+                    ],
+                    strategy: DnsQueryStrategy::Concurrent,
+                    upstream: DnsUpstream::Direct,
+                },
+                DnsGroup {
+                    name: "proxy".to_string(),
+                    servers: vec![
+                        "8.8.8.8:53".parse().unwrap(),
+                        "1.1.1.1:53".parse().unwrap(),
+                    ],
+                    strategy: DnsQueryStrategy::Concurrent,
+                    upstream: DnsUpstream::Proxy,
+                },
+            ],
             listen_port: 53,
             timeout_ms: 5000,
             hijack: DnsHijackConfig::default(),
+            routing: DnsRoutingConfig::default(),
+        }
+    }
+}
+
+impl Default for DnsRoutingConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            fallback_group: "proxy".to_string(),
+            enable_cache: true,
+            cache_capacity: 4096,
         }
     }
 }
@@ -212,10 +334,6 @@ impl Default for RouteConfig {
 }
 
 impl Config {
-    pub fn effective_dns_servers(&self) -> Vec<DnsServerEntry> {
-        self.dns.servers.clone()
-    }
-
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         let config: Config = serde_json::from_str(&content)?;

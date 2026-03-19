@@ -36,8 +36,8 @@ impl DnsHandler {
         
         // Forward to upstream server
         let upstream_socket = self.upstream_socket.clone();
-        let upstream_addr = self.config.servers.first()
-            .map(|s| s.address)
+        let upstream_addr = self.config.groups.first()
+            .and_then(|g| g.servers.first().copied())
             .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))?;
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
@@ -63,8 +63,8 @@ impl DnsHandler {
         let query = self.build_dns_query(domain, qtype)?;
         
         let upstream_socket = self.upstream_socket.clone();
-        let upstream_addr = self.config.servers.first()
-            .map(|s| s.address)
+        let upstream_addr = self.config.groups.first()
+            .and_then(|g| g.servers.first().copied())
             .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))?;
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
