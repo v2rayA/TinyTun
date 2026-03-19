@@ -1,24 +1,3 @@
 # Cross.toml – configuration for the `cross` cross-compilation tool.
 #
-# The eBPF BPF C program (bpf/tinytun.bpf.c) is compiled at build time using
-# `clang -target bpf` and embedded in the binary.  The cross Docker images do
-# not ship clang or the kernel API headers, so we install them as a pre-build
-# step.
-#
-# Notes:
-#   • The BPF object is compiled for the *BPF VM* (architecture-neutral), not
-#     for the target CPU, so host-side (x86_64) clang and kernel headers are
-#     sufficient for all cross-compilation targets.
-#   • `linux-libc-dev` provides /usr/include/asm (→ asm-x86 symlink) which is
-#     needed by linux/types.h → asm/types.h.  Without it the BPF compilation
-#     fails with "fatal error: 'asm/types.h' file not found".
-
-[target.armv7-unknown-linux-gnueabihf]
-pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends clang linux-libc-dev",
-]
-
-[target.armv7-unknown-linux-musleabihf]
-pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends clang linux-libc-dev",
-]
+# No extra pre-build dependencies are required.

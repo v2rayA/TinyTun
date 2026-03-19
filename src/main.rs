@@ -7,9 +7,6 @@ mod error;
 mod route_manager;
 mod process_lookup;
 mod dns_hijack;
-mod ebpf_ingress;
-#[cfg(target_os = "linux")]
-mod ebpf_mode;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -22,7 +19,7 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::config::{Config, DnsRoute, DnsServerEntry, InboundMode, Ipv6Mode, LogLevel};
+use crate::config::{Config, DnsRoute, DnsServerEntry, Ipv6Mode, LogLevel};
 use crate::dns_hijack::DnsHijackState;
 use crate::tun_device::TunDevice;
 use crate::packet_processor::PacketProcessor;
@@ -164,46 +161,6 @@ enum Commands {
         #[arg(long = "exclude-process")]
         exclude_process: Vec<String>,
 
-        /// Linux process lookup backend: auto, ss, or ebpf
-        #[arg(long)]
-        linux_process_backend: Option<String>,
-
-        /// Linux eBPF flow cache file path (used when backend is auto/ebpf)
-        #[arg(long)]
-        linux_ebpf_cache_path: Option<String>,
-
-        /// Inbound traffic capture mode: tun or linux-ebpf
-        #[arg(long, value_enum)]
-        inbound_mode: Option<CliInboundMode>,
-
-        /// Enable Linux eBPF ingress mode settings
-        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
-        linux_ebpf_ingress_enabled: Option<bool>,
-
-        /// Linux ingress interface for eBPF attach (auto when omitted)
-        #[arg(long)]
-        linux_ebpf_ingress_interface: Option<String>,
-
-        /// Linux eBPF ingress fwmark value
-        #[arg(long)]
-        linux_ebpf_ingress_mark: Option<u32>,
-
-        /// Linux eBPF ingress policy routing table id
-        #[arg(long)]
-        linux_ebpf_ingress_table_id: Option<u32>,
-
-        /// Linux eBPF ingress redirect target port (internal transparent listener)
-        #[arg(long)]
-        linux_ebpf_ingress_redirect_port: Option<u16>,
-
-        /// Redirect TCP in Linux eBPF mode
-        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
-        linux_ebpf_ingress_redirect_tcp: Option<bool>,
-
-        /// Redirect UDP in Linux eBPF mode
-        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
-        linux_ebpf_ingress_redirect_udp: Option<bool>,
-
         /// Auto-detect outbound physical interface for bypass routes
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         auto_detect_interface: Option<bool>,
@@ -247,16 +204,6 @@ async fn main() -> Result<()> {
             block_port,
             allow_port,
             exclude_process,
-            linux_process_backend,
-            linux_ebpf_cache_path,
-            inbound_mode,
-            linux_ebpf_ingress_enabled,
-            linux_ebpf_ingress_interface,
-            linux_ebpf_ingress_mark,
-            linux_ebpf_ingress_table_id,
-            linux_ebpf_ingress_redirect_port,
-            linux_ebpf_ingress_redirect_tcp,
-            linux_ebpf_ingress_redirect_udp,
             auto_detect_interface,
             default_interface,
         } => {
@@ -288,16 +235,6 @@ async fn main() -> Result<()> {
                 block_port,
                 allow_port,
                 exclude_process,
-                linux_process_backend,
-                linux_ebpf_cache_path,
-                inbound_mode.map(Into::into),
-                linux_ebpf_ingress_enabled,
-                linux_ebpf_ingress_interface,
-                linux_ebpf_ingress_mark,
-                linux_ebpf_ingress_table_id,
-                linux_ebpf_ingress_redirect_port,
-                linux_ebpf_ingress_redirect_tcp,
-                linux_ebpf_ingress_redirect_udp,
                 auto_detect_interface,
                 default_interface,
             )?;
@@ -311,10 +248,6 @@ async fn run_proxy(config: Config) -> Result<()> {
     info!("Starting TinyTun with configuration: {:?}", config);
 
     preflight_checks(&config).await?;
-
-    if matches!(config.inbound.mode, InboundMode::LinuxEbpf) {
-        return run_linux_ebpf_mode(config).await;
-    }
 
     let ipv6_enabled = resolve_ipv6_enabled(config.tun.ipv6_mode.clone());
     if ipv6_enabled {
@@ -697,19 +630,6 @@ async fn run_proxy(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_linux_ebpf_mode(config: Config) -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = config;
-        return Err(anyhow!("inbound.mode=linux-ebpf is only supported on Linux"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        ebpf_mode::run(config).await
-    }
-}
-
 fn load_config(
     config_path: Option<String>,
     loglevel: Option<LogLevel>,
@@ -738,16 +658,6 @@ fn load_config(
     block_port: Vec<u16>,
     allow_port: Vec<u16>,
     linux_exclude_process: Vec<String>,
-    linux_process_backend: Option<String>,
-    linux_ebpf_cache_path: Option<String>,
-    inbound_mode: Option<InboundMode>,
-    linux_ebpf_ingress_enabled: Option<bool>,
-    linux_ebpf_ingress_interface: Option<String>,
-    linux_ebpf_ingress_mark: Option<u32>,
-    linux_ebpf_ingress_table_id: Option<u32>,
-    linux_ebpf_ingress_redirect_port: Option<u16>,
-    linux_ebpf_ingress_redirect_tcp: Option<bool>,
-    linux_ebpf_ingress_redirect_udp: Option<bool>,
     auto_detect_interface: Option<bool>,
     default_interface: Option<String>,
 ) -> Result<Config> {
@@ -839,48 +749,6 @@ fn load_config(
     }
     if !linux_exclude_process.is_empty() {
         config.filtering.exclude_processes = linux_exclude_process;
-    }
-    if let Some(v) = linux_process_backend {
-        config.filtering.process_lookup.linux_backend = v;
-    }
-    if let Some(v) = linux_ebpf_cache_path {
-        config.filtering.process_lookup.linux_ebpf_cache_path = Some(v);
-    }
-    if let Some(v) = inbound_mode {
-        config.inbound.mode = v;
-    }
-    if let Some(v) = linux_ebpf_ingress_enabled {
-        config.inbound.linux_ebpf.enabled = v;
-    }
-    if let Some(v) = linux_ebpf_ingress_interface {
-        config.inbound.linux_ebpf.interface = Some(v);
-    }
-    if let Some(v) = linux_ebpf_ingress_mark {
-        config.inbound.linux_ebpf.mark = v;
-    }
-    if let Some(v) = linux_ebpf_ingress_table_id {
-        config.inbound.linux_ebpf.table_id = v;
-    }
-    if let Some(v) = linux_ebpf_ingress_redirect_port {
-        config.inbound.linux_ebpf.redirect_port = v;
-    }
-    if let Some(v) = linux_ebpf_ingress_redirect_tcp {
-        config.inbound.linux_ebpf.redirect_tcp = v;
-    }
-    if let Some(v) = linux_ebpf_ingress_redirect_udp {
-        config.inbound.linux_ebpf.redirect_udp = v;
-    }
-
-    let backend = config
-        .filtering
-        .process_lookup
-        .linux_backend
-        .to_ascii_lowercase();
-    if backend != "auto" && backend != "ss" && backend != "ebpf" {
-        return Err(anyhow!(
-            "invalid linux_process_backend '{}': expected one of auto|ss|ebpf",
-            config.filtering.process_lookup.linux_backend
-        ));
     }
     if let Some(v) = auto_detect_interface {
         config.route.auto_detect_interface = v;
@@ -976,10 +844,6 @@ async fn preflight_checks(config: &Config) -> Result<()> {
                 "Windows administrator privileges are required to create a Wintun adapter. Please run the terminal as Administrator and retry."
             ));
         }
-    }
-
-    if matches!(config.inbound.mode, InboundMode::LinuxEbpf) {
-        return Ok(());
     }
 
     let socks_addr = config.socks5.address;
@@ -1102,20 +966,4 @@ fn init_logging(level: LogLevel) {
     });
 
     let _ = builder.try_init();
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum CliInboundMode {
-    Tun,
-    #[value(name = "linux-ebpf")]
-    LinuxEbpf,
-}
-
-impl From<CliInboundMode> for InboundMode {
-    fn from(value: CliInboundMode) -> Self {
-        match value {
-            CliInboundMode::Tun => InboundMode::Tun,
-            CliInboundMode::LinuxEbpf => InboundMode::LinuxEbpf,
-        }
-    }
 }

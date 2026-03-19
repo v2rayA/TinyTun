@@ -35,39 +35,11 @@ pub struct Config {
     #[serde(default)]
     pub log: LogConfig,
     pub tun: TunConfig,
-    #[serde(default)]
-    pub inbound: InboundConfig,
     pub socks5: Socks5Config,
     pub dns: DnsConfig,
     pub filtering: FilteringConfig,
     #[serde(default)]
     pub route: RouteConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum InboundMode {
-    Tun,
-    LinuxEbpf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct InboundConfig {
-    pub mode: InboundMode,
-    pub linux_ebpf: LinuxEbpfIngressConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LinuxEbpfIngressConfig {
-    pub enabled: bool,
-    pub interface: Option<String>,
-    pub mark: u32,
-    pub table_id: u32,
-    pub redirect_port: u16,
-    pub redirect_tcp: bool,
-    pub redirect_udp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,15 +95,6 @@ pub struct FilteringConfig {
     pub allow_ports: Vec<u16>,
     #[serde(default)]
     pub exclude_processes: Vec<String>,
-    #[serde(default)]
-    pub process_lookup: ProcessLookupConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProcessLookupConfig {
-    pub linux_backend: String,
-    pub linux_ebpf_cache_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +115,6 @@ impl Default for Config {
         Self {
             log: LogConfig::default(),
             tun: TunConfig::default(),
-            inbound: InboundConfig::default(),
             socks5: Socks5Config::default(),
             dns: DnsConfig::default(),
             filtering: FilteringConfig::default(),
@@ -236,16 +198,6 @@ impl Default for FilteringConfig {
             block_ports: vec![22, 23, 25, 110, 143], // Common blocked ports
             allow_ports: vec![80, 443, 53],           // Always allow HTTP, HTTPS, DNS
             exclude_processes: Vec::new(),
-            process_lookup: ProcessLookupConfig::default(),
-        }
-    }
-}
-
-impl Default for ProcessLookupConfig {
-    fn default() -> Self {
-        Self {
-            linux_backend: "auto".to_string(),
-            linux_ebpf_cache_path: Some("/run/tinytun-ebpf-flow-cache.json".to_string()),
         }
     }
 }
@@ -334,35 +286,6 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             loglevel: LogLevel::default(),
-        }
-    }
-}
-
-impl Default for InboundMode {
-    fn default() -> Self {
-        Self::Tun
-    }
-}
-
-impl Default for InboundConfig {
-    fn default() -> Self {
-        Self {
-            mode: InboundMode::Tun,
-            linux_ebpf: LinuxEbpfIngressConfig::default(),
-        }
-    }
-}
-
-impl Default for LinuxEbpfIngressConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            interface: None,
-            mark: 0x233,
-            table_id: 233,
-            redirect_port: 15080,
-            redirect_tcp: true,
-            redirect_udp: false,
         }
     }
 }

@@ -9,38 +9,19 @@ use netstat2::{
     get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo,
 };
 
-#[cfg(target_os = "linux")]
-use serde::Deserialize;
-
-#[cfg(target_os = "linux")]
-use crate::config::ProcessLookupConfig;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TransportProtocol {
     Tcp,
     Udp,
 }
 
-#[derive(Clone, Debug)]
-pub struct ProcessLookupOptions {
-    #[cfg(target_os = "linux")]
-    pub linux: ProcessLookupConfig,
-}
+#[derive(Clone, Debug, Default)]
+pub struct ProcessLookupOptions {}
 
 impl ProcessLookupOptions {
     pub fn from_config(config: &crate::config::Config) -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            Self {
-                linux: config.filtering.process_lookup.clone(),
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = config;
-            Self {}
-        }
+        let _ = config;
+        Self {}
     }
 }
 
@@ -50,87 +31,8 @@ pub fn find_process_name_for_flow(
     src: SocketAddr,
     dst: SocketAddr,
 ) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        return find_process_name_for_flow_linux(options, protocol, src, dst);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = options;
-        find_process_name_for_flow_netstat2(protocol, src, dst)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn find_process_name_for_flow_linux(
-    options: &ProcessLookupOptions,
-    protocol: TransportProtocol,
-    src: SocketAddr,
-    dst: SocketAddr,
-) -> Option<String> {
-    let backend = options.linux.linux_backend.to_ascii_lowercase();
-
-    if backend == "ebpf" {
-        return find_process_name_for_flow_linux_ebpf(options, protocol, src, dst);
-    }
-
-    if backend == "ss" {
-        // Keep backward-compatible config value, but now use netstat2 instead of shelling out to ss.
-        return find_process_name_for_flow_netstat2(protocol, src, dst);
-    }
-
-    // auto: prefer eBPF cache if present, then fallback to netstat2.
-    find_process_name_for_flow_linux_ebpf(options, protocol, src, dst)
-        .or_else(|| find_process_name_for_flow_netstat2(protocol, src, dst))
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Deserialize)]
-struct EbpfFlowRecord {
-    protocol: String,
-    src: String,
-    dst: String,
-    process_name: String,
-}
-
-#[cfg(target_os = "linux")]
-fn find_process_name_for_flow_linux_ebpf(
-    options: &ProcessLookupOptions,
-    protocol: TransportProtocol,
-    src: SocketAddr,
-    dst: SocketAddr,
-) -> Option<String> {
-    let cache_path = options
-        .linux
-        .linux_ebpf_cache_path
-        .as_deref()
-        .unwrap_or("/run/tinytun-ebpf-flow-cache.json");
-
-    let content = std::fs::read_to_string(cache_path).ok()?;
-    let records: Vec<EbpfFlowRecord> = serde_json::from_str(&content).ok()?;
-
-    let protocol_name = match protocol {
-        TransportProtocol::Tcp => "tcp",
-        TransportProtocol::Udp => "udp",
-    };
-
-    let src_text = src.to_string();
-    let dst_text = dst.to_string();
-
-    for record in records {
-        if record.protocol.eq_ignore_ascii_case(protocol_name)
-            && record.src == src_text
-            && record.dst == dst_text
-        {
-            let name = record.process_name.trim();
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
-        }
-    }
-
-    None
+    let _ = options;
+    find_process_name_for_flow_netstat2(protocol, src, dst)
 }
 
 fn find_process_name_for_flow_netstat2(
