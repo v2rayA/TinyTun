@@ -1,6 +1,14 @@
 {
+  "log": {
+    "loglevel": "info"
+  },
   "tun": {
-    "auto_route": true
+    "name": "tun0",
+    "ip": "198.18.0.1",
+    "netmask": "255.255.255.255",
+    "ipv6_mode": "auto",
+    "auto_route": true,
+    "mtu": 1500
   },
   "socks5": {
     "address": "127.0.0.1:1080",
@@ -9,23 +17,56 @@
     "dns_over_socks5": true
   },
   "dns": {
-    "servers": [
+    "groups": [
       {
-        "address": "8.8.8.8:53",
-        "route": "direct"
+        "name": "direct",
+        "servers": ["114.114.114.114:53", "223.5.5.5:53"],
+        "strategy": "concurrent",
+        "upstream": "direct"
+      },
+      {
+        "name": "proxy",
+        "servers": ["8.8.8.8:53", "1.1.1.1:53"],
+        "strategy": "concurrent",
+        "upstream": "proxy"
       }
     ],
     "listen_port": 53,
-    "timeout_ms": 5000
+    "timeout_ms": 5000,
+    "routing": {
+      "rules": [
+        {
+          "matcher": {"type": "geosite", "file": "/etc/v2ray/geosite.dat", "tag": "category-ads-all"},
+          "reject": true
+        },
+        {
+          "matcher": {"type": "geosite", "file": "/etc/v2ray/geosite.dat", "tag": "cn"},
+          "group": "direct"
+        },
+        {
+          "matcher": {"type": "wildcard"},
+          "group": "proxy"
+        }
+      ],
+      "fallback_group": "proxy",
+      "enable_cache": true,
+      "cache_capacity": 4096
+    }
   },
   "filtering": {
-    "skip_ips": [
-      "127.0.0.1"
-    ],
+    "skip_ips": ["127.0.0.1", "::1", "198.18.0.1"],
     "skip_networks": [
-      "127.0.0.0/8"
+      "127.0.0.0/8",
+      "169.254.0.0/16",
+      "::1/128",
+      "fc00::/7",
+      "fe80::/10"
     ],
     "block_ports": [],
-    "allow_ports": []
+    "allow_ports": [80, 443, 53],
+    "exclude_processes": []
+  },
+  "route": {
+    "auto_detect_interface": true
   }
 }

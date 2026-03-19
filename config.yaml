@@ -1,0 +1,82 @@
+log:
+  loglevel: info
+
+tun:
+  name: tun0
+  ip: 198.18.0.1
+  netmask: 255.255.255.255
+  ipv6_mode: auto
+  auto_route: true
+  mtu: 1500
+
+socks5:
+  address: "127.0.0.1:1080"
+  username: null
+  password: null
+  dns_over_socks5: true
+
+dns:
+  groups:
+    - name: direct
+      servers:
+        - "114.114.114.114:53"
+        - "223.5.5.5:53"
+      strategy: concurrent
+      upstream: direct
+    - name: proxy
+      servers:
+        - "8.8.8.8:53"
+        - "1.1.1.1:53"
+      strategy: concurrent
+      upstream: proxy
+
+  listen_port: 53
+  timeout_ms: 5000
+
+  routing:
+    # Default geosite.dat path, used when a rule does not specify an explicit file.
+    geosite_file: /etc/v2ray/geosite.dat
+
+    # Rules are evaluated top-to-bottom; the first match wins.
+    #
+    # Syntax:  match(<condition>),<action>
+    #
+    # Conditions:
+    #   geosite:<tag>            — v2ray geosite category (uses geosite_file above)
+    #   geosite:<tag>:<file>     — explicit geosite.dat path
+    #   domain:<fqdn>            — exact domain match
+    #   suffix:<domain>          — suffix / sub-domain match
+    #   keyword:<word>           — substring keyword
+    #   regex:<pattern>          — full regex match against the FQDN
+    #   *                        — wildcard / catch-all
+    #
+    # Actions:
+    #   <group-name>             — forward to that DNS group
+    #   reject                   — answer with NXDOMAIN (block the domain)
+    rules:
+      - "match(geosite:category-ads-all),reject"
+      - "match(geosite:cn),direct"
+      - "match(suffix:lan),direct"
+      - "match(*),proxy"
+
+    fallback_group: proxy
+    enable_cache: true
+    cache_capacity: 4096
+
+filtering:
+  skip_ips:
+    - "127.0.0.1"
+    - "::1"
+    - "198.18.0.1"
+  skip_networks:
+    - "127.0.0.0/8"
+    - "169.254.0.0/16"
+    - "::1/128"
+    - "fc00::/7"
+    - "fe80::/10"
+  block_ports: []
+  allow_ports: [80, 443, 53]
+  exclude_processes: []
+
+route:
+  auto_detect_interface: true

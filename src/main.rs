@@ -55,7 +55,7 @@ struct Cli {
 enum Commands {
     /// Run the tun2socks proxy
     Run {
-        /// Configuration file path
+        /// Configuration file path (.json or .yaml/.yml)
         #[arg(short, long)]
         config: Option<String>,
 

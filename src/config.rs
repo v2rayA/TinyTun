@@ -335,13 +335,28 @@ impl Default for RouteConfig {
 
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
         let content = fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
-        Ok(config)
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+        match ext {
+            "yaml" | "yml" => {
+                let yaml_config: YamlConfig = serde_yaml::from_str(&content)?;
+                yaml_config.into_config()
+            }
+            _ => {
+                let config: Config = serde_json::from_str(&content)?;
+                Ok(config)
+            }
+        }
     }
-    
+
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
+        let path = path.as_ref();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+        let content = match ext {
+            "yaml" | "yml" => serde_yaml::to_string(self)?,
+            _ => serde_json::to_string_pretty(self)?,
+        };
         fs::write(path, content)?;
         Ok(())
     }
@@ -407,3 +422,199 @@ impl Default for LogConfig {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// YAML support — simplified rule syntax
+// ---------------------------------------------------------------------------
+
+/// YAML-specific representation of DNS routing config.
+/// Rules are written as compact strings instead of nested objects.
+///
+/// Syntax:  `match(<condition>),<action>`
+///
+/// Conditions:
+///   `geosite:<tag>`           — v2ray geosite category (uses `geosite_file`)
+///   `geosite:<tag>:<file>`    — explicit geosite.dat path
+///   `domain:<fqdn>`           — exact domain match
+///   `suffix:<domain>`         — suffix (sub-domain) match
+///   `keyword:<word>`          — substring keyword match
+///   `regex:<pattern>`         — regex match
+///   `*`                       — wildcard / catch-all
+///
+/// Actions:
+///   `<group-name>`            — forward to named DNS group
+///   `reject`                  — answer with NXDOMAIN
+///
+/// Examples:
+///   `match(geosite:category-ads-all),reject`
+///   `match(geosite:cn),direct`
+///   `match(suffix:github.com),proxy`
+///   `match(*),proxy`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct YamlDnsRoutingConfig {
+    /// Ordered routing rules in compact string form.
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Name of the fallback DNS group when no rule matches.
+    #[serde(default = "default_fallback_group")]
+    pub fallback_group: String,
+    /// Default geosite.dat path used when a `geosite:tag` rule omits the file.
+    #[serde(default)]
+    pub geosite_file: Option<String>,
+    #[serde(default = "default_true")]
+    pub enable_cache: bool,
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: usize,
+}
+
+fn default_fallback_group() -> String { "proxy".to_string() }
+fn default_true() -> bool { true }
+fn default_cache_capacity() -> usize { 4096 }
+
+impl Default for YamlDnsRoutingConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            fallback_group: default_fallback_group(),
+            geosite_file: None,
+            enable_cache: true,
+            cache_capacity: default_cache_capacity(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct YamlDnsConfig {
+    pub groups: Vec<DnsGroup>,
+    #[serde(default = "default_dns_listen_port")]
+    pub listen_port: u16,
+    #[serde(default = "default_dns_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub hijack: DnsHijackConfig,
+    #[serde(default)]
+    pub routing: YamlDnsRoutingConfig,
+}
+
+fn default_dns_listen_port() -> u16 { 53 }
+fn default_dns_timeout_ms() -> u64 { 5000 }
+
+/// Top-level YAML config.  Identical to [`Config`] except DNS routing rules
+/// are in the compact string syntax.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct YamlConfig {
+    #[serde(default)]
+    pub log: LogConfig,
+    pub tun: TunConfig,
+    pub socks5: Socks5Config,
+    pub dns: YamlDnsConfig,
+    pub filtering: FilteringConfig,
+    #[serde(default)]
+    pub route: RouteConfig,
+}
+
+impl YamlConfig {
+    fn into_config(self) -> Result<Config> {
+        let geosite_file = self.dns.routing.geosite_file;
+        let rules = self
+            .dns
+            .routing
+            .rules
+            .iter()
+            .map(|s| parse_yaml_rule(s, geosite_file.as_deref()))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Config {
+            log: self.log,
+            tun: self.tun,
+            socks5: self.socks5,
+            dns: DnsConfig {
+                groups: self.dns.groups,
+                listen_port: self.dns.listen_port,
+                timeout_ms: self.dns.timeout_ms,
+                hijack: self.dns.hijack,
+                routing: DnsRoutingConfig {
+                    rules,
+                    fallback_group: self.dns.routing.fallback_group,
+                    enable_cache: self.dns.routing.enable_cache,
+                    cache_capacity: self.dns.routing.cache_capacity,
+                },
+            },
+            filtering: self.filtering,
+            route: self.route,
+        })
+    }
+}
+
+/// Parse one compact rule string into a [`DnsRoutingRule`].
+fn parse_yaml_rule(s: &str, default_geosite_file: Option<&str>) -> Result<DnsRoutingRule> {
+    // Expected: `match(<condition>),<action>`
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("match(")
+        .ok_or_else(|| anyhow::anyhow!("DNS rule must start with 'match(': {s}"))?;
+
+    let close = inner
+        .rfind(')') // find the matching closing paren
+        .ok_or_else(|| anyhow::anyhow!("DNS rule missing closing ')': {s}"))?;
+
+    let condition = &inner[..close];
+    let rest = inner[close + 1..].trim();
+    let action = rest
+        .strip_prefix(',')
+        .ok_or_else(|| anyhow::anyhow!("DNS rule missing ',<action>' after ')': {s}"))?
+        .trim();
+
+    let matcher = parse_condition(condition, default_geosite_file, s)?;
+
+    let (group, reject) = if action.eq_ignore_ascii_case("reject") {
+        (None, true)
+    } else {
+        (Some(action.to_string()), false)
+    };
+
+    Ok(DnsRoutingRule { matcher, group, reject })
+}
+
+fn parse_condition(
+    cond: &str,
+    default_geosite_file: Option<&str>,
+    full_rule: &str,
+) -> Result<DnsMatcher> {
+    if cond == "*" {
+        return Ok(DnsMatcher::Wildcard);
+    }
+
+    if let Some(rest) = cond.strip_prefix("geosite:") {
+        // geosite:TAG  or  geosite:TAG:FILE
+        let mut parts = rest.splitn(2, ':');
+        let tag = parts.next().unwrap_or("").to_string();
+        let file = parts
+            .next()
+            .map(|f| f.to_string())
+            .or_else(|| default_geosite_file.map(|f| f.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "geosite rule '{full_rule}' has no file path \
+                     and no 'geosite_file' default is set"
+                )
+            })?;
+        return Ok(DnsMatcher::Geosite { file, tag });
+    }
+
+    if let Some(value) = cond.strip_prefix("domain:") {
+        return Ok(DnsMatcher::DomainFull { value: value.to_string() });
+    }
+    if let Some(value) = cond.strip_prefix("suffix:") {
+        return Ok(DnsMatcher::DomainSuffix { value: value.to_string() });
+    }
+    if let Some(value) = cond.strip_prefix("keyword:") {
+        return Ok(DnsMatcher::DomainKeyword { value: value.to_string() });
+    }
+    if let Some(value) = cond.strip_prefix("regex:") {
+        return Ok(DnsMatcher::DomainRegex { value: value.to_string() });
+    }
+
+    Err(anyhow::anyhow!("Unknown condition '{cond}' in rule: {full_rule}"))
+}
+
