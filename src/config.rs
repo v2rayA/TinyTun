@@ -13,6 +13,27 @@ pub enum Ipv6Mode {
     Off,
 }
 
+/// Encryption / transport protocol used to communicate with upstream DNS servers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProtocol {
+    /// Plain DNS over UDP (RFC 1035, default port 53).
+    #[default]
+    Udp,
+    /// Plain DNS over TCP (RFC 1035, default port 53).
+    Tcp,
+    /// DNS over TLS — RFC 7858 (default port 853).
+    /// `servers` entries must be `"host:port"` strings.
+    Dot,
+    /// DNS over HTTPS — RFC 8484.
+    /// `servers` entries must be HTTPS URLs, e.g. `"https://dns.google/dns-query"`.
+    Doh,
+    /// DNS over QUIC — RFC 9250 (default port 853).
+    /// `servers` entries must be `"host:port"` strings.
+    /// Note: QUIC is UDP-based and cannot be tunnelled through a TCP SOCKS5 proxy.
+    Doq,
+}
+
 /// Transport used by a [`DnsGroup`] when forwarding queries to upstream servers.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -44,14 +65,30 @@ pub enum DnsQueryStrategy {
 pub struct DnsGroup {
     /// Unique identifier referenced by routing rules (e.g. `"direct"`, `"proxy"`).
     pub name: String,
-    /// Upstream DNS server addresses (host:port).
-    pub servers: Vec<SocketAddr>,
+    /// Upstream server addresses.
+    ///
+    /// - For `Udp`, `Tcp`, `Dot`, `Doq`: `"host:port"` strings
+    ///   (e.g. `"8.8.8.8:853"` or `"dns.google:853"`).
+    /// - For `Doh`: HTTPS endpoint URLs
+    ///   (e.g. `"https://dns.google/dns-query"`).
+    pub servers: Vec<String>,
     /// How to select which server(s) to query within this group.
     #[serde(default)]
     pub strategy: DnsQueryStrategy,
     /// Whether to query servers directly or via the SOCKS5 proxy.
+    /// For `Doq`, this field is ignored (QUIC cannot traverse TCP SOCKS5).
     #[serde(default)]
     pub upstream: DnsUpstream,
+    /// Encryption protocol used to communicate with each server.
+    #[serde(default)]
+    pub protocol: DnsProtocol,
+    /// TLS server name (SNI) override for `Dot` and `Doq`.
+    ///
+    /// When omitted the hostname portion of the server address string is used
+    /// as the SNI value.  Required when `servers` contains bare IP addresses
+    /// and the server certificate does not cover that IP via a SAN.
+    #[serde(default)]
+    pub sni: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,20 +293,24 @@ impl Default for DnsConfig {
                 DnsGroup {
                     name: "direct".to_string(),
                     servers: vec![
-                        "114.114.114.114:53".parse().unwrap(),
-                        "223.5.5.5:53".parse().unwrap(),
+                        "114.114.114.114:53".to_string(),
+                        "223.5.5.5:53".to_string(),
                     ],
                     strategy: DnsQueryStrategy::Concurrent,
                     upstream: DnsUpstream::Direct,
+                    protocol: DnsProtocol::Udp,
+                    sni: None,
                 },
                 DnsGroup {
                     name: "proxy".to_string(),
                     servers: vec![
-                        "8.8.8.8:53".parse().unwrap(),
-                        "1.1.1.1:53".parse().unwrap(),
+                        "8.8.8.8:53".to_string(),
+                        "1.1.1.1:53".to_string(),
                     ],
                     strategy: DnsQueryStrategy::Concurrent,
                     upstream: DnsUpstream::Proxy,
+                    protocol: DnsProtocol::Udp,
+                    sni: None,
                 },
             ],
             listen_port: 53,

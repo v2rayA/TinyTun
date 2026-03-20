@@ -18,11 +18,11 @@ use anyhow::Result;
 use log::{debug, warn};
 use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::config::{DnsConfig, DnsGroup, DnsMatcher, DnsQueryStrategy, DnsUpstream};
+use crate::config::{DnsConfig, DnsGroup, DnsMatcher, DnsProtocol, DnsQueryStrategy, DnsUpstream};
 use crate::geosite::{DomainType, GeositeDb};
 use crate::socks5_client::Socks5Client;
 
@@ -112,6 +112,14 @@ pub struct DnsRouter {
     /// Fast lookup: group name → group config.
     groups: HashMap<String, DnsGroup>,
     cache: Arc<Mutex<LruCache<CacheKey, CacheEntry>>>,
+    /// Shared TLS client config for DoT (DNS over TLS).
+    tls_config: Arc<rustls::ClientConfig>,
+    /// QUIC-specific TLS client config for DoQ (ALPN = "doq").
+    doq_tls_config: Arc<rustls::ClientConfig>,
+    /// HTTP client for direct DoH queries.
+    http_client: reqwest::Client,
+    /// HTTP client for DoH queries routed via the SOCKS5 proxy.
+    http_proxy_client: Option<reqwest::Client>,
 }
 
 impl DnsRouter {
@@ -218,12 +226,64 @@ impl DnsRouter {
             rules.push(CompiledRule { matcher, action });
         }
 
+        // Build shared TLS root store (webpki system roots).
+        let mut tls_roots = rustls::RootCertStore::empty();
+        tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_roots = Arc::new(tls_roots);
+
+        // DoT / generic TLS config (no ALPN restriction).
+        let tls_config: Arc<rustls::ClientConfig> = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(tls_roots.as_ref().clone())
+                .with_no_client_auth(),
+        );
+
+        // DoQ TLS config — must advertise the "doq" ALPN protocol (RFC 9250 §10).
+        let mut doq_base = rustls::ClientConfig::builder()
+            .with_root_certificates(tls_roots.as_ref().clone())
+            .with_no_client_auth();
+        doq_base.alpn_protocols = vec![b"doq".to_vec()];
+        let doq_tls_config = Arc::new(doq_base);
+
+        // HTTP client for direct DoH.
+        let http_client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .https_only(true)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build DoH HTTP client: {e}"))?;
+
+        // HTTP client for DoH via SOCKS5 proxy (built lazily only when any
+        // group has protocol=Doh and upstream=Proxy).
+        let needs_proxy_client = config
+            .groups
+            .iter()
+            .any(|g| g.protocol == DnsProtocol::Doh && g.upstream == DnsUpstream::Proxy);
+
+        let http_proxy_client = if needs_proxy_client {
+            let proxy_url = socks5_client.proxy_socks5h_url();
+            let proxy = reqwest::Proxy::all(&proxy_url)
+                .map_err(|e| anyhow::anyhow!("Invalid SOCKS5 proxy URL '{proxy_url}': {e}"))?;
+            let client = reqwest::Client::builder()
+                .use_rustls_tls()
+                .https_only(true)
+                .proxy(proxy)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build DoH proxy HTTP client: {e}"))?;
+            Some(client)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             socks5_client,
             rules,
             groups,
             cache: Arc::new(Mutex::new(cache)),
+            tls_config,
+            doq_tls_config,
+            http_client,
+            http_proxy_client,
         })
     }
 
@@ -473,11 +533,11 @@ impl DnsRouter {
     ) -> Result<Vec<u8>> {
         let mut last_err: Option<anyhow::Error> = None;
 
-        for &addr in &group.servers {
-            match Self::query_server(&self.socks5_client, payload, addr, group.upstream, timeout_duration).await {
+        for server in &group.servers {
+            match self.dispatch(payload, server, group, timeout_duration).await {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
-                    warn!("DNS [{}] {} failed (sequential): {}", group.name, addr, err);
+                    warn!("DNS [{}] {} failed (sequential): {}", group.name, server, err);
                     last_err = Some(err);
                 }
             }
@@ -498,18 +558,35 @@ impl DnsRouter {
     ) -> Result<Vec<u8>> {
         use futures::FutureExt;
 
-        let socks5_client = self.socks5_client.clone();
-        let upstream = group.upstream;
-        let payload = payload.to_vec();
+        let socks5_client  = self.socks5_client.clone();
+        let tls_config     = self.tls_config.clone();
+        let doq_tls_config = self.doq_tls_config.clone();
+        let http_client    = self.http_client.clone();
+        let http_proxy     = self.http_proxy_client.clone();
+        let protocol       = group.protocol;
+        let upstream       = group.upstream;
+        let sni            = group.sni.clone();
+        let payload        = payload.to_vec();
 
         let futs: Vec<_> = group
             .servers
             .iter()
-            .map(|&addr| {
-                let sc = socks5_client.clone();
-                let p = payload.clone();
-                async move { Self::query_server(&sc, &p, addr, upstream, timeout_duration).await }
-                    .boxed()
+            .map(|server| {
+                let sc  = socks5_client.clone();
+                let tc  = tls_config.clone();
+                let dqc = doq_tls_config.clone();
+                let hc  = http_client.clone();
+                let hp  = http_proxy.clone();
+                let sv  = server.clone();
+                let sni = sni.clone();
+                let p   = payload.clone();
+                async move {
+                    Self::query_server_static(
+                        &sc, &tc, &dqc, &hc, hp.as_ref(),
+                        &p, &sv, protocol, sni.as_deref(), upstream, timeout_duration,
+                    ).await
+                }
+                .boxed()
             })
             .collect();
 
@@ -532,11 +609,11 @@ impl DnsRouter {
         let mut last_err: Option<anyhow::Error> = None;
 
         for idx in indices {
-            let addr = group.servers[idx];
-            match Self::query_server(&self.socks5_client, payload, addr, group.upstream, timeout_duration).await {
+            let server = &group.servers[idx];
+            match self.dispatch(payload, server, group, timeout_duration).await {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
-                    warn!("DNS [{}] {} failed (random): {}", group.name, addr, err);
+                    warn!("DNS [{}] {} failed (random): {}", group.name, server, err);
                     last_err = Some(err);
                 }
             }
@@ -573,17 +650,101 @@ impl DnsRouter {
     // Per-server dispatch
     // -----------------------------------------------------------------------
 
-    async fn query_server(
-        socks5_client: &Socks5Client,
+    /// Instance-method wrapper so sequential/random strategies can call it
+    /// without cloning all shared state upfront.
+    async fn dispatch(
+        &self,
         payload: &[u8],
-        address: SocketAddr,
+        server: &str,
+        group: &DnsGroup,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>> {
+        Self::query_server_static(
+            &self.socks5_client,
+            &self.tls_config,
+            &self.doq_tls_config,
+            &self.http_client,
+            self.http_proxy_client.as_ref(),
+            payload,
+            server,
+            group.protocol,
+            group.sni.as_deref(),
+            group.upstream,
+            timeout_duration,
+        )
+        .await
+    }
+
+    /// Statically-dispatched per-server query — handles all protocol variants.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_server_static(
+        socks5_client: &Socks5Client,
+        tls_config: &Arc<rustls::ClientConfig>,
+        doq_tls_config: &Arc<rustls::ClientConfig>,
+        http_client: &reqwest::Client,
+        http_proxy_client: Option<&reqwest::Client>,
+        payload: &[u8],
+        server: &str,
+        protocol: DnsProtocol,
+        group_sni: Option<&str>,
         upstream: DnsUpstream,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>> {
-        match upstream {
-            DnsUpstream::Direct => Self::query_direct(payload, address, timeout_duration).await,
-            DnsUpstream::Proxy => {
-                Self::query_via_socks(socks5_client.clone(), payload, address, timeout_duration).await
+        match protocol {
+            DnsProtocol::Udp => {
+                let addr = parse_socket_addr(server)?;
+                match upstream {
+                    DnsUpstream::Direct => {
+                        Self::query_udp_direct(payload, addr, timeout_duration).await
+                    }
+                    DnsUpstream::Proxy => {
+                        Self::query_via_socks(socks5_client.clone(), payload, addr, timeout_duration).await
+                    }
+                }
+            }
+            DnsProtocol::Tcp => {
+                let addr = parse_socket_addr(server)?;
+                match upstream {
+                    DnsUpstream::Direct => {
+                        Self::query_tcp_direct(payload, addr, timeout_duration).await
+                    }
+                    DnsUpstream::Proxy => {
+                        Self::query_via_socks(socks5_client.clone(), payload, addr, timeout_duration).await
+                    }
+                }
+            }
+            DnsProtocol::Dot => {
+                let addr = parse_socket_addr(server)?;
+                let sni  = resolve_sni(server, group_sni);
+                match upstream {
+                    DnsUpstream::Direct => {
+                        Self::query_dot_direct(payload, addr, &sni, tls_config, timeout_duration).await
+                    }
+                    DnsUpstream::Proxy => {
+                        Self::query_dot_via_socks(
+                            socks5_client.clone(), payload, addr, &sni, tls_config, timeout_duration,
+                        ).await
+                    }
+                }
+            }
+            DnsProtocol::Doh => {
+                let client = match upstream {
+                    DnsUpstream::Proxy => http_proxy_client.unwrap_or(http_client),
+                    DnsUpstream::Direct => http_client,
+                };
+                Self::query_doh(payload, server, client, timeout_duration).await
+            }
+            DnsProtocol::Doq => {
+                if upstream == DnsUpstream::Proxy {
+                    warn!(
+                        "DoQ upstream '{}': QUIC is UDP-based and cannot be tunnelled through \
+                         a TCP SOCKS5 proxy — querying directly instead.",
+                        server
+                    );
+                }
+                let addr = parse_socket_addr(server)?;
+                let sni  = resolve_sni(server, group_sni);
+                Self::query_doq(payload, addr, &sni, doq_tls_config, timeout_duration).await
             }
         }
     }
@@ -592,7 +753,7 @@ impl DnsRouter {
     // Direct UDP upstream
     // -----------------------------------------------------------------------
 
-    async fn query_direct(
+    async fn query_udp_direct(
         payload: &[u8],
         upstream: SocketAddr,
         timeout_duration: Duration,
@@ -609,6 +770,184 @@ impl DnsRouter {
         let (n, _) = timeout(timeout_duration, socket.recv_from(&mut buf)).await??;
         buf.truncate(n);
         Ok(buf)
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct plain-TCP upstream (DNS-over-TCP framing, RFC 1035 §4.2.2)
+    // -----------------------------------------------------------------------
+
+    async fn query_tcp_direct(
+        payload: &[u8],
+        upstream: SocketAddr,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>> {
+        let mut stream = timeout(timeout_duration, TcpStream::connect(upstream)).await??;
+        stream.set_nodelay(true)?;
+        send_dns_tcp_framed(&mut stream, payload, timeout_duration).await?;
+        recv_dns_tcp_framed(&mut stream, timeout_duration).await
+    }
+
+    // -----------------------------------------------------------------------
+    // DNS over TLS (DoT) — RFC 7858
+    // -----------------------------------------------------------------------
+
+    async fn query_dot_direct(
+        payload: &[u8],
+        upstream: SocketAddr,
+        sni: &str,
+        tls_config: &Arc<rustls::ClientConfig>,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>> {
+        use tokio_rustls::TlsConnector;
+
+        let server_name = make_server_name(sni)?;
+        let connector   = TlsConnector::from(tls_config.clone());
+
+        let tcp_stream = timeout(timeout_duration, TcpStream::connect(upstream)).await??;
+        let mut tls_stream = timeout(
+            timeout_duration,
+            connector.connect(server_name, tcp_stream),
+        ).await??;
+
+        send_dns_tcp_framed(&mut tls_stream, payload, timeout_duration).await?;
+        recv_dns_tcp_framed(&mut tls_stream, timeout_duration).await
+    }
+
+    async fn query_dot_via_socks(
+        socks5_client: Socks5Client,
+        payload: &[u8],
+        upstream: SocketAddr,
+        sni: &str,
+        tls_config: &Arc<rustls::ClientConfig>,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>> {
+        use tokio_rustls::TlsConnector;
+
+        let server_name     = make_server_name(sni)?;
+        let connector       = TlsConnector::from(tls_config.clone());
+        let handshake_timeout = timeout_duration.max(Duration::from_secs(10));
+
+        let tcp_stream = timeout(handshake_timeout, socks5_client.connect(upstream))
+            .await
+            .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out for DoT upstream {}", upstream))??;
+
+        let mut tls_stream = timeout(
+            timeout_duration,
+            connector.connect(server_name, tcp_stream),
+        ).await??;
+
+        send_dns_tcp_framed(&mut tls_stream, payload, timeout_duration).await?;
+        recv_dns_tcp_framed(&mut tls_stream, timeout_duration).await
+    }
+
+    // -----------------------------------------------------------------------
+    // DNS over HTTPS (DoH) — RFC 8484
+    // -----------------------------------------------------------------------
+
+    async fn query_doh(
+        payload: &[u8],
+        url: &str,
+        client: &reqwest::Client,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>> {
+        let response = tokio::time::timeout(
+            timeout_duration,
+            client
+                .post(url)
+                .header("Content-Type", "application/dns-message")
+                .header("Accept",       "application/dns-message")
+                .body(payload.to_vec())
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("DoH request to '{}' timed out", url))??;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "DoH server '{}' returned HTTP {}", url, status
+            ));
+        }
+
+        let bytes = tokio::time::timeout(timeout_duration, response.bytes())
+            .await
+            .map_err(|_| anyhow::anyhow!("DoH response body read timed out for '{}'", url))??;
+
+        Ok(bytes.to_vec())
+    }
+
+    // -----------------------------------------------------------------------
+    // DNS over QUIC (DoQ) — RFC 9250
+    // -----------------------------------------------------------------------
+
+    async fn query_doq(
+        payload: &[u8],
+        upstream: SocketAddr,
+        sni: &str,
+        doq_tls_config: &Arc<rustls::ClientConfig>,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>> {
+        use quinn::crypto::rustls::QuicClientConfig;
+
+        let quic_config = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(doq_tls_config.as_ref().clone())
+                .map_err(|e| anyhow::anyhow!("DoQ TLS config error: {e}"))?,
+        ));
+
+        let bind_addr: SocketAddr = if upstream.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
+
+        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+        endpoint.set_default_client_config(quic_config);
+
+        // Connect and wait for the QUIC handshake.
+        let connecting = endpoint
+            .connect(upstream, sni)
+            .map_err(|e| anyhow::anyhow!("DoQ connect failed: {e}"))?;
+        let connection: quinn::Connection = timeout(timeout_duration, connecting)
+            .await
+            .map_err(|_| anyhow::anyhow!("DoQ connection to {} timed out", upstream))??;
+
+        let (mut send, mut recv): (quinn::SendStream, quinn::RecvStream) =
+            timeout(timeout_duration, connection.open_bi())
+                .await
+                .map_err(|_| anyhow::anyhow!("DoQ stream open timed out"))?
+                .map_err(|e| anyhow::anyhow!("DoQ stream error: {e}"))?;
+
+        // RFC 9250 §4.2: 2-byte big-endian length prefix + DNS message.
+        let mut framed = Vec::with_capacity(payload.len() + 2);
+        framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        framed.extend_from_slice(payload);
+
+        timeout(timeout_duration, async {
+            send.write_all(&framed).await
+                .map_err(|e| anyhow::anyhow!("DoQ write error: {e}"))?;
+            let _ = send.finish();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DoQ send timed out"))??;
+
+        // Read the full response (length-prefixed).
+        let raw: Vec<u8> = timeout(
+            timeout_duration,
+            recv.read_to_end(u16::MAX as usize + 2),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("DoQ response read timed out"))?
+        .map_err(|e| anyhow::anyhow!("DoQ read error: {e}"))?;
+
+        if raw.len() < 2 {
+            return Err(anyhow::anyhow!("DoQ response too short ({} bytes)", raw.len()));
+        }
+        let resp_len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        if raw.len() < 2 + resp_len {
+            return Err(anyhow::anyhow!("DoQ response truncated"));
+        }
+        Ok(raw[2..2 + resp_len].to_vec())
     }
 
     // -----------------------------------------------------------------------
@@ -635,19 +974,8 @@ impl DnsRouter {
             })??;
 
         // DNS-over-TCP framing: two-byte big-endian length prefix.
-        let mut framed = Vec::with_capacity(payload.len() + 2);
-        framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        framed.extend_from_slice(payload);
-        timeout(timeout_duration, stream.write_all(&framed)).await??;
-        timeout(timeout_duration, stream.flush()).await??;
-
-        let mut len_buf = [0u8; 2];
-        timeout(timeout_duration, stream.read_exact(&mut len_buf)).await??;
-        let response_len = u16::from_be_bytes(len_buf) as usize;
-
-        let mut response = vec![0u8; response_len];
-        timeout(timeout_duration, stream.read_exact(&mut response)).await??;
-        Ok(response)
+        send_dns_tcp_framed(&mut stream, payload, timeout_duration).await?;
+        recv_dns_tcp_framed(&mut stream, timeout_duration).await
     }
 
     // -----------------------------------------------------------------------
@@ -784,4 +1112,64 @@ impl DnsRouter {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free-standing helpers (used by the DNS transport methods above)
+// ---------------------------------------------------------------------------
+
+/// Parse a `"host:port"` string into a [`SocketAddr`].
+fn parse_socket_addr(s: &str) -> Result<SocketAddr> {
+    s.parse::<SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("Invalid server address '{}': {}", s, e))
+}
+
+/// Determine the TLS SNI value for a server address string.
+///
+/// Priority: explicit group `sni` > hostname extracted from `"host:port"`.
+fn resolve_sni(server: &str, group_sni: Option<&str>) -> String {
+    if let Some(sni) = group_sni {
+        return sni.to_string();
+    }
+    // Strip IPv6 brackets: "[::1]:853" → "::1"
+    if let Some(inner) = server.strip_prefix('[') {
+        return inner.split(']').next().unwrap_or(server).to_string();
+    }
+    // Regular "host:port" → take host part only.
+    server.split(':').next().unwrap_or(server).to_string()
+}
+
+/// Build a rustls [`ServerName`] from a string that is either a DNS hostname
+/// or an IP address literal.
+fn make_server_name(s: &str) -> Result<rustls::pki_types::ServerName<'static>> {
+    rustls::pki_types::ServerName::try_from(s.to_owned())
+        .map_err(|e| anyhow::anyhow!("Invalid TLS server name '{}': {}", s, e))
+}
+
+/// Write a DNS message to any `AsyncWrite` sink using the DNS-over-TCP
+/// two-byte big-endian length framing (RFC 1035 §4.2.2).
+async fn send_dns_tcp_framed<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+    timeout_duration: Duration,
+) -> Result<()> {
+    let mut framed = Vec::with_capacity(payload.len() + 2);
+    framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    framed.extend_from_slice(payload);
+    timeout(timeout_duration, writer.write_all(&framed)).await??;
+    timeout(timeout_duration, writer.flush()).await??;
+    Ok(())
+}
+
+/// Read a length-prefixed DNS response from any `AsyncRead` source.
+async fn recv_dns_tcp_framed<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    timeout_duration: Duration,
+) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    timeout(timeout_duration, reader.read_exact(&mut len_buf)).await??;
+    let response_len = u16::from_be_bytes(len_buf) as usize;
+    let mut response = vec![0u8; response_len];
+    timeout(timeout_duration, reader.read_exact(&mut response)).await??;
+    Ok(response)
 }

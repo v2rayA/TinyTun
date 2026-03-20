@@ -23,6 +23,40 @@ impl Socks5Client {
     pub fn new(config: Socks5Config) -> Self {
         Self { config }
     }
+
+    /// Return a `socks5h://[user:pass@]host:port` URL for use with HTTP clients
+    /// that support SOCKS5 proxies (e.g. `reqwest`).
+    pub fn proxy_socks5h_url(&self) -> String {
+        let addr = self.config.address;
+        match (&self.config.username, &self.config.password) {
+            (Some(u), Some(p)) => format!(
+                "socks5h://{}:{}@{}",
+                percent_encode(u),
+                percent_encode(p),
+                addr
+            ),
+            _ => format!("socks5h://{}", addr),
+        }
+    }
+}
+
+/// Percent-encode a string for use in a URL userinfo component.
+fn percent_encode(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                vec![c]
+            } else {
+                // encode as %XX
+                c.to_string()
+                    .bytes()
+                    .flat_map(|b| {
+                        format!("%{:02X}", b).chars().collect::<Vec<_>>()
+                    })
+                    .collect()
+            }
+        })
+        .collect()
 }
 
 impl Socks5Client {

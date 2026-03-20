@@ -36,9 +36,10 @@ impl DnsHandler {
         
         // Forward to upstream server
         let upstream_socket = self.upstream_socket.clone();
-        let upstream_addr = self.config.groups.first()
-            .and_then(|g| g.servers.first().copied())
-            .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))?;
+        let upstream_addr: std::net::SocketAddr = self.config.groups.first()
+            .and_then(|g| g.servers.first())
+            .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))
+            .and_then(|s| s.parse().map_err(|e| anyhow::anyhow!("Invalid DNS server address '{}': {}", s, e)))?;
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
         let response = timeout(timeout_duration, async move {
@@ -63,9 +64,10 @@ impl DnsHandler {
         let query = self.build_dns_query(domain, qtype)?;
         
         let upstream_socket = self.upstream_socket.clone();
-        let upstream_addr = self.config.groups.first()
-            .and_then(|g| g.servers.first().copied())
-            .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))?;
+        let upstream_addr: std::net::SocketAddr = self.config.groups.first()
+            .and_then(|g| g.servers.first())
+            .ok_or_else(|| anyhow::anyhow!("No DNS server configured"))
+            .and_then(|s| s.parse().map_err(|e| anyhow::anyhow!("Invalid DNS server address '{}': {}", s, e)))?;
         let timeout_duration = Duration::from_millis(self.config.timeout_ms);
         
         let response = timeout(timeout_duration, async move {

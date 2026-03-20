@@ -21,14 +21,44 @@
       {
         "name": "direct",
         "servers": ["114.114.114.114:53", "223.5.5.5:53"],
+        "protocol": "udp",
         "strategy": "concurrent",
         "upstream": "direct"
       },
       {
         "name": "proxy",
         "servers": ["8.8.8.8:53", "1.1.1.1:53"],
+        "protocol": "udp",
         "strategy": "concurrent",
         "upstream": "proxy"
+      },
+      {
+        "_comment": "DoT example — remove _comment and rename to enable",
+        "_name": "proxy-dot",
+        "_servers": ["8.8.8.8:853", "1.1.1.1:853"],
+        "_protocol": "dot",
+        "_sni": "dns.google",
+        "_strategy": "concurrent",
+        "_upstream": "proxy"
+      },
+      {
+        "_comment": "DoH example — servers must be HTTPS URLs",
+        "_name": "proxy-doh",
+        "_servers": [
+          "https://dns.google/dns-query",
+          "https://cloudflare-dns.com/dns-query"
+        ],
+        "_protocol": "doh",
+        "_strategy": "concurrent",
+        "_upstream": "proxy"
+      },
+      {
+        "_comment": "DoQ example — QUIC cannot traverse SOCKS5, upstream is always direct",
+        "_name": "proxy-doq",
+        "_servers": ["dns.google:853", "dns.cloudflare.com:853"],
+        "_protocol": "doq",
+        "_strategy": "concurrent",
+        "_upstream": "direct"
       }
     ],
     "listen_port": 53,

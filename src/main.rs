@@ -835,16 +835,15 @@ fn build_dns_groups_from_cli(
 
     // Accumulate servers per group name, preserving insertion order.
     let mut order: Vec<(&str, CliDnsRoute)> = Vec::new();
-    let mut by_name: std::collections::HashMap<&str, Vec<std::net::SocketAddr>> =
+    let mut by_name: std::collections::HashMap<&str, Vec<String>> =
         std::collections::HashMap::new();
 
     for (addr_str, route) in dns.iter().zip(routes.iter()) {
-        let addr: std::net::SocketAddr = addr_str.parse()?;
         let name = route.group_name();
         if !by_name.contains_key(name) {
             order.push((name, *route));
         }
-        by_name.entry(name).or_default().push(addr);
+        by_name.entry(name).or_default().push(addr_str.clone());
     }
 
     Ok(order
@@ -854,6 +853,8 @@ fn build_dns_groups_from_cli(
             servers: by_name.remove(name).unwrap_or_default(),
             strategy,
             upstream: route.upstream(),
+            protocol: crate::config::DnsProtocol::Udp,
+            sni: None,
         })
         .collect())
 }

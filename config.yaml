@@ -17,18 +17,54 @@ socks5:
 
 dns:
   groups:
+    # Plain UDP DNS — used for domestic (direct) traffic.
     - name: direct
       servers:
         - "114.114.114.114:53"
         - "223.5.5.5:53"
+      protocol: udp          # udp | tcp | dot | doh | doq  (default: udp)
       strategy: concurrent
       upstream: direct
+
+    # Plain UDP DNS — used for proxied traffic (relayed via SOCKS5).
     - name: proxy
       servers:
         - "8.8.8.8:53"
         - "1.1.1.1:53"
+      protocol: udp
       strategy: concurrent
       upstream: proxy
+
+    # DNS over TLS (DoT) — encrypted, port 853.
+    # `sni` overrides the TLS server name; defaults to the hostname in the address.
+    #- name: proxy-dot
+    #  servers:
+    #    - "8.8.8.8:853"      # Google Public DNS
+    #    - "1.1.1.1:853"      # Cloudflare
+    #  protocol: dot
+    #  sni: dns.google         # optional — required when host is a bare IP lacking IP SANs
+    #  strategy: concurrent
+    #  upstream: proxy
+
+    # DNS over HTTPS (DoH) — encrypted, HTTP/2, full URL required.
+    # When upstream=proxy the request is routed through the SOCKS5 proxy.
+    #- name: proxy-doh
+    #  servers:
+    #    - "https://dns.google/dns-query"
+    #    - "https://cloudflare-dns.com/dns-query"
+    #  protocol: doh
+    #  strategy: concurrent
+    #  upstream: proxy
+
+    # DNS over QUIC (DoQ) — encrypted, UDP-based, port 853.
+    # QUIC cannot be tunnelled through a TCP SOCKS5 proxy; upstream is always direct.
+    #- name: proxy-doq
+    #  servers:
+    #    - "dns.google:853"
+    #    - "dns.cloudflare.com:853"
+    #  protocol: doq
+    #  strategy: concurrent
+    #  upstream: direct        # proxy is silently ignored for DoQ
 
   listen_port: 53
   timeout_ms: 5000
