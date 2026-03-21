@@ -71,6 +71,7 @@ tinytun run --config <FILE>
 
 # Common overrides
 tinytun run --config <FILE> --loglevel warning
+tinytun run --config <FILE> --log-hide-timestamp
 tinytun run --config <FILE> --socks5 127.0.0.1:1080
 tinytun run --config <FILE> --skip-ip 1.1.1.1 --skip-network 10.0.0.0/8
 ```

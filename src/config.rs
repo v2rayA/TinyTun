@@ -35,14 +35,33 @@ pub enum DnsProtocol {
 }
 
 /// Transport used by a [`DnsGroup`] when forwarding queries to upstream servers.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(untagged)]
 pub enum DnsUpstream {
     /// Send directly via UDP (or plain TCP).
     #[default]
+    #[serde(rename = "direct")]
     Direct,
-    /// Tunnel through the configured SOCKS5 proxy (DNS-over-TCP framing).
-    Proxy,
+    /// Tunnel through a named SOCKS5 proxy.
+    ///
+    /// Use `"proxy"` to select the first configured proxy, or any name from
+    /// the `proxies` list to select a specific one.
+    Named(String),
+}
+
+impl DnsUpstream {
+    /// Return the proxy name if this upstream uses a proxy, or `None` for direct.
+    pub fn proxy_name(&self) -> Option<&str> {
+        match self {
+            DnsUpstream::Direct => None,
+            DnsUpstream::Named(name) => Some(name.as_str()),
+        }
+    }
+
+    /// Returns `true` when the upstream should be routed through a proxy.
+    pub fn is_proxy(&self) -> bool {
+        matches!(self, DnsUpstream::Named(_))
+    }
 }
 
 /// Strategy controlling how a [`DnsGroup`] picks which server(s) to query.
@@ -75,7 +94,12 @@ pub struct DnsGroup {
     /// How to select which server(s) to query within this group.
     #[serde(default)]
     pub strategy: DnsQueryStrategy,
-    /// Whether to query servers directly or via the SOCKS5 proxy.
+    /// Whether to query servers directly or via a SOCKS5 proxy.
+    ///
+    /// - `"direct"` — plain UDP/TCP, no proxy.
+    /// - `"proxy"` — route through the default SOCKS5 proxy.
+    /// - any other string — route through the named proxy from the `proxies` list.
+    ///
     /// For `Doq`, this field is ignored (QUIC cannot traverse TCP SOCKS5).
     #[serde(default)]
     pub upstream: DnsUpstream,
@@ -101,16 +125,67 @@ pub enum LogLevel {
     None,
 }
 
+/// A named SOCKS5 proxy upstream.
+///
+/// The `name` field uniquely identifies the proxy and is referenced by
+/// DNS group `upstream` values and traffic routing rules.
+/// The first entry in `proxies` (or the `socks5` shorthand) acts as the
+/// **default proxy** and can be referenced via the special name `"proxy"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Unique name used to reference this proxy.
+    /// The default proxy should be named `"proxy"`.
+    #[serde(default = "default_proxy_name")]
+    pub name: String,
+    /// SOCKS5 proxy address (`host:port`).
+    pub address: SocketAddr,
+    /// Optional SOCKS5 username.
+    pub username: Option<String>,
+    /// Optional SOCKS5 password.
+    pub password: Option<String>,
+}
+
+fn default_proxy_name() -> String {
+    "proxy".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub log: LogConfig,
     pub tun: TunConfig,
-    pub socks5: Socks5Config,
+    /// Shorthand for the default proxy (equivalent to `proxies[0]` with
+    /// name=`"proxy"`).  Kept for backward compatibility.
+    pub socks5: ProxyConfig,
+    /// Additional named proxies.  Entries here are merged with `socks5`.
+    /// Names must be unique; `"proxy"` is reserved for the default proxy.
+    #[serde(default)]
+    pub proxies: Vec<ProxyConfig>,
     pub dns: DnsConfig,
     pub filtering: FilteringConfig,
     #[serde(default)]
     pub route: RouteConfig,
+}
+
+impl Config {
+    /// Return the proxy configuration for the given name.
+    ///
+    /// Returns the `socks5` (default) proxy when `name` is `"proxy"` or when
+    /// no matching entry is found in `proxies`.
+    pub fn find_proxy(&self, name: &str) -> &ProxyConfig {
+        if name == self.socks5.name || name == "proxy" {
+            return &self.socks5;
+        }
+        self.proxies
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or(&self.socks5)
+    }
+
+    /// Return every configured proxy in order (default first, then extras).
+    pub fn all_proxies(&self) -> impl Iterator<Item = &ProxyConfig> {
+        std::iter::once(&self.socks5).chain(self.proxies.iter())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,14 +199,6 @@ pub struct TunConfig {
     pub ipv6_prefix: u8,
     pub auto_route: bool,
     pub mtu: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Socks5Config {
-    pub address: SocketAddr,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub dns_over_socks5: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +307,7 @@ pub struct RouteConfig {
 #[serde(default)]
 pub struct LogConfig {
     pub loglevel: LogLevel,
+    pub hide_timestamp: bool,
 }
 
 impl Default for Config {
@@ -247,10 +315,22 @@ impl Default for Config {
         Self {
             log: LogConfig::default(),
             tun: TunConfig::default(),
-            socks5: Socks5Config::default(),
+            socks5: ProxyConfig::default(),
+            proxies: Vec::new(),
             dns: DnsConfig::default(),
             filtering: FilteringConfig::default(),
             route: RouteConfig::default(),
+        }
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            name: "proxy".to_string(),
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1080),
+            username: None,
+            password: None,
         }
     }
 }
@@ -276,17 +356,6 @@ impl Default for Ipv6Mode {
     }
 }
 
-impl Default for Socks5Config {
-    fn default() -> Self {
-        Self {
-            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1080),
-            username: None,
-            password: None,
-            dns_over_socks5: true,
-        }
-    }
-}
-
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
@@ -309,7 +378,7 @@ impl Default for DnsConfig {
                         "1.1.1.1:53".to_string(),
                     ],
                     strategy: DnsQueryStrategy::Concurrent,
-                    upstream: DnsUpstream::Proxy,
+                    upstream: DnsUpstream::Named("proxy".to_string()),
                     protocol: DnsProtocol::Udp,
                     sni: None,
                 },
@@ -461,6 +530,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             loglevel: LogLevel::default(),
+            hide_timestamp: false,
         }
     }
 }
@@ -548,7 +618,9 @@ struct YamlConfig {
     #[serde(default)]
     pub log: LogConfig,
     pub tun: TunConfig,
-    pub socks5: Socks5Config,
+    pub socks5: ProxyConfig,
+    #[serde(default)]
+    pub proxies: Vec<ProxyConfig>,
     pub dns: YamlDnsConfig,
     pub filtering: FilteringConfig,
     #[serde(default)]
@@ -570,6 +642,7 @@ impl YamlConfig {
             log: self.log,
             tun: self.tun,
             socks5: self.socks5,
+            proxies: self.proxies,
             dns: DnsConfig {
                 groups: self.dns.groups,
                 listen_port: self.dns.listen_port,

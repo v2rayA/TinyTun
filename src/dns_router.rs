@@ -22,7 +22,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::config::{DnsConfig, DnsGroup, DnsMatcher, DnsProtocol, DnsQueryStrategy, DnsUpstream};
+use crate::config::{Config, DnsConfig, DnsGroup, DnsMatcher, DnsProtocol, DnsQueryStrategy, DnsUpstream};
 use crate::geosite::{DomainType, GeositeDb};
 use crate::socks5_client::Socks5Client;
 
@@ -106,7 +106,9 @@ enum MatchOutcome {
 /// async tasks.
 pub struct DnsRouter {
     config: DnsConfig,
-    socks5_client: Socks5Client,
+    /// Named SOCKS5 clients keyed by proxy name.
+    /// The default proxy is stored under its own name (typically `"proxy"`).
+    proxy_clients: HashMap<String, Socks5Client>,
     /// Pre-compiled routing rules (same order as `config.routing.rules`).
     rules: Vec<CompiledRule>,
     /// Fast lookup: group name → group config.
@@ -118,16 +120,17 @@ pub struct DnsRouter {
     doq_tls_config: Arc<rustls::ClientConfig>,
     /// HTTP client for direct DoH queries.
     http_client: reqwest::Client,
-    /// HTTP client for DoH queries routed via the SOCKS5 proxy.
-    http_proxy_client: Option<reqwest::Client>,
+    /// HTTP client per proxy for DoH queries routed via a SOCKS5 proxy.
+    /// Keyed by proxy name.
+    http_proxy_clients: HashMap<String, reqwest::Client>,
 }
 
 impl DnsRouter {
-    /// Build a new `DnsRouter` from the DNS section of the configuration.
+    /// Build a new `DnsRouter` from the full application [`Config`].
     ///
     /// Returns an error if any `geosite` rule references a file that cannot
     /// be read or parsed.
-    pub fn new(config: DnsConfig, socks5_client: Socks5Client) -> Result<Self> {
+    pub fn new(config: DnsConfig, app_config: &Config) -> Result<Self> {
         let capacity = NonZeroUsize::new(config.routing.cache_capacity.max(1)).unwrap();
         let cache = LruCache::new(capacity);
 
@@ -252,38 +255,50 @@ impl DnsRouter {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build DoH HTTP client: {e}"))?;
 
-        // HTTP client for DoH via SOCKS5 proxy (built lazily only when any
-        // group has protocol=Doh and upstream=Proxy).
-        let needs_proxy_client = config
-            .groups
-            .iter()
-            .any(|g| g.protocol == DnsProtocol::Doh && g.upstream == DnsUpstream::Proxy);
+        // Build named SOCKS5 clients for every configured proxy.
+        let proxy_clients: HashMap<String, Socks5Client> = app_config
+            .all_proxies()
+            .map(|p| (p.name.clone(), Socks5Client::new(p.clone())))
+            .collect();
 
-        let http_proxy_client = if needs_proxy_client {
-            let proxy_url = socks5_client.proxy_socks5h_url();
-            let proxy = reqwest::Proxy::all(&proxy_url)
-                .map_err(|e| anyhow::anyhow!("Invalid SOCKS5 proxy URL '{proxy_url}': {e}"))?;
-            let client = reqwest::Client::builder()
-                .use_rustls_tls()
-                .https_only(true)
-                .proxy(proxy)
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to build DoH proxy HTTP client: {e}"))?;
-            Some(client)
-        } else {
-            None
-        };
+        // Build per-proxy HTTP clients for groups using protocol=DoH and upstream=Named.
+        let mut http_proxy_clients: HashMap<String, reqwest::Client> = HashMap::new();
+        for group in &config.groups {
+            if group.protocol != DnsProtocol::Doh {
+                continue;
+            }
+            if let Some(pname) = group.upstream.proxy_name() {
+                if http_proxy_clients.contains_key(pname) {
+                    continue;
+                }
+                let client = if let Some(sc) = proxy_clients.get(pname) {
+                    let proxy_url = sc.proxy_socks5h_url();
+                    let proxy = reqwest::Proxy::all(&proxy_url)
+                        .map_err(|e| anyhow::anyhow!("Invalid SOCKS5 proxy URL '{proxy_url}' for proxy '{pname}': {e}"))?;
+                    reqwest::Client::builder()
+                        .use_rustls_tls()
+                        .https_only(true)
+                        .proxy(proxy)
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("Failed to build DoH HTTP client for proxy '{pname}': {e}"))?
+                } else {
+                    warn!("DNS group '{}' references unknown proxy '{}' for DoH; will use direct", group.name, pname);
+                    continue;
+                };
+                http_proxy_clients.insert(pname.to_string(), client);
+            }
+        }
 
         Ok(Self {
             config,
-            socks5_client,
+            proxy_clients,
             rules,
             groups,
             cache: Arc::new(Mutex::new(cache)),
             tls_config,
             doq_tls_config,
             http_client,
-            http_proxy_client,
+            http_proxy_clients,
         })
     }
 
@@ -558,13 +573,17 @@ impl DnsRouter {
     ) -> Result<Vec<u8>> {
         use futures::FutureExt;
 
-        let socks5_client  = self.socks5_client.clone();
+        let proxy_client   = group.upstream.proxy_name()
+            .and_then(|n| self.proxy_clients.get(n))
+            .cloned();
+        let http_proxy     = group.upstream.proxy_name()
+            .and_then(|n| self.http_proxy_clients.get(n))
+            .cloned();
         let tls_config     = self.tls_config.clone();
         let doq_tls_config = self.doq_tls_config.clone();
         let http_client    = self.http_client.clone();
-        let http_proxy     = self.http_proxy_client.clone();
         let protocol       = group.protocol;
-        let upstream       = group.upstream;
+        let upstream       = group.upstream.clone();
         let sni            = group.sni.clone();
         let payload        = payload.to_vec();
 
@@ -572,7 +591,7 @@ impl DnsRouter {
             .servers
             .iter()
             .map(|server| {
-                let sc  = socks5_client.clone();
+                let pc  = proxy_client.clone();
                 let tc  = tls_config.clone();
                 let dqc = doq_tls_config.clone();
                 let hc  = http_client.clone();
@@ -580,10 +599,11 @@ impl DnsRouter {
                 let sv  = server.clone();
                 let sni = sni.clone();
                 let p   = payload.clone();
+                let up  = upstream.clone();
                 async move {
                     Self::query_server_static(
-                        &sc, &tc, &dqc, &hc, hp.as_ref(),
-                        &p, &sv, protocol, sni.as_deref(), upstream, timeout_duration,
+                        pc.as_ref(), &tc, &dqc, &hc, hp.as_ref(),
+                        &p, &sv, protocol, sni.as_deref(), &up, timeout_duration,
                     ).await
                 }
                 .boxed()
@@ -659,17 +679,21 @@ impl DnsRouter {
         group: &DnsGroup,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>> {
+        let proxy_client = group.upstream.proxy_name()
+            .and_then(|n| self.proxy_clients.get(n));
+        let http_proxy = group.upstream.proxy_name()
+            .and_then(|n| self.http_proxy_clients.get(n));
         Self::query_server_static(
-            &self.socks5_client,
+            proxy_client,
             &self.tls_config,
             &self.doq_tls_config,
             &self.http_client,
-            self.http_proxy_client.as_ref(),
+            http_proxy,
             payload,
             server,
             group.protocol,
             group.sni.as_deref(),
-            group.upstream,
+            &group.upstream,
             timeout_duration,
         )
         .await
@@ -678,7 +702,7 @@ impl DnsRouter {
     /// Statically-dispatched per-server query — handles all protocol variants.
     #[allow(clippy::too_many_arguments)]
     async fn query_server_static(
-        socks5_client: &Socks5Client,
+        proxy_client: Option<&Socks5Client>,
         tls_config: &Arc<rustls::ClientConfig>,
         doq_tls_config: &Arc<rustls::ClientConfig>,
         http_client: &reqwest::Client,
@@ -687,55 +711,50 @@ impl DnsRouter {
         server: &str,
         protocol: DnsProtocol,
         group_sni: Option<&str>,
-        upstream: DnsUpstream,
+        upstream: &DnsUpstream,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>> {
         match protocol {
             DnsProtocol::Udp => {
                 let addr = parse_socket_addr(server)?;
-                match upstream {
-                    DnsUpstream::Direct => {
-                        Self::query_udp_direct(payload, addr, timeout_duration).await
-                    }
-                    DnsUpstream::Proxy => {
-                        Self::query_via_socks(socks5_client.clone(), payload, addr, timeout_duration).await
-                    }
+                if upstream.is_proxy() {
+                    let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
+                    Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
+                } else {
+                    Self::query_udp_direct(payload, addr, timeout_duration).await
                 }
             }
             DnsProtocol::Tcp => {
                 let addr = parse_socket_addr(server)?;
-                match upstream {
-                    DnsUpstream::Direct => {
-                        Self::query_tcp_direct(payload, addr, timeout_duration).await
-                    }
-                    DnsUpstream::Proxy => {
-                        Self::query_via_socks(socks5_client.clone(), payload, addr, timeout_duration).await
-                    }
+                if upstream.is_proxy() {
+                    let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
+                    Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
+                } else {
+                    Self::query_tcp_direct(payload, addr, timeout_duration).await
                 }
             }
             DnsProtocol::Dot => {
                 let addr = parse_socket_addr(server)?;
                 let sni  = resolve_sni(server, group_sni);
-                match upstream {
-                    DnsUpstream::Direct => {
-                        Self::query_dot_direct(payload, addr, &sni, tls_config, timeout_duration).await
-                    }
-                    DnsUpstream::Proxy => {
-                        Self::query_dot_via_socks(
-                            socks5_client.clone(), payload, addr, &sni, tls_config, timeout_duration,
-                        ).await
-                    }
+                if upstream.is_proxy() {
+                    let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
+                    Self::query_dot_via_socks(
+                        sc.clone(), payload, addr, &sni, tls_config, timeout_duration,
+                    ).await
+                } else {
+                    Self::query_dot_direct(payload, addr, &sni, tls_config, timeout_duration).await
                 }
             }
             DnsProtocol::Doh => {
-                let client = match upstream {
-                    DnsUpstream::Proxy => http_proxy_client.unwrap_or(http_client),
-                    DnsUpstream::Direct => http_client,
+                let client = if upstream.is_proxy() {
+                    http_proxy_client.unwrap_or(http_client)
+                } else {
+                    http_client
                 };
                 Self::query_doh(payload, server, client, timeout_duration).await
             }
             DnsProtocol::Doq => {
-                if upstream == DnsUpstream::Proxy {
+                if upstream.is_proxy() {
                     warn!(
                         "DoQ upstream '{}': QUIC is UDP-based and cannot be tunnelled through \
                          a TCP SOCKS5 proxy — querying directly instead.",

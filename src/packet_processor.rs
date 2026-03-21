@@ -166,7 +166,7 @@ impl PacketProcessor {
         outbound_interface: Option<String>,
     ) -> Result<Self> {
         let socks5_client = Socks5Client::new(config.socks5.clone());
-        let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), socks5_client.clone())?);
+        let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), &config)?);
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
         let (tun_packet_tx, mut tun_packet_rx) = mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
 

@@ -1,5 +1,6 @@
 log:
   loglevel: info
+  hide_timestamp: false
 
 tun:
   name: tun0
@@ -13,7 +14,6 @@ socks5:
   address: "127.0.0.1:1080"
   username: null
   password: null
-  dns_over_socks5: true
 
 dns:
   groups:

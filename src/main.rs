@@ -62,6 +62,10 @@ enum Commands {
         /// Log level: debug, info, warning, error, none
         #[arg(long, value_enum)]
         loglevel: Option<CliLogLevel>,
+
+        /// Hide timestamps in log output
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        log_hide_timestamp: Option<bool>,
         
         /// SOCKS5 proxy address
         #[arg(short, long)]
@@ -75,10 +79,6 @@ enum Commands {
         #[arg(long)]
         socks5_password: Option<String>,
 
-        /// Use SOCKS5 path for DNS where applicable
-        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
-        socks5_dns_over_socks5: Option<bool>,
-        
         /// DNS server address (repeatable)
         #[arg(long)]
         dns: Vec<String>,
@@ -185,10 +185,10 @@ async fn main() -> Result<()> {
         Commands::Run {
             config,
             loglevel,
+            log_hide_timestamp,
             socks5,
             socks5_username,
             socks5_password,
-            socks5_dns_over_socks5,
             dns,
             dns_route,
             dns_strategy,
@@ -217,10 +217,10 @@ async fn main() -> Result<()> {
             let config = load_config(
                 config,
                 loglevel.map(Into::into),
+                log_hide_timestamp,
                 socks5,
                 socks5_username,
                 socks5_password,
-                socks5_dns_over_socks5,
                 dns,
                 dns_route,
                 dns_strategy,
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
                 auto_detect_interface,
                 default_interface,
             )?;
-            init_logging(config.log.loglevel.clone());
+            init_logging(config.log.loglevel.clone(), config.log.hide_timestamp);
             install_rustls_crypto_provider();
             run_proxy(config).await
         }
@@ -661,10 +661,10 @@ async fn run_proxy(config: Config) -> Result<()> {
 fn load_config(
     config_path: Option<String>,
     loglevel: Option<LogLevel>,
+    log_hide_timestamp: Option<bool>,
     socks5: Option<String>,
     socks5_username: Option<String>,
     socks5_password: Option<String>,
-    socks5_dns_over_socks5: Option<bool>,
     dns: Vec<String>,
     dns_route: Vec<CliDnsRoute>,
     dns_strategy: Option<CliDnsStrategy>,
@@ -702,6 +702,9 @@ fn load_config(
     if let Some(v) = loglevel {
         config.log.loglevel = v;
     }
+    if let Some(v) = log_hide_timestamp {
+        config.log.hide_timestamp = v;
+    }
 
     if let Some(socks5_addr) = socks5 {
         config.socks5.address = socks5_addr.parse()?;
@@ -711,9 +714,6 @@ fn load_config(
     }
     if let Some(v) = socks5_password {
         config.socks5.password = Some(v);
-    }
-    if let Some(v) = socks5_dns_over_socks5 {
-        config.socks5.dns_over_socks5 = v;
     }
 
     if !dns.is_empty() {
@@ -968,7 +968,7 @@ impl CliDnsRoute {
     fn upstream(self) -> DnsUpstream {
         match self {
             Self::Direct => DnsUpstream::Direct,
-            Self::Proxy => DnsUpstream::Proxy,
+            Self::Proxy => DnsUpstream::Named("proxy".to_string()),
         }
     }
 }
@@ -1014,7 +1014,7 @@ impl From<CliLogLevel> for LogLevel {
     }
 }
 
-fn init_logging(level: LogLevel) {
+fn init_logging(level: LogLevel, hide_timestamp: bool) {
     let level_filter = match level {
         LogLevel::Debug => LevelFilter::Debug,
         LogLevel::Info => LevelFilter::Info,
@@ -1025,8 +1025,10 @@ fn init_logging(level: LogLevel) {
 
     let mut builder = Builder::new();
     builder.filter_level(level_filter);
-    builder.format_timestamp_secs();
-    builder.format(|buf, record| {
+    if !hide_timestamp {
+        builder.format_timestamp_secs();
+    }
+    builder.format(move |buf, record| {
         use std::io::Write;
 
         let lvl = match record.level() {
@@ -1037,7 +1039,11 @@ fn init_logging(level: LogLevel) {
             log::Level::Trace => "Debug",
         };
 
-        writeln!(buf, "{} [{}] {}", buf.timestamp(), lvl, record.args())
+        if hide_timestamp {
+            writeln!(buf, "[{}] {}", lvl, record.args())
+        } else {
+            writeln!(buf, "{} [{}] {}", buf.timestamp(), lvl, record.args())
+        }
     });
 
     let _ = builder.try_init();
