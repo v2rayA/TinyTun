@@ -43,7 +43,16 @@ jobs:
       - name: Install v2ray (Linux/macOS via Homebrew)
         if: matrix.os != 'windows'
         run: |
-          brew tap v2fly/homebrew-v2ray
+          if command -v /usr/local/bin/brew > /dev/null; then
+              brew_prefix="$(/usr/local/bin/brew --prefix)"
+              eval "$(/usr/local/bin/brew shellenv)"
+          elif command -v /opt/homebrew/bin/brew > /dev/null; then
+              brew_prefix="$(/opt/homebrew/bin/brew --prefix)"
+              eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif command -v /home/linuxbrew/.linuxbrew/bin/brew > /dev/null; then
+              brew_prefix="$(/home/linuxbrew/.linuxbrew/bin/brew --prefix)"
+              eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
           brew install v2ray
 
       - name: Install v2ray (Windows via Scoop)
