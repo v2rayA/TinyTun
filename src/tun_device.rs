@@ -135,10 +135,11 @@ impl TunDevice {
                 warn!("Failed to bring up interface {}: {}", name, String::from_utf8_lossy(&output.stderr));
             }
             
-            // Set IP address
+            // Set IP address (replace is idempotent — handles the case where the
+            // tun crate already assigned the address via ioctl)
             let ip_str = format!("{}/{}", ip, Self::netmask_to_prefix(netmask));
             let output = Command::new("ip")
-                .args(&["addr", "add", &ip_str, "dev", name])
+                .args(&["addr", "replace", &ip_str, "dev", name])
                 .output()?;
             
             if !output.status.success() {
@@ -348,6 +349,19 @@ impl TunDevice {
             let ipv6_prefix = _ipv6_prefix;
 
             // utun is point-to-point on macOS; set local+peer to the same address.
+            // Delete first so a restart with the same address doesn't leave a stale
+            // "Address already assigned" error (ifconfig doesn't have a 'replace').
+            let _ = Command::new("ifconfig")
+                .args([
+                    name,
+                    "inet",
+                    &ip.to_string(),
+                    &ip.to_string(),
+                    "netmask",
+                    &netmask.to_string(),
+                    "-alias",
+                ])
+                .output();
             let output = Command::new("ifconfig")
                 .args([
                     name,
@@ -369,6 +383,18 @@ impl TunDevice {
             }
 
             if let Some(v6) = ipv6 {
+                // Remove the address first (ignore errors if not present) so that
+                // restarting the daemon doesn't accumulate duplicate IPv6 aliases.
+                let _ = Command::new("ifconfig")
+                    .args([
+                        name,
+                        "inet6",
+                        &v6.to_string(),
+                        "prefixlen",
+                        &ipv6_prefix.to_string(),
+                        "-alias",
+                    ])
+                    .output();
                 let output = Command::new("ifconfig")
                     .args([
                         name,

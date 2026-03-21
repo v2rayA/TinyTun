@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
                 default_interface,
             )?;
             init_logging(config.log.loglevel.clone());
+            install_rustls_crypto_provider();
             run_proxy(config).await
         }
     }
@@ -279,28 +280,35 @@ async fn run_proxy(config: Config) -> Result<()> {
             info!("Using outbound interface for bypass routes: {}", interface);
         }
 
-        if let Err(err) = route_manager::apply_skip_ip_routes(
-            &config.filtering.skip_ips,
-            selected_outbound_interface.as_deref(),
-        ) {
-            return Err(anyhow!(
-                "failed to apply skip_ip bypass routes while auto_route is enabled: {}",
-                err
-            ));
+        if !config.filtering.skip_ips.is_empty() {
+            if let Err(err) = route_manager::apply_skip_ip_routes(
+                &config.filtering.skip_ips,
+                selected_outbound_interface.as_deref(),
+            ) {
+                return Err(anyhow!(
+                    "failed to apply skip_ip bypass routes while auto_route is enabled: {}",
+                    err
+                ));
+            }
+            skip_ip_routes_applied = true;
         }
-        skip_ip_routes_applied = true;
 
-        if let Err(err) = route_manager::apply_skip_network_routes(
-            &config.filtering.skip_networks,
-            selected_outbound_interface.as_deref(),
-        ) {
-            let _ = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips);
-            return Err(anyhow!(
-                "failed to apply skip_network bypass routes while auto_route is enabled: {}",
-                err
-            ));
+        if !config.filtering.skip_networks.is_empty() {
+            match route_manager::apply_skip_network_routes(
+                &config.filtering.skip_networks,
+                selected_outbound_interface.as_deref(),
+            ) {
+                Ok(()) => {
+                    skip_network_routes_applied = true;
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to apply skip_network bypass routes: {}; continuing without them",
+                        err
+                    );
+                }
+            }
         }
-        skip_network_routes_applied = true;
     }
     
     // Create TUN device
@@ -1033,4 +1041,10 @@ fn init_logging(level: LogLevel) {
     });
 
     let _ = builder.try_init();
+}
+
+fn install_rustls_crypto_provider() {
+    // Ensure rustls has a process-wide crypto backend before any TLS client is built.
+    // Ignore the error when a provider has already been installed elsewhere.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }

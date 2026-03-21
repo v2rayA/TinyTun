@@ -219,6 +219,7 @@ pub struct DnsHijackConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FilteringConfig {
     pub skip_ips: Vec<IpAddr>,
     pub skip_networks: Vec<String>, // CIDR notation

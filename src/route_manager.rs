@@ -1,5 +1,6 @@
 use ::route_manager::{Route as SysRoute, RouteManager as SysRouteManager};
 use anyhow::{anyhow, Result};
+use log::warn;
 use ipnetwork::IpNetwork;
 use std::cmp::Ordering;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -229,7 +230,9 @@ where
         };
 
         let route = build_route_from_base(ip, prefix, base);
-        add_or_replace(manager, &route)?;
+        if let Err(err) = add_or_replace(manager, &route) {
+            warn!("Skipping bypass route for {}/{}: {}", ip, prefix, err);
+        }
     }
 
     Ok(())
