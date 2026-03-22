@@ -44,15 +44,20 @@ jobs:
         if: matrix.os != 'windows'
         run: |
           if command -v /usr/local/bin/brew > /dev/null; then
+              brew_path="/usr/local/bin/brew"
               brew_prefix="$(/usr/local/bin/brew --prefix)"
               eval "$(/usr/local/bin/brew shellenv)"
           elif command -v /opt/homebrew/bin/brew > /dev/null; then
+              brew_path="/opt/homebrew/bin/brew"
               brew_prefix="$(/opt/homebrew/bin/brew --prefix)"
               eval "$(/opt/homebrew/bin/brew shellenv)"
           elif command -v /home/linuxbrew/.linuxbrew/bin/brew > /dev/null; then
+              brew_path="/home/linuxbrew/.linuxbrew/bin/brew"
               brew_prefix="$(/home/linuxbrew/.linuxbrew/bin/brew --prefix)"
               eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           fi
+          echo BREW_PATH="$brew_path" >> $GITHUB_ENV
+          echo BREW_PREFIX="$brew_prefix" >> $GITHUB_ENV
           brew install v2ray
 
       - name: Install v2ray (Windows via Scoop)
@@ -72,8 +77,9 @@ jobs:
       - name: Write v2ray config (Unix)
         if: matrix.os != 'windows'
         run: |
-          mkdir -p "$(brew --prefix)/etc/v2ray"
-          cat > "$(brew --prefix)/etc/v2ray/config.json" << 'EOF'
+        
+          mkdir -p "$BREW_PREFIX/etc/v2ray"
+          cat > "$BREW_PREFIX/etc/v2ray/config.json" << 'EOF'
           {
             "inbounds": [{
               "port": 1080,
