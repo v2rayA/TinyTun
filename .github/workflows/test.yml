@@ -126,6 +126,7 @@ jobs:
       - name: Start v2ray (Unix)
         if: matrix.os != 'windows'
         run: |
+          eval "$($BREW_PATH shellenv)"
           brew services start v2ray
           sleep 2
 
