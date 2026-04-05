@@ -129,7 +129,6 @@ jobs:
         run: |
           eval "$($BREW_PATH shellenv)"
           brew services start v2ray
-          sleep 2
 
       - name: Start v2ray (Windows)
         if: matrix.os == 'windows'
