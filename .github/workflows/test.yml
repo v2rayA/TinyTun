@@ -103,13 +103,13 @@ jobs:
         shell: pwsh
         run: |
           if (${{ matrix.os  }} -ne 'windows') {
-            $v2ray-bin=$(Get-Command v2ray).Source
-            Write-Host "v2ray binary: $v2ray-bin"
+            $v2ray_bin=$(Get-Command v2ray).Source
+            Write-Host "v2ray binary: $v2ray_bin"
           else {
-            $v2ray-bin = "/home/linuxbrew/.linuxbrew/bin/v2ray.exe"
-            write-host "v2ray binary: $v2ray-bin"
+            $v2ray_bin = "/home/linuxbrew/.linuxbrew/bin/v2ray.exe"
+            write-host "v2ray binary: $v2ray_bin"
           }
-          $proc = Start-Process $v2ray-bin `
+          $proc = Start-Process $v2ray_bin `
             -ArgumentList "run", "-c", "v2ray-config.json" `
             -NoNewWindow -RedirectStandardOutput v2ray.log -RedirectStandardError v2ray-err.log `
             -PassThru
