@@ -1026,46 +1026,6 @@ impl PacketProcessor {
         }
     }
 
-    async fn proxy_udp_with_reused_session(
-        &self,
-        flow_key: UdpFlowKey,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        if let Some(session) = self.get_cached_udp_session(&flow_key).await {
-            match self.exchange_udp_on_session(session, &flow_key, payload).await {
-                Ok(resp) => return Ok(resp),
-                Err(err) => {
-                    debug!(
-                        "Existing UDP ASSOCIATE session failed for {} -> {}: {}; recreating",
-                        flow_key.src,
-                        flow_key.dst,
-                        err
-                    );
-                    self.remove_udp_session(&flow_key).await;
-                }
-            }
-        }
-
-        let session = self
-            .socks5_client
-            .open_udp_session(flow_key.dst)
-            .await
-            .map(|s| Arc::new(Mutex::new(s)))?;
-
-        {
-            let mut table = self.udp_sessions.lock().await;
-            table.insert(
-                flow_key.clone(),
-                UdpSessionEntry {
-                    session: session.clone(),
-                    last_activity: Instant::now(),
-                },
-            );
-        }
-
-        self.exchange_udp_on_session(session, &flow_key, payload).await
-    }
-
     async fn proxy_udp_with_reused_session_shared(
         socks5_client: Socks5Client,
         udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
@@ -1106,32 +1066,6 @@ impl PacketProcessor {
         Self::exchange_udp_on_session_shared(udp_sessions, session, &flow_key, &payload).await
     }
 
-    async fn exchange_udp_on_session(
-        &self,
-        session: Arc<Mutex<Socks5UdpSession>>,
-        flow_key: &UdpFlowKey,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        let response = {
-            let mut guard = session.lock().await;
-            guard.exchange(flow_key.dst, payload).await
-        };
-
-        match response {
-            Ok(resp) => {
-                let mut table = self.udp_sessions.lock().await;
-                if let Some(entry) = table.get_mut(flow_key) {
-                    entry.last_activity = Instant::now();
-                }
-                Ok(resp)
-            }
-            Err(err) => {
-                self.remove_udp_session(flow_key).await;
-                Err(err)
-            }
-        }
-    }
-
     async fn exchange_udp_on_session_shared(
         udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
         session: Arc<Mutex<Socks5UdpSession>>,
@@ -1159,18 +1093,6 @@ impl PacketProcessor {
         }
     }
 
-    async fn get_cached_udp_session(
-        &self,
-        flow_key: &UdpFlowKey,
-    ) -> Option<Arc<Mutex<Socks5UdpSession>>> {
-        let mut table = self.udp_sessions.lock().await;
-        if let Some(entry) = table.get_mut(flow_key) {
-            entry.last_activity = Instant::now();
-            return Some(entry.session.clone());
-        }
-        None
-    }
-
     async fn get_cached_udp_session_shared(
         udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
         flow_key: &UdpFlowKey,
@@ -1181,11 +1103,6 @@ impl PacketProcessor {
             return Some(entry.session.clone());
         }
         None
-    }
-
-    async fn remove_udp_session(&self, flow_key: &UdpFlowKey) {
-        let mut table = self.udp_sessions.lock().await;
-        table.remove(flow_key);
     }
 
     async fn remove_udp_session_shared(
@@ -1253,16 +1170,6 @@ impl PacketProcessor {
         let backoff = self.udp_timeout_backoff.lock().await;
         let now = Instant::now();
         backoff.get(flow_key).is_some_and(|until| *until > now)
-    }
-
-    async fn mark_udp_flow_backoff(&self, flow_key: UdpFlowKey) {
-        let mut backoff = self.udp_timeout_backoff.lock().await;
-        backoff.insert(flow_key, Instant::now() + Self::UDP_TIMEOUT_BACKOFF);
-    }
-
-    async fn clear_udp_backoff(&self, flow_key: &UdpFlowKey) {
-        let mut backoff = self.udp_timeout_backoff.lock().await;
-        backoff.remove(flow_key);
     }
 
     async fn mark_udp_flow_backoff_shared(
@@ -1338,10 +1245,6 @@ impl PacketProcessor {
         }
 
         resp
-    }
-
-    async fn write_tun_packet(&self, packet: &[u8]) -> Result<()> {
-        Self::write_tun_packet_with(self.tun_packet_tx.clone(), packet.to_vec()).await
     }
 
     async fn write_tun_packet_with(

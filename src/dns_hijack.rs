@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::config::Config;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct DnsHijackState {
     pub table_id: u32,
     pub mark: u32,

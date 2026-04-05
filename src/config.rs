@@ -168,20 +168,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Return the proxy configuration for the given name.
-    ///
-    /// Returns the `socks5` (default) proxy when `name` is `"proxy"` or when
-    /// no matching entry is found in `proxies`.
-    pub fn find_proxy(&self, name: &str) -> &ProxyConfig {
-        if name == self.socks5.name || name == "proxy" {
-            return &self.socks5;
-        }
-        self.proxies
-            .iter()
-            .find(|p| p.name == name)
-            .unwrap_or(&self.socks5)
-    }
-
     /// Return every configured proxy in order (default first, then extras).
     pub fn all_proxies(&self) -> impl Iterator<Item = &ProxyConfig> {
         std::iter::once(&self.socks5).chain(self.proxies.iter())
@@ -461,17 +447,6 @@ impl Config {
         }
     }
 
-    pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
-        let content = match ext {
-            "yaml" | "yml" => serde_yaml::to_string(self)?,
-            _ => serde_json::to_string_pretty(self)?,
-        };
-        fs::write(path, content)?;
-        Ok(())
-    }
-    
     /// Check if an IP address should be skipped (not proxied)
     pub fn should_skip_ip(&self, ip: IpAddr) -> bool {
         // Check exact IP matches
@@ -506,11 +481,6 @@ impl Config {
         false
     }
     
-    /// Check if a connection should be proxied
-    pub fn should_proxy(&self, ip: IpAddr, port: u16) -> bool {
-        !self.should_skip_ip(ip) && !self.should_skip_port(port)
-    }
-
     pub fn is_excluded_process_name(&self, process_name: &str) -> bool {
         let candidate = process_name.rsplit(['/', '\\']).next().unwrap_or(process_name);
         self.filtering.exclude_processes.iter().any(|excluded| {

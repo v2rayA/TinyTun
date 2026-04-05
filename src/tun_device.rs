@@ -1,12 +1,9 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use tun::{AbstractDevice, Configuration, DeviceReader, DeviceWriter};
@@ -34,6 +31,7 @@ impl TunDevice {
         ipv6: Option<Ipv6Addr>,
         ipv6_prefix: u8,
         auto_route_enabled: bool,
+        mtu: u32,
     ) -> Result<Self> {
         info!("Creating TUN device: {}", name);
         
@@ -42,7 +40,7 @@ impl TunDevice {
             .tun_name(name)
             .address(ip)
             .netmask(netmask)
-            .mtu(1500)
+            .mtu(mtu as u16)
             .up();
 
         #[cfg(windows)]
@@ -473,6 +471,7 @@ impl TunDevice {
         Ok(None)
     }
     
+    #[cfg(target_os = "macos")]
     fn netmask_to_prefix(netmask: Ipv4Addr) -> u8 {
         let octets = netmask.octets();
         let mut prefix = 0;
@@ -796,18 +795,6 @@ impl TunDevice {
         self.writer.clone()
     }
     
-    pub async fn write_packet(&self, packet: &[u8]) -> Result<usize> {
-        let mut writer = self.writer.lock().await;
-        writer.write_all(packet).await?;
-        Ok(packet.len())
-    }
-    
-    pub async fn read_packet(&self, buffer: &mut [u8]) -> Result<usize> {
-        let mut reader = self.reader.lock().await;
-        let bytes_read = reader.read(buffer).await?;
-        Ok(bytes_read)
-    }
-    
     pub async fn cleanup(&self) -> Result<()> {
         info!("Cleaning up TUN device: {}", self.name);
         
@@ -857,43 +844,5 @@ impl TunDevice {
     
     pub fn name(&self) -> &str {
         &self.name
-    }
-}
-
-// DNS server for handling DNS requests on the TUN interface
-pub struct DnsServer {
-    socket: UdpSocket,
-    upstream_server: SocketAddr,
-    timeout: Duration,
-}
-
-impl DnsServer {
-    pub async fn new(listen_port: u16, upstream_server: SocketAddr, timeout_ms: u64) -> Result<Self> {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", listen_port)).await?;
-        info!("DNS server listening on port {}", listen_port);
-        
-        Ok(Self {
-            socket,
-            upstream_server,
-            timeout: Duration::from_millis(timeout_ms),
-        })
-    }
-    
-    pub async fn handle_dns_request(&self, buffer: &[u8], client_addr: SocketAddr) -> Result<()> {
-        // Forward DNS request to upstream server
-        let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        upstream_socket.send_to(buffer, self.upstream_server).await?;
-        
-        // Wait for response
-        let mut response_buffer = vec![0; 512];
-        let (bytes_read, _) = tokio::time::timeout(
-            self.timeout,
-            upstream_socket.recv_from(&mut response_buffer)
-        ).await??;
-        
-        // Send response back to client
-        self.socket.send_to(&response_buffer[..bytes_read], client_addr).await?;
-        
-        Ok(())
     }
 }

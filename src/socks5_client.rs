@@ -38,14 +38,6 @@ impl Socks5Client {
             _ => format!("socks5h://{}", addr),
         }
     }
-
-    pub fn name(&self) -> &str {
-        &self.config.name
-    }
-
-    pub fn address(&self) -> SocketAddr {
-        self.config.address
-    }
 }
 
 /// Percent-encode a string for use in a URL userinfo component.

@@ -1,11 +1,9 @@
 mod config;
 mod tun_device;
 mod socks5_client;
-mod dns_handler;
 mod dns_router;
 mod geosite;
 mod packet_processor;
-mod error;
 mod route_manager;
 mod process_lookup;
 mod dns_hijack;
@@ -177,7 +175,7 @@ enum Commands {
     },
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     
@@ -319,6 +317,7 @@ async fn run_proxy(config: Config) -> Result<()> {
         if ipv6_enabled { Some(config.tun.ipv6) } else { None },
         config.tun.ipv6_prefix,
         config.tun.auto_route,
+        config.tun.mtu,
     ).await {
         Ok(device) => device,
         Err(err) => {
