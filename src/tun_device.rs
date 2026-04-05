@@ -471,7 +471,7 @@ impl TunDevice {
         Ok(None)
     }
     
-    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     fn netmask_to_prefix(netmask: Ipv4Addr) -> u8 {
         let octets = netmask.octets();
         let mut prefix = 0;
