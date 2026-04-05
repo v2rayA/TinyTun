@@ -105,8 +105,8 @@ jobs:
             Write-Host "v2ray binary: $v2ray_bin"
           }
           else {
-            $v2ray_bin = "$brew_prefix/bin/v2ray"
-            $PATH = "$brew_prefix/bin:" + $env:PATH
+            $v2ray_bin = "$env:brew_prefix/bin/v2ray"
+            $env:PATH = "$env:brew_prefix/bin:" + $env:PATH
             write-host "v2ray binary: $v2ray_bin"
           }
           $proc = Start-Process $v2ray_bin `
