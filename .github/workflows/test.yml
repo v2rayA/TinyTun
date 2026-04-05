@@ -72,27 +72,7 @@ jobs:
           # Persist shims path to subsequent steps
           "$env:USERPROFILE\scoop\shims" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
-      # ── Write v2ray config ─────────────────────────────────────────────────
-
-      - name: Write v2ray config (Unix)
-        if: matrix.os != 'windows'
-        run: |
-        
-          mkdir -p "$BREW_PREFIX/etc/v2ray"
-          cat > "$BREW_PREFIX/etc/v2ray/config.json" << 'EOF'
-          {
-            "inbounds": [{
-              "port": 1080,
-              "listen": "127.0.0.1",
-              "protocol": "socks",
-              "settings": { "auth": "noauth", "udp": true }
-            }],
-            "outbounds": [{ "protocol": "freedom", "settings": {} }]
-          }
-          EOF
-
-      - name: Write v2ray config (Windows)
-        if: matrix.os == 'windows'
+      - name: Write v2ray config
         shell: bash
         run: |
           cat > v2ray-config.json << 'EOF'
@@ -107,8 +87,6 @@ jobs:
           }
           EOF
 
-      # ── Download Wintun (Windows only) ────────────────────────────────────
-
       - name: Download Wintun
         if: matrix.os == 'windows'
         shell: bash
@@ -121,17 +99,7 @@ jobs:
             cp wintun/wintun/bin/amd64/wintun.dll "target/${{ matrix.target }}/release/"
           fi
 
-      # ── Start v2ray ────────────────────────────────────────────────────────
-
-      - name: Start v2ray (Unix)
-        if: matrix.os != 'windows'
-        shell: bash
-        run: |
-          eval "$($BREW_PATH shellenv)"
-          brew services start v2ray
-
-      - name: Start v2ray (Windows)
-        if: matrix.os == 'windows'
+      - name: Start v2ray
         shell: pwsh
         run: |
           $proc = Start-Process v2ray `
@@ -140,10 +108,6 @@ jobs:
             -PassThru
           Write-Host "v2ray PID: $($proc.Id)"
           Start-Sleep -Seconds 2
-
-      # ── Start tinytun ──────────────────────────────────────────────────────
-      # v2ray is excluded via --exclude-process so its outbound traffic bypasses
-      # the TUN and goes directly to the internet, preventing a routing loop.
 
       - name: Start tinytun (Unix)
         if: matrix.os != 'windows'
@@ -172,8 +136,6 @@ jobs:
           Write-Host "tinytun PID: $($proc.Id)"
           Start-Sleep -Seconds 10
 
-      # ── Test ───────────────────────────────────────────────────────────────
-
       - name: Test connectivity via curl (204 check)
         shell: bash
         run: |
@@ -190,8 +152,6 @@ jobs:
           done
           echo "All attempts failed."
           exit 1
-
-      # ── Diagnostics on failure ─────────────────────────────────────────────
 
       - name: Dump logs
         if: failure()
