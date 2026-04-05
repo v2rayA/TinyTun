@@ -38,8 +38,6 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      # ── Install v2ray ──────────────────────────────────────────────────────
-
       - name: Install v2ray (Linux/macOS via Homebrew)
         if: matrix.os != 'windows'
         run: |
@@ -102,11 +100,13 @@ jobs:
       - name: Start v2ray
         shell: pwsh
         run: |
-          if (${{ matrix.os  }} -ne 'windows') {
+          if ("${{ matrix.os }}" -eq 'windows') {
             $v2ray_bin=$(Get-Command v2ray).Source
             Write-Host "v2ray binary: $v2ray_bin"
+          }
           else {
-            $v2ray_bin = "/home/linuxbrew/.linuxbrew/bin/v2ray.exe"
+            $v2ray_bin = "/home/linuxbrew/.linuxbrew/bin/v2ray"
+            $PATH = $brew_prefix + "/bin:" + $env:PATH
             write-host "v2ray binary: $v2ray_bin"
           }
           $proc = Start-Process $v2ray_bin `
