@@ -102,7 +102,14 @@ jobs:
       - name: Start v2ray
         shell: pwsh
         run: |
-          $proc = Start-Process v2ray `
+          if (${{ matrix.os  }} -ne 'windows') {
+            $v2ray-bin=$(Get-Command v2ray).Source
+            Write-Host "v2ray binary: $v2ray-bin"
+          else {
+            $v2ray-bin = "/home/linuxbrew/.linuxbrew/bin/v2ray.exe"
+            write-host "v2ray binary: $v2ray-bin"
+          }
+          $proc = Start-Process $v2ray-bin `
             -ArgumentList "run", "-c", "v2ray-config.json" `
             -NoNewWindow -RedirectStandardOutput v2ray.log -RedirectStandardError v2ray-err.log `
             -PassThru
