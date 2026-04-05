@@ -96,19 +96,29 @@ jobs:
           else
             cp wintun/wintun/bin/amd64/wintun.dll "target/${{ matrix.target }}/release/"
           fi
+ 
 
-      - name: Start v2ray
+      - name: Start v2ray (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          systemd-run --user --scope --quiet --wait --pipe \
+            v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log &
+          echo "v2ray PID: $!"
+
+      - name: Start v2ray (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log &
+          echo "v2ray PID: $!"
+
+      - name: Start v2ray (Windows)
+        if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          if ("${{ matrix.os }}" -eq 'windows') {
-            $v2ray_bin=$(Get-Command v2ray).Source
-            Write-Host "v2ray binary: $v2ray_bin"
-          }
-          else {
-            $v2ray_bin = "$env:brew_prefix/bin/v2ray"
-            $env:PATH = "$env:brew_prefix/bin:" + $env:PATH
-            write-host "v2ray binary: $v2ray_bin"
-          }
+          $v2ray_bin=$(Get-Command v2ray).Source
+          Write-Host "v2ray binary: $v2ray_bin"
           $proc = Start-Process $v2ray_bin `
             -ArgumentList "run", "-c", "v2ray-config.json" `
             -NoNewWindow -RedirectStandardOutput v2ray.log -RedirectStandardError v2ray-err.log `
