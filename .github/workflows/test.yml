@@ -97,21 +97,19 @@ jobs:
             cp wintun/wintun/bin/amd64/wintun.dll "target/${{ matrix.target }}/release/"
           fi
  
-
       - name: Start v2ray (Linux)
         if: matrix.os == 'linux'
         shell: bash
         run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           systemd-run --user --scope --quiet --wait --pipe \
-            v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log &
-          echo "v2ray PID: $!"
+            v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log
 
       - name: Start v2ray (macOS)
         if: matrix.os == 'macos'
         shell: bash
         run: |
           v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log &
-          echo "v2ray PID: $!"
 
       - name: Start v2ray (Windows)
         if: matrix.os == 'windows'
@@ -123,7 +121,6 @@ jobs:
             -ArgumentList "run", "-c", "v2ray-config.json" `
             -NoNewWindow -RedirectStandardOutput v2ray.log -RedirectStandardError v2ray-err.log `
             -PassThru
-          Write-Host "v2ray PID: $($proc.Id)"
           Start-Sleep -Seconds 2
 
       - name: Start tinytun (Unix)
