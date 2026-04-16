@@ -86,7 +86,7 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
-            mingw-w64-clang-x86_64-rust
+            mingw-w64-x86_64-rust
 
       - name: Install MSYS2 toolchain (gnullvm x86_64)
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'x86_64-pc-windows-gnullvm'
