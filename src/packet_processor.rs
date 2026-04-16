@@ -36,6 +36,7 @@ pub struct PacketProcessor {
     tcp_sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
     pending_connections: Arc<Mutex<HashSet<FlowKey>>>,
     udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+    pending_udp_sessions: Arc<Mutex<HashSet<UdpFlowKey>>>,
     udp_timeout_backoff: Arc<Mutex<HashMap<UdpFlowKey, Instant>>>,
     process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
     process_lookup_inflight: Arc<Mutex<HashSet<ProcessLookupKey>>>,
@@ -188,6 +189,7 @@ impl PacketProcessor {
             tcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_connections: Arc::new(Mutex::new(HashSet::new())),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_udp_sessions: Arc::new(Mutex::new(HashSet::new())),
             udp_timeout_backoff: Arc::new(Mutex::new(HashMap::new())),
             process_name_cache: Arc::new(Mutex::new(HashMap::new())),
             process_lookup_inflight: Arc::new(Mutex::new(HashSet::new())),
@@ -331,18 +333,36 @@ impl PacketProcessor {
             .should_exclude_process_flow(TransportProtocol::Tcp, source_addr, target_addr)
             .await
         {
-            let mut should_reset = !self.config.tun.auto_route;
-            if tcp_header.syn() && !tcp_header.ack() && self.config.tun.auto_route {
-                if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
-                    warn!(
-                        "Failed to install dynamic bypass route for excluded flow {}:{} -> {}:{}: {}",
-                        ip_packet.src,
-                        source_port,
-                        ip_packet.dst,
-                        dest_port,
-                        err
-                    );
-                    should_reset = true;
+            // If a SOCKS5 session was already established for this flow before the process
+            // lookup completed, remove it now so it does not become a ghost entry that keeps
+            // forwarding data forever.
+            let had_session = {
+                let mut table = self.tcp_sessions.lock().await;
+                table.remove(&flow_key).is_some()
+            };
+
+            // Inject a RST when:
+            //   • auto_route is OFF  (client must reconnect; it will be rejected again), OR
+            //   • a live session was just torn down (wake the client so it retries; the retry
+            //     SYN will go via the bypass route that we install below).
+            let mut should_reset = !self.config.tun.auto_route || had_session;
+
+            if self.config.tun.auto_route {
+                // Install bypass route for SYN packets *or* when a ghost session was just
+                // removed (so the imminent client reconnect is routed around the TUN).
+                let needs_bypass = (tcp_header.syn() && !tcp_header.ack()) || had_session;
+                if needs_bypass {
+                    if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
+                        warn!(
+                            "Failed to install dynamic bypass route for excluded flow {}:{} -> {}:{}: {}",
+                            ip_packet.src,
+                            source_port,
+                            ip_packet.dst,
+                            dest_port,
+                            err
+                        );
+                        should_reset = true;
+                    }
                 }
             }
 
@@ -910,6 +930,7 @@ impl PacketProcessor {
 
         let socks5_client = self.socks5_client.clone();
         let udp_sessions = self.udp_sessions.clone();
+        let pending_udp_sessions = self.pending_udp_sessions.clone();
         let udp_timeout_backoff = self.udp_timeout_backoff.clone();
         let tun_packet_tx = self.tun_packet_tx.clone();
         let src_ip = ip_packet.src;
@@ -923,6 +944,7 @@ impl PacketProcessor {
                 PacketProcessor::proxy_udp_with_reused_session_shared(
                     socks5_client,
                     udp_sessions,
+                    pending_udp_sessions,
                     udp_flow_key.clone(),
                     udp_payload,
                 ),
@@ -1021,6 +1043,7 @@ impl PacketProcessor {
     async fn proxy_udp_with_reused_session_shared(
         socks5_client: Socks5Client,
         udp_sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpSessionEntry>>>,
+        pending_udp_sessions: Arc<Mutex<HashSet<UdpFlowKey>>>,
         flow_key: UdpFlowKey,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
@@ -1039,10 +1062,30 @@ impl PacketProcessor {
             }
         }
 
-        let session = socks5_client
-            .open_udp_session(flow_key.dst)
-            .await
-            .map(|s| Arc::new(Mutex::new(s)))?;
+        // Guard against concurrent tasks for the same flow all racing into
+        // open_udp_session simultaneously. Each call opens a TCP control socket + UDP
+        // socket to the SOCKS5 proxy; on Windows every abandoned socket pair enters
+        // TIME_WAIT and consumes ephemeral ports, exhausting the ~16 k port pool fast.
+        let is_already_pending = {
+            let mut pending = pending_udp_sessions.lock().await;
+            !pending.insert(flow_key.clone())
+        };
+        if is_already_pending {
+            return Err(anyhow::anyhow!(
+                "UDP ASSOCIATE session establishment already in progress for {} -> {}",
+                flow_key.src,
+                flow_key.dst
+            ));
+        }
+
+        let open_result = socks5_client.open_udp_session(flow_key.dst).await;
+
+        {
+            let mut pending = pending_udp_sessions.lock().await;
+            pending.remove(&flow_key);
+        }
+
+        let session = open_result.map(|s| Arc::new(Mutex::new(s)))?;
 
         {
             let mut table = udp_sessions.lock().await;
@@ -1347,9 +1390,14 @@ impl PacketProcessor {
         {
             let mut dynamic = self.dynamic_bypass_ips.lock().await;
             if let Some(last_seen) = dynamic.get_mut(&ip) {
+                // IP already tracked (route installed or pending): refresh TTL and return.
                 *last_seen = Instant::now();
                 return Ok(());
             }
+            // Insert a placeholder *before* releasing the lock to prevent concurrent tasks
+            // from racing into open_udp_session / apply_skip_ip_routes for the same IP
+            // and causing duplicate route entries or Windows ephemeral-port exhaustion.
+            dynamic.insert(ip, Instant::now());
         }
 
         let outbound_interface = self.outbound_interface.clone();
@@ -1359,10 +1407,13 @@ impl PacketProcessor {
         .await
         .map_err(|err| anyhow::anyhow!("dynamic bypass task join error: {}", err))?;
 
-        install_result?;
+        if let Err(err) = install_result {
+            // Route installation failed: remove the placeholder so the next packet can retry.
+            let mut dynamic = self.dynamic_bypass_ips.lock().await;
+            dynamic.remove(&ip);
+            return Err(err);
+        }
 
-        let mut dynamic = self.dynamic_bypass_ips.lock().await;
-        dynamic.insert(ip, Instant::now());
         info!("Installed dynamic bypass route for excluded process destination {}", ip);
         Ok(())
     }

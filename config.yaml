@@ -6,14 +6,21 @@ tun:
   name: tun0
   ip: 198.18.0.1
   netmask: 255.255.255.255
-  ipv6_mode: auto
+  ipv6_mode: auto    # auto | on | off
+  ipv6: "fd00::1"    # TUN IPv6 address (used when ipv6_mode != off)
+  ipv6_prefix: 128   # prefix length for the TUN IPv6 address
   auto_route: true
   mtu: 1500
 
 socks5:
+  name: proxy          # logical name referenced by dns.groups[].upstream
   address: "127.0.0.1:1080"
   username: null
   password: null
+
+# Additional named proxies (optional).  Each entry has the same fields as socks5.
+# Reference them by name in dns.groups[].upstream or future traffic-routing rules.
+proxies: []
 
 dns:
   groups:
@@ -69,6 +76,14 @@ dns:
   listen_port: 53
   timeout_ms: 5000
 
+  # DNS hijack — redirect host DNS traffic into TinyTun (Linux only).
+  # Requires iptables and a dedicated routing table.
+  hijack:
+    enabled: false
+    mark: 0x01        # fwmark value used to steer DNS packets
+    table_id: 100     # ip rule / ip route table for hijacked DNS
+    capture_tcp: true # also hijack TCP/53 (in addition to UDP/53)
+
   routing:
     # Default geosite.dat path, used when a rule does not specify an explicit file.
     geosite_file: /etc/v2ray/geosite.dat
@@ -116,3 +131,4 @@ filtering:
 
 route:
   auto_detect_interface: true
+  default_interface: null   # e.g. "eth0" — explicit outbound interface, overrides auto-detection

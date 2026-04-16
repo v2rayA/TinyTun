@@ -8,14 +8,18 @@
     "ip": "198.18.0.1",
     "netmask": "255.255.255.255",
     "ipv6_mode": "auto",
+    "ipv6": "fd00::1",
+    "ipv6_prefix": 128,
     "auto_route": true,
     "mtu": 1500
   },
   "socks5": {
+    "name": "proxy",
     "address": "127.0.0.1:1080",
     "username": null,
     "password": null
   },
+  "proxies": [],
   "dns": {
     "groups": [
       {
@@ -63,6 +67,12 @@
     ],
     "listen_port": 53,
     "timeout_ms": 5000,
+    "hijack": {
+      "enabled": false,
+      "mark": 1,
+      "table_id": 100,
+      "capture_tcp": true
+    },
     "routing": {
       "rules": [
         {
@@ -71,6 +81,10 @@
         },
         {
           "matcher": {"type": "geosite", "file": "/etc/v2ray/geosite.dat", "tag": "cn"},
+          "group": "direct"
+        },
+        {
+          "matcher": {"type": "domain_suffix", "value": "lan"},
           "group": "direct"
         },
         {
@@ -97,6 +111,7 @@
     "exclude_processes": []
   },
   "route": {
-    "auto_detect_interface": true
+    "auto_detect_interface": true,
+    "default_interface": null
   }
 }
