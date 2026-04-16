@@ -1,0 +1,27 @@
+[package]
+name = "tinytun-ebpf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aya = { version = "0.12", features = ["no_std", "btf"] }
+aya-bindings = "0.12"
+aya-log-ebpf = "0.1"
+
+[profile.release]
+opt-level = 3
+debug = 1
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+codegen-units = 1
+rpath = false
+
+[profile.dev]
+opt-level = 0
+debug = 2

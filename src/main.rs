@@ -1,3 +1,4 @@
+mod common;
 mod config;
 mod tun_device;
 mod socks5_client;
@@ -310,7 +311,7 @@ async fn run_proxy(config: Config) -> Result<()> {
     }
     
     // Create TUN device
-    let tun_device = match TunDevice::new(
+    let mut tun_device = match TunDevice::new(
         &config.tun.name,
         config.tun.ip,
         config.tun.netmask,

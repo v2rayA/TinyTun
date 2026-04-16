@@ -162,7 +162,7 @@ impl PacketProcessor {
 
     pub fn new(
         config: Config,
-        tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+        tun_writer: Arc<tun_rs::AsyncDevice>,
         outbound_interface: Option<String>,
     ) -> Result<Self> {
         let socks5_client = Socks5Client::new(config.socks5.clone());
@@ -172,12 +172,7 @@ impl PacketProcessor {
 
         tokio::spawn(async move {
             while let Some(packet) = tun_packet_rx.recv().await {
-                let write_result = {
-                    let mut writer = tun_writer.lock().await;
-                    writer.write_all(&packet).await
-                };
-
-                if let Err(err) = write_result {
+                if let Err(err) = tun_writer.send(&packet).await {
                     warn!("Failed to write packet to TUN from writer queue: {}", err);
                 }
             }
@@ -206,7 +201,7 @@ impl PacketProcessor {
         self.dynamic_bypass_ips.clone()
     }
     
-    pub async fn process_packets(&self, tun_reader: Arc<Mutex<tun::DeviceReader>>) -> Result<()> {
+    pub async fn process_packets(&self, tun_reader: Arc<tun_rs::AsyncDevice>) -> Result<()> {
         info!("Starting packet processing");
         
         let mut buffer = vec![0; self.config.tun.mtu as usize];
@@ -233,10 +228,7 @@ impl PacketProcessor {
                 last_process_cache_cleanup_at = Instant::now();
             }
 
-            let bytes_read = {
-                let mut reader = tun_reader.lock().await;
-                reader.read(&mut buffer).await?
-            };
+            let bytes_read = tun_reader.recv(&mut buffer).await?;
             
             if bytes_read == 0 {
                 continue;
