@@ -77,6 +77,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+          targets: ${{ matrix.target }}
 
       - name: Install bpf-linker (eBPF builds)
         if: matrix.ebpf == true
