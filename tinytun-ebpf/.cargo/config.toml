@@ -1,0 +1,15 @@
+# Build and linker configuration for the `tinytun-ebpf` eBPF crate.
+#
+# This sets the default compilation target to `bpfel-unknown-none` (little-endian
+# BPF) and wires in `bpf-linker` as the linker.  These settings only take effect
+# when Cargo is invoked from within the `tinytun-ebpf/` directory or when the
+# package is built explicitly with `--package tinytun-ebpf --target bpfel-unknown-none`.
+
+[build]
+target = "bpfel-unknown-none"
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+
+[target.bpfeb-unknown-none]
+linker = "bpf-linker"

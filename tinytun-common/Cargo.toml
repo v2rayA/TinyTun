@@ -1,0 +1,13 @@
+[package]
+name = "tinytun-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types between tinytun user-space and eBPF kernel programs"
+license = "GPL-3.0-or-later"
+
+[features]
+# Enable the `aya::Pod` impl for `PacketEvent` (needed by the user-space crate).
+aya = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.13.1", optional = true }

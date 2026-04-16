@@ -6,3 +6,12 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-gnullvm]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# eBPF targets use bpf-linker.
+# These settings are only used when `tinytun-ebpf` is compiled explicitly for
+# the BPF target (either via build.rs / aya-build or manually).
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+
+[target.bpfeb-unknown-none]
+linker = "bpf-linker"

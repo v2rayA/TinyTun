@@ -1,0 +1,16 @@
+[package]
+name = "tinytun-ebpf"
+version = "0.1.0"
+edition = "2021"
+description = "eBPF TC egress program for tinytun traffic filtering"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1.1"
+aya-log-ebpf = "0.1.0"
+tinytun-common = { path = "../tinytun-common" }
+
+[[bin]]
+name = "tinytun-filter"
+path = "src/main.rs"

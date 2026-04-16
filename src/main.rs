@@ -7,6 +7,8 @@ mod packet_processor;
 mod route_manager;
 mod process_lookup;
 mod dns_hijack;
+#[cfg(all(target_os = "linux", feature = "ebpf-inbound"))]
+mod ebpf_inbound;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -19,7 +21,7 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::config::{Config, DnsGroup, DnsQueryStrategy, DnsUpstream, Ipv6Mode, LogLevel};
+use crate::config::{Config, DnsGroup, DnsQueryStrategy, DnsUpstream, InboundMode, Ipv6Mode, LogLevel};
 use crate::dns_hijack::DnsHijackState;
 use crate::tun_device::TunDevice;
 use crate::packet_processor::PacketProcessor;
@@ -37,6 +39,24 @@ impl From<CliIpv6Mode> for Ipv6Mode {
             CliIpv6Mode::Auto => Ipv6Mode::Auto,
             CliIpv6Mode::On => Ipv6Mode::On,
             CliIpv6Mode::Off => Ipv6Mode::Off,
+        }
+    }
+}
+
+/// Inbound capture mode selectable from the CLI.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CliInboundMode {
+    /// Standard TUN-device inbound (default).
+    Tun,
+    /// eBPF TC egress filter on the TUN interface (Linux only).
+    Ebpf,
+}
+
+impl From<CliInboundMode> for InboundMode {
+    fn from(value: CliInboundMode) -> Self {
+        match value {
+            CliInboundMode::Tun => InboundMode::Tun,
+            CliInboundMode::Ebpf => InboundMode::Ebpf,
         }
     }
 }
@@ -172,6 +192,10 @@ enum Commands {
         /// Manually specify outbound physical interface for bypass routes
         #[arg(long)]
         default_interface: Option<String>,
+
+        /// Inbound capture mode: tun (default) or ebpf (Linux only)
+        #[arg(long, value_enum)]
+        inbound: Option<CliInboundMode>,
     },
 }
 
@@ -211,6 +235,7 @@ async fn main() -> Result<()> {
             exclude_process,
             auto_detect_interface,
             default_interface,
+            inbound,
         } => {
             let config = load_config(
                 config,
@@ -243,6 +268,7 @@ async fn main() -> Result<()> {
                 exclude_process,
                 auto_detect_interface,
                 default_interface,
+                inbound.map(Into::into),
             )?;
             init_logging(config.log.loglevel.clone(), config.log.hide_timestamp);
             install_rustls_crypto_provider();
@@ -587,7 +613,39 @@ async fn run_proxy(config: Config) -> Result<()> {
             error!("Packet processing error: {}", e);
         }
     });
-    
+
+    // Attach the eBPF TC egress filter to the TUN interface (Linux only).
+    #[cfg(all(target_os = "linux", feature = "ebpf-inbound"))]
+    let ebpf_handle: Option<ebpf_inbound::EbpfInbound> =
+        if config.inbound == InboundMode::Ebpf {
+            match ebpf_inbound::EbpfInbound::attach(&config, tun_device.name()).await {
+                Ok(h) => {
+                    info!(
+                        "eBPF inbound mode active on TUN interface {}",
+                        tun_device.name()
+                    );
+                    Some(h)
+                }
+                Err(e) => {
+                    warn!(
+                        "eBPF inbound mode requested but failed to attach: {e:#}; \
+                         falling back to user-space filtering only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    #[cfg(not(all(target_os = "linux", feature = "ebpf-inbound")))]
+    if config.inbound == InboundMode::Ebpf {
+        warn!(
+            "eBPF inbound mode requested but tinytun was not compiled with \
+             '--features ebpf-inbound'; using user-space filtering only"
+        );
+    }
+
     // Handle shutdown signals
     let shutdown_signal = async {
         let _ = signal::ctrl_c().await;
@@ -609,6 +667,12 @@ async fn run_proxy(config: Config) -> Result<()> {
     processor_handle.abort();
     if let Some(handle) = interface_monitor_handle {
         handle.abort();
+    }
+
+    // Detach eBPF TC filter before tearing down the TUN device.
+    #[cfg(all(target_os = "linux", feature = "ebpf-inbound"))]
+    if let Some(h) = ebpf_handle {
+        h.detach().await;
     }
 
     if auto_route_applied {
@@ -688,6 +752,7 @@ fn load_config(
     linux_exclude_process: Vec<String>,
     auto_detect_interface: Option<bool>,
     default_interface: Option<String>,
+    inbound_mode: Option<InboundMode>,
 ) -> Result<Config> {
     let default_interface_cli_provided = default_interface.is_some();
 
@@ -796,6 +861,16 @@ fn load_config(
         return Err(anyhow!(
             "auto_detect_interface and default_interface cannot both be enabled; disable auto_detect_interface when default_interface is set"
         ));
+    }
+
+    if let Some(mode) = inbound_mode {
+        config.inbound = mode;
+    }
+
+    // Validate: eBPF inbound is Linux-only.
+    #[cfg(not(target_os = "linux"))]
+    if config.inbound == InboundMode::Ebpf {
+        return Err(anyhow!("--inbound ebpf is only supported on Linux"));
     }
 
     // Ensure tunnel local addresses are never proxied.

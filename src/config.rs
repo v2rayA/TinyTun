@@ -149,6 +149,62 @@ fn default_proxy_name() -> String {
     "proxy".to_string()
 }
 
+/// Selects which inbound capture mechanism is used.
+///
+/// * `Tun` (default) — the existing TUN-device based approach.
+/// * `Ebpf` (Linux only) — a TC eBPF egress program attached to the TUN
+///   interface that filters traffic at the kernel level before it reaches
+///   user space.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InboundMode {
+    /// Use TUN virtual NIC; all filtering is performed in user space.
+    #[default]
+    Tun,
+    /// Use aya-rs eBPF TC program for kernel-level filtering (Linux only).
+    Ebpf,
+}
+
+/// Configuration for the eBPF inbound mode (Linux only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EbpfConfig {
+    /// Physical network interface whose ifindex is written into the eBPF
+    /// `REDIRECT_IFINDEX` map.  When `None`, the interface is auto-detected
+    /// from the default route (same heuristic as `route.default_interface`).
+    pub interface: Option<String>,
+    /// Firewall mark value applied to packets that should be proxied through
+    /// the TUN device in mark-based routing scenarios.  Defaults to `0x162`.
+    /// Not used by the default redirect-via-TUN strategy, but exposed for
+    /// advanced setups.
+    #[serde(default = "EbpfConfig::default_proxy_mark")]
+    pub proxy_mark: u32,
+    /// Policy-routing table ID used together with `proxy_mark`.
+    /// Defaults to `162`.
+    #[serde(default = "EbpfConfig::default_route_table")]
+    pub route_table: u32,
+}
+
+impl EbpfConfig {
+    fn default_proxy_mark() -> u32 {
+        0x162
+    }
+
+    fn default_route_table() -> u32 {
+        162
+    }
+}
+
+impl Default for EbpfConfig {
+    fn default() -> Self {
+        Self {
+            interface: None,
+            proxy_mark: Self::default_proxy_mark(),
+            route_table: Self::default_route_table(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -165,6 +221,12 @@ pub struct Config {
     pub filtering: FilteringConfig,
     #[serde(default)]
     pub route: RouteConfig,
+    /// Selects the inbound capture strategy.  Defaults to `"tun"`.
+    #[serde(default)]
+    pub inbound: InboundMode,
+    /// Configuration specific to the eBPF inbound mode.
+    #[serde(default)]
+    pub ebpf: EbpfConfig,
 }
 
 impl Config {
@@ -306,6 +368,8 @@ impl Default for Config {
             dns: DnsConfig::default(),
             filtering: FilteringConfig::default(),
             route: RouteConfig::default(),
+            inbound: InboundMode::default(),
+            ebpf: EbpfConfig::default(),
         }
     }
 }
@@ -595,6 +659,10 @@ struct YamlConfig {
     pub filtering: FilteringConfig,
     #[serde(default)]
     pub route: RouteConfig,
+    #[serde(default)]
+    pub inbound: InboundMode,
+    #[serde(default)]
+    pub ebpf: EbpfConfig,
 }
 
 impl YamlConfig {
@@ -627,6 +695,8 @@ impl YamlConfig {
             },
             filtering: self.filtering,
             route: self.route,
+            inbound: self.inbound,
+            ebpf: self.ebpf,
         })
     }
 }
