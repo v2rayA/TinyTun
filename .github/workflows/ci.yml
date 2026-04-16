@@ -40,7 +40,6 @@ jobs:
           - target: armv7-unknown-linux-gnueabihf
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
-
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
@@ -50,7 +49,6 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
-
           - target: x86_64-apple-darwin
             runner: macos-26-intel
             build_tool: cargo
@@ -128,11 +126,12 @@ jobs:
 
       - name: Build (cargo, windows gnu via MSYS2)
         if: matrix.build_tool == 'cargo-windows-gnu'
+        shell: msys2 {0}
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Build (cargo, windows gnullvm via Cargo target config)
+      - name: Build (cargo, windows gnullvm via MSYS2 and clang)
         if: matrix.build_tool == 'cargo-gnullvm'
         shell: msys2 {0}
         run: |
