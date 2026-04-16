@@ -32,24 +32,24 @@ jobs:
             runner: windows-11-arm
             build_tool: cargo-gnullvm
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            build_tool: cargo
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            build_tool: cargo
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
           - target: armv7-unknown-linux-gnueabihf
-            runner: ubuntu-24.04
-            build_tool: cross
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
 
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            build_tool: cargo-musl
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            build_tool: cargo-musl
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
           - target: armv7-unknown-linux-musleabihf
-            runner: ubuntu-24.04
-            build_tool: cross
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
 
           - target: x86_64-apple-darwin
             runner: macos-26-intel
@@ -64,17 +64,23 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        if: matrix.target != 'x86_64-pc-windows-gnullvm' && matrix.target != 'aarch64-pc-windows-gnullvm'
+        if: matrix.target != 'x86_64-pc-windows-gnu' && matrix.target != 'x86_64-pc-windows-gnullvm' && matrix.target != 'aarch64-pc-windows-gnullvm'
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.build_tool == 'cross'
+      - name: Install Zig
+        if: startsWith(matrix.runner, 'ubuntu-latest')
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.14.0'
+
+      - name: Install cargo-zigbuild
+        if: startsWith(matrix.runner, 'ubuntu-latest')
         uses: taiki-e/install-action@v2
         with:
-          tool: cross
+          tool: cargo-zigbuild
 
-      - name: Install MSYS2 (MinGW64)
+      - name: Install MSYS2 toolchain (gnu x86_64)
         if: matrix.build_tool == 'cargo-windows-gnu'
         uses: msys2/setup-msys2@v2
         with:
@@ -82,6 +88,7 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
+            mingw-w64-clang-x86_64-rust
 
       - name: Install MSYS2 toolchain (gnullvm x86_64)
         if: matrix.build_tool == 'cargo-gnullvm' && matrix.target == 'x86_64-pc-windows-gnullvm'
@@ -107,22 +114,16 @@ jobs:
             mingw-w64-clang-aarch64-llvm
             mingw-w64-clang-aarch64-rust 
 
-      - name: Install musl toolchain
-        if: matrix.build_tool == 'cargo-musl'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
       - name: Build (cargo)
         if: matrix.build_tool == 'cargo'
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      - name: Build (cargo-zigbuild)
+        if: matrix.build_tool == 'cargo-zigbuild'
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+
       - name: Build (cargo, windows msvc static CRT)
         if: matrix.build_tool == 'cargo-msvc'
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cargo, windows gnu via MSYS2)
@@ -136,14 +137,6 @@ jobs:
         shell: msys2 {0}
         run: |
           cargo build --locked --release --target ${{ matrix.target }}
-
-      - name: Build (cargo, musl)
-        if: matrix.build_tool == 'cargo-musl'
-        run: cargo build --locked --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.build_tool == 'cross'
-        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         shell: bash
@@ -171,7 +164,7 @@ jobs:
   release:
     name: release
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
