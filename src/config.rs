@@ -169,13 +169,14 @@ pub enum InboundMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EbpfConfig {
-    /// Physical network interface whose ifindex is written into the eBPF
-    /// `REDIRECT_IFINDEX` map.  When `None`, the interface is auto-detected
-    /// from the default route (same heuristic as `route.default_interface`).
+    /// Physical outbound network interface used when the eBPF program needs
+    /// to identify the physical NIC (e.g. for future redirect-to-physical
+    /// strategies).  When `None`, the interface is auto-detected from the
+    /// default route, matching the same heuristic as `route.default_interface`.
     pub interface: Option<String>,
     /// Firewall mark value applied to packets that should be proxied through
     /// the TUN device in mark-based routing scenarios.  Defaults to `0x162`.
-    /// Not used by the default redirect-via-TUN strategy, but exposed for
+    /// Not used by the default TC-egress strategy, but provided for
     /// advanced setups.
     #[serde(default = "EbpfConfig::default_proxy_mark")]
     pub proxy_mark: u32,

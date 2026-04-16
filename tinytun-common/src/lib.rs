@@ -43,7 +43,9 @@ pub struct PacketEvent {
     pub protocol: u8,
     /// Action taken (see [`action`]).
     pub action: u8,
-    /// Padding to align the struct to 4 bytes.
+    /// Padding to align the struct size to a multiple of 4 bytes so that
+    /// it can be safely copied from the perf-event ring buffer on any
+    /// alignment.
     pub _pad: [u8; 2],
 }
 

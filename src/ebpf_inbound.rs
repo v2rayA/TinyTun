@@ -230,6 +230,8 @@ fn populate_maps(ebpf: &mut Ebpf, config: &Config) -> Result<()> {
         for net_str in &config.filtering.skip_networks {
             if let Ok(net) = net_str.parse::<ipnetwork::IpNetwork>() {
                 if let IpAddr::V4(addr) = net.network() {
+                    // aya's LpmKey::new expects `u32` for the prefix length
+                    // even though ipnetwork::IpNetwork::prefix() returns `u8`.
                     let key = LpmKey::new(net.prefix() as u32, u32::from(addr).to_be());
                     map.insert(&key, 1u8, 0)
                         .with_context(|| format!("SKIP_NETS_V4: insert {net_str}"))?;
@@ -250,6 +252,7 @@ fn populate_maps(ebpf: &mut Ebpf, config: &Config) -> Result<()> {
         for net_str in &config.filtering.skip_networks {
             if let Ok(net) = net_str.parse::<ipnetwork::IpNetwork>() {
                 if let IpAddr::V6(addr) = net.network() {
+                    // aya's LpmKey::new expects `u32` for the prefix length.
                     let key = LpmKey::new(net.prefix() as u32, addr.octets());
                     map.insert(&key, 1u8, 0)
                         .with_context(|| format!("SKIP_NETS_V6: insert {net_str}"))?;
@@ -359,9 +362,16 @@ fn spawn_perf_reader(ebpf: &mut Ebpf, shutdown: Arc<Notify>) -> Result<JoinHandl
                     Ok(info) if info.read > 0 => {
                         any_data = true;
                         for raw in &raw_bufs[..info.read] {
-                            if raw.len() >= event_size {
-                                // SAFETY: We checked the buffer is large enough
-                                // and PacketEvent is repr(C) / plain-old-data.
+                        if raw.len() >= event_size {
+                                // SAFETY: Three conditions are met:
+                                // 1. `raw.len() >= event_size` is verified above.
+                                // 2. We pre-allocated `event_size + 256` bytes per
+                                //    buffer and called `set_len(capacity)`, so the
+                                //    kernel's perf ring write has already initialised
+                                //    this memory before `read_events` returns.
+                                // 3. `PacketEvent` is `#[repr(C)]` with only
+                                //    plain-old-data fields; `read_unaligned` handles
+                                //    any alignment requirements safely.
                                 let ev = unsafe {
                                     (raw.as_ptr() as *const PacketEvent).read_unaligned()
                                 };
