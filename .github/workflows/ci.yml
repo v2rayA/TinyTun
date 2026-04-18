@@ -138,6 +138,7 @@ jobs:
       - name: Build (cargo-zigbuild)
         if: matrix.build_tool == 'cargo-zigbuild'
         run: >
+          rustup target add ${{ matrix.target }}
           cargo zigbuild --locked --release --target ${{ matrix.target }}
           ${{ matrix.has_ebpf == true && '--features ebpf' || '' }}
 
