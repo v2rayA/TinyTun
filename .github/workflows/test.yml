@@ -99,12 +99,10 @@ jobs:
  
       - name: Start v2ray (Linux)
         if: matrix.os == 'linux'
-        shell: bash
+        shell: /usr/bin/sh {0}
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          systemd-run --user --scope --quiet --wait --pipe \
-            v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log
-
+          v2ray run -c v2ray-config.json > v2ray.log 2> v2ray-err.log &
       - name: Start v2ray (macOS)
         if: matrix.os == 'macos'
         shell: bash
