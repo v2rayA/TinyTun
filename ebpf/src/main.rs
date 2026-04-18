@@ -38,14 +38,12 @@
 #![no_main]
 
 use aya_ebpf::{
+    EbpfContext,
     bindings::{TC_ACT_OK, TC_ACT_PIPE},
-    helpers::{
-        bpf_get_current_task, bpf_get_socket_cookie, bpf_probe_read_kernel,
-        bpf_probe_read_user_str_bytes,
-    },
-    macros::{cgroup_sock, cgroup_sock_addr, map, tc_classifier},
+    helpers::{bpf_get_current_comm, bpf_get_socket_cookie},
+    macros::{cgroup_sock, cgroup_sock_addr, map, classifier},
     maps::{LruHashMap, HashMap},
-    programs::{SkBuff, SockContext, SockAddrContext},
+    programs::{sk_buff::SkBuff, SockContext, SockAddrContext},
 };
 
 // ── BPF Maps ─────────────────────────────────────────────────────────────────
@@ -65,56 +63,13 @@ static EXCLUDE_PROCS_MAP: HashMap<[u8; 16], u8> =
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Read the argv[0] basename of the current task into `buf`.
-/// Mirrors dae's `get_pid_pname` kernel helper.
+/// Read the current task's comm (process name, max 16 bytes) into `buf`.
+/// Uses bpf_get_current_comm which reads task_struct->comm directly.
 #[inline(always)]
 unsafe fn read_current_pname(buf: &mut [u8; 16]) {
-    // task_struct → mm_struct → arg_start  (pointer to argv[0] string)
-    let task = bpf_get_current_task() as *const aya_ebpf::bindings::task_struct;
-
-    // Read task->mm
-    let mm_ptr: *const aya_ebpf::bindings::mm_struct =
-        match bpf_probe_read_kernel(&(*task).mm) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-    if mm_ptr.is_null() {
-        return;
+    if let Ok(comm) = bpf_get_current_comm() {
+        *buf = comm;
     }
-
-    // Read mm->arg_start
-    let arg_start: u64 = match bpf_probe_read_kernel(&(*mm_ptr).arg_start) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    if arg_start == 0 {
-        return;
-    }
-
-    // Read up to 64 bytes of argv[0] from user memory
-    let mut argv0 = [0u8; 64];
-    let _ = bpf_probe_read_user_str_bytes(arg_start as *const u8, &mut argv0);
-
-    // Extract basename: find the last '/' and copy up to 16 bytes after it
-    let mut start = 0usize;
-    for i in 0..64usize {
-        if argv0[i] == b'/' {
-            start = i + 1;
-        }
-        if argv0[i] == 0 {
-            break;
-        }
-    }
-    let mut i = 0usize;
-    while i < 16 {
-        let c = argv0[start + i];
-        if c == 0 || start + i >= 64 {
-            break;
-        }
-        buf[i] = c;
-        i += 1;
-    }
-    // remaining bytes stay zero (buf is already zeroed)
 }
 
 /// Insert or refresh the cookie → pname mapping for the current socket.
@@ -199,7 +154,7 @@ pub fn cg_sock_release(ctx: SockContext) -> i32 {
 ///
 /// This mirrors dae's `do_tproxy_wan_egress` routing decision: excluded
 /// processes' packets never enter user space — zero overhead direct path.
-#[tc_classifier]
+#[classifier]
 pub fn tc_egress(ctx: SkBuff) -> i32 {
     // bpf_get_socket_cookie on an skb may return 0 for non-socket packets
     // (e.g. kernel-generated ICMP); pass those through untouched.
