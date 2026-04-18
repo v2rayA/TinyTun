@@ -132,7 +132,9 @@ jobs:
 
       - name: Install bpf-linker
         if: matrix.has_ebpf == true
-        run: cargo binstall bpf-linker --locked --force
+        run: | 
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall bpf-linker --locked --force
 
       - name: Build eBPF kernel object
         if: matrix.has_ebpf == true
