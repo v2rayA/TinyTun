@@ -56,7 +56,7 @@ jobs:
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: x86_64-unknown-freebsd
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: actions-rust-cross
           # - target: aarch64-unknown-freebsd
           #   runner: ubuntu-slim
