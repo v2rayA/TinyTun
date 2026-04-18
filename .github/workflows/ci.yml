@@ -34,27 +34,33 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: armv7-unknown-linux-gnueabihf
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: armv7-unknown-linux-musleabihf
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: x86_64-unknown-freebsd
             runner: ubuntu-latest
             build_tool: actions-rust-cross
-          - target: aarch64-unknown-freebsd
-            runner: ubuntu-latest
-            build_tool: actions-rust-cross
+          # - target: aarch64-unknown-freebsd
+          #   runner: ubuntu-latest
+          #   build_tool: actions-rust-cross
           - target: x86_64-apple-darwin
             runner: macos-26-intel
             build_tool: cargo
@@ -118,13 +124,26 @@ jobs:
             mingw-w64-clang-aarch64-llvm
             mingw-w64-clang-aarch64-rust 
 
+      - name: Install Rust nightly with rust-src (for eBPF object build)
+        if: matrix.has_ebpf == true
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Build eBPF kernel object
+        if: matrix.has_ebpf == true
+        working-directory: ebpf
+        run: cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release
+
       - name: Build (cargo)
         if: matrix.build_tool == 'cargo'
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cargo-zigbuild)
         if: matrix.build_tool == 'cargo-zigbuild'
-        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+        run: >
+          cargo zigbuild --locked --release --target ${{ matrix.target }}
+          ${{ matrix.has_ebpf == true && '--features ebpf' || '' }}
 
       - name: Build (actions-rust-cross)
         if: matrix.build_tool == 'actions-rust-cross'
@@ -164,6 +183,10 @@ jobs:
           else
             artifact_bin="${BIN_NAME}-${{ matrix.target }}"
             cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$out_dir/$artifact_bin"
+          fi
+
+          if [[ "${{ matrix.has_ebpf }}" == "true" ]]; then
+            cp "ebpf/target/bpfel-unknown-none/release/tinytun-ebpf" "$out_dir/tinytun-ebpf.o"
           fi
 
       - name: Upload artifact

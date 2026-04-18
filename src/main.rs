@@ -8,6 +8,8 @@ mod packet_processor;
 mod route_manager;
 mod process_lookup;
 mod dns_hijack;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+mod ebpf_loader;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

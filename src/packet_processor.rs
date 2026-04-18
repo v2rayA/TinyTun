@@ -39,7 +39,6 @@ pub struct PacketProcessor {
     pending_udp_sessions: Arc<Mutex<HashSet<UdpFlowKey>>>,
     udp_timeout_backoff: Arc<Mutex<HashMap<UdpFlowKey, Instant>>>,
     process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
-    process_lookup_inflight: Arc<Mutex<HashSet<ProcessLookupKey>>>,
     dynamic_bypass_ips: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     dns_task_limiter: Arc<Semaphore>,
     udp_task_limiter: Arc<Semaphore>,
@@ -192,7 +191,6 @@ impl PacketProcessor {
             pending_udp_sessions: Arc::new(Mutex::new(HashSet::new())),
             udp_timeout_backoff: Arc::new(Mutex::new(HashMap::new())),
             process_name_cache: Arc::new(Mutex::new(HashMap::new())),
-            process_lookup_inflight: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bypass_ips: Arc::new(Mutex::new(HashMap::new())),
             dns_task_limiter: Arc::new(Semaphore::new(Self::DNS_TASK_CONCURRENCY_LIMIT)),
             udp_task_limiter: Arc::new(Semaphore::new(Self::UDP_TASK_CONCURRENCY_LIMIT)),
@@ -1190,15 +1188,6 @@ impl PacketProcessor {
             }
         }
 
-        {
-            let cache_keys = {
-                let cache = self.process_name_cache.lock().await;
-                cache.keys().cloned().collect::<HashSet<_>>()
-            };
-
-            let mut inflight = self.process_lookup_inflight.lock().await;
-            inflight.retain(|key| !cache_keys.contains(key));
-        }
     }
 
     async fn is_udp_flow_in_backoff(&self, flow_key: &UdpFlowKey) -> bool {
@@ -1305,6 +1294,16 @@ impl PacketProcessor {
         }
     }
 
+    /// Check whether the flow belongs to an excluded process.
+    ///
+    /// Design mirrors mihomo's approach:
+    /// - Cache hit → return immediately (hot path, no blocking).
+    /// - Cache miss → perform a **synchronous** process lookup on a blocking
+    ///   thread and await the result before returning.  This eliminates the
+    ///   "first-packet-leaks-to-proxy" window that the previous async-lazy
+    ///   design had: a SYN/first-datagram is held until the lookup finishes,
+    ///   so the exclusion decision is always made before any connection is
+    ///   established to the SOCKS5 proxy.
     async fn should_exclude_process_flow(
         &self,
         protocol: TransportProtocol,
@@ -1316,70 +1315,67 @@ impl PacketProcessor {
         }
 
         let key = ProcessLookupKey { protocol, src, dst };
-        let cached_name = {
-            let cache = self.process_name_cache.lock().await;
-            cache.get(&key).and_then(|entry| {
-                if entry.recorded_at.elapsed() <= Self::PROCESS_LOOKUP_CACHE_TTL {
-                    entry.process_name.clone()
-                } else {
-                    None
-                }
-            })
-        };
 
-        if let Some(name) = cached_name {
-            if self.config.is_excluded_process_name(&name) {
+        // ── Fast path: valid cache entry ─────────────────────────────────────
+        {
+            let cache = self.process_name_cache.lock().await;
+            if let Some(entry) = cache.get(&key) {
+                if entry.recorded_at.elapsed() <= Self::PROCESS_LOOKUP_CACHE_TTL {
+                    if let Some(ref name) = entry.process_name {
+                        if self.config.is_excluded_process_name(name) {
+                            debug!(
+                                "Excluded process matched (cached): process={} protocol={:?} flow={} -> {}",
+                                name, protocol, src, dst
+                            );
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+
+        // ── Slow path: synchronous blocking lookup ───────────────────────────
+        // Run the platform-native query on a blocking thread and wait for it.
+        // For TCP this is fine because the SYN itself has no RTT budget yet;
+        // the extra ~0.5–2 ms for a netlink round-trip is imperceptible.
+        let options = self.process_lookup_options.clone();
+        let key_clone = key.clone();
+        let lookup = tokio::task::spawn_blocking(move || {
+            process_lookup::find_process_name_for_flow(
+                &options,
+                key_clone.protocol,
+                key_clone.src,
+                key_clone.dst,
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+
+        // Write result into cache so subsequent packets for the same flow are fast.
+        {
+            let mut cache = self.process_name_cache.lock().await;
+            cache.insert(
+                key,
+                ProcessLookupEntry {
+                    process_name: lookup.clone(),
+                    recorded_at: Instant::now(),
+                },
+            );
+        }
+
+        if let Some(ref name) = lookup {
+            if self.config.is_excluded_process_name(name) {
                 debug!(
                     "Excluded process matched: process={} protocol={:?} flow={} -> {}",
                     name, protocol, src, dst
                 );
                 return true;
             }
-
-            return false;
         }
-
-        self.schedule_process_lookup_refresh(key).await;
 
         false
-    }
-
-    async fn schedule_process_lookup_refresh(&self, key: ProcessLookupKey) {
-        let should_schedule = {
-            let mut inflight = self.process_lookup_inflight.lock().await;
-            inflight.insert(key.clone())
-        };
-
-        if !should_schedule {
-            return;
-        }
-
-        let cache = self.process_name_cache.clone();
-        let inflight = self.process_lookup_inflight.clone();
-        let options = self.process_lookup_options.clone();
-
-        tokio::spawn(async move {
-            let lookup = tokio::task::spawn_blocking(move || {
-                process_lookup::find_process_name_for_flow(&options, key.protocol, key.src, key.dst)
-            })
-            .await
-            .ok()
-            .flatten();
-
-            {
-                let mut table = cache.lock().await;
-                table.insert(
-                    key.clone(),
-                    ProcessLookupEntry {
-                        process_name: lookup,
-                        recorded_at: Instant::now(),
-                    },
-                );
-            }
-
-            let mut active = inflight.lock().await;
-            active.remove(&key);
-        });
     }
 
     async fn ensure_dynamic_bypass_for_ip(&self, ip: IpAddr) -> Result<()> {

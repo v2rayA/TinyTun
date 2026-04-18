@@ -1,6 +1,4 @@
 use std::net::SocketAddr;
-#[cfg(target_os = "linux")]
-use std::net::IpAddr;
 
 #[cfg(not(target_os = "freebsd"))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -58,89 +56,169 @@ fn find_pid_for_flow(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Linux: parse /proc/net/tcp[6] and /proc/net/udp[6]
+// Linux: NETLINK_INET_DIAG (same approach as mihomo)
+//
+// Phase 1: send an inet_diag_req_v2 to the kernel, which returns uid + inode
+//          for the matching socket in a single round-trip.
+// Phase 2: scan /proc/<pid>/fd/ for the process that owns that inode, filtering
+//          by UID first to skip unrelated processes quickly.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
 fn linux_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -> Option<u32> {
-    // Collect candidate inodes from the kernel socket table.
-    let inode = match (protocol, src.is_ipv4()) {
-        (TransportProtocol::Tcp, true) => linux_find_inode("/proc/net/tcp", src, Some(dst)),
-        (TransportProtocol::Tcp, false) => linux_find_inode("/proc/net/tcp6", src, Some(dst)),
-        (TransportProtocol::Udp, true) => linux_find_inode("/proc/net/udp", src, None),
-        (TransportProtocol::Udp, false) => linux_find_inode("/proc/net/udp6", src, None),
-    }?;
+    use std::net::IpAddr;
 
-    linux_pid_from_inode(inode)
-}
+    let ipproto: u8 = match protocol {
+        TransportProtocol::Tcp => libc::IPPROTO_TCP as u8,
+        TransportProtocol::Udp => libc::IPPROTO_UDP as u8,
+    };
 
-/// Parse /proc/net/tcp or /proc/net/udp and return the socket inode matching
-/// the given local (and optionally remote) address.
-///
-/// Each data line has the format (whitespace-separated fields):
-///   sl  local_address  rem_address  st  tx_queue:rx_queue  ...  inode
-///   0   1              2            3   4                   ...  9
-#[cfg(target_os = "linux")]
-fn linux_find_inode(path: &str, src: SocketAddr, dst: Option<SocketAddr>) -> Option<u64> {
-    let content = std::fs::read_to_string(path).ok()?;
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 10 {
-            continue;
+    match (src.ip(), dst.ip()) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            netlink_find_pid(libc::AF_INET as u8, ipproto, &s.octets(), src.port(), &d.octets(), dst.port())
         }
-
-        let local = parse_linux_hex_addr(fields[1])?;
-        if local != src {
-            continue;
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            netlink_find_pid(libc::AF_INET6 as u8, ipproto, &s.octets(), src.port(), &d.octets(), dst.port())
         }
-
-        if let Some(d) = dst {
-            let remote = parse_linux_hex_addr(fields[2])?;
-            if remote != d {
-                continue;
+        // IPv4-mapped IPv6 → try both families
+        (IpAddr::V6(s), IpAddr::V4(d)) => {
+            if let Some(s4) = s.to_ipv4_mapped() {
+                netlink_find_pid(libc::AF_INET as u8, ipproto, &s4.octets(), src.port(), &d.octets(), dst.port())
+            } else {
+                None
             }
-        }
-
-        let inode: u64 = fields[9].parse().ok()?;
-        return Some(inode);
-    }
-    None
-}
-
-/// Parse a Linux hex-encoded address:port pair like "0100007F:1234" (little-endian IPv4)
-/// or the 128-bit IPv6 variant.
-#[cfg(target_os = "linux")]
-fn parse_linux_hex_addr(s: &str) -> Option<SocketAddr> {
-    let (addr_hex, port_hex) = s.split_once(':')?;
-    let port = u16::from_str_radix(port_hex, 16).ok()?;
-
-    match addr_hex.len() {
-        8 => {
-            // IPv4 – 4 bytes little-endian
-            let n = u32::from_str_radix(addr_hex, 16).ok()?;
-            let ip = IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(n.swap_bytes())));
-            Some(SocketAddr::new(ip, port))
-        }
-        32 => {
-            // IPv6 – 4 × 4-byte words, each in host byte order
-            let mut bytes = [0u8; 16];
-            for i in 0..4 {
-                let word = u32::from_str_radix(&addr_hex[i * 8..(i + 1) * 8], 16).ok()?;
-                let be = word.to_be_bytes();
-                bytes[i * 4..(i + 1) * 4].copy_from_slice(&be);
-            }
-            let ip = IpAddr::V6(std::net::Ipv6Addr::from(bytes));
-            Some(SocketAddr::new(ip, port))
         }
         _ => None,
     }
 }
 
-/// Walk /proc/<pid>/fd/ to find which process owns the given socket inode.
+/// Send an NETLINK_INET_DIAG request and parse the response to obtain
+/// (uid, inode) for the socket matching the given 5-tuple.
+/// Then walk /proc to find the PID that owns that inode.
 #[cfg(target_os = "linux")]
-fn linux_pid_from_inode(inode: u64) -> Option<u32> {
+fn netlink_find_pid(
+    family: u8,
+    ipproto: u8,
+    src_ip: &[u8],
+    src_port: u16,
+    dst_ip: &[u8],
+    dst_port: u16,
+) -> Option<u32> {
+    // ── Build the netlink request ────────────────────────────────────────────
+    // struct inet_diag_req_v2 layout (total 56 bytes, see linux/inet_diag.h):
+    //   u8   sdiag_family
+    //   u8   sdiag_protocol
+    //   u8   idiag_ext
+    //   u8   pad
+    //   u32  idiag_states   (0xffffffff = all)
+    //   struct inet_diag_sockid (48 bytes):
+    //     be16 idiag_sport
+    //     be16 idiag_dport
+    //     u32  idiag_src[4]
+    //     u32  idiag_dst[4]
+    //     u32  idiag_if
+    //     u32  idiag_cookie[2]
+    const INET_DIAG_REQ_V2_LEN: usize = 56;
+    const NLMSG_HDR_LEN: usize = 16; // struct nlmsghdr
+    const TOTAL_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_REQ_V2_LEN;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20; // SOCK_DIAG_BY_FAMILY
+
+    let mut buf = [0u8; TOTAL_LEN];
+
+    // nlmsghdr: len, type, flags, seq, pid
+    let nlmsg_len = (TOTAL_LEN as u32).to_ne_bytes();
+    buf[0..4].copy_from_slice(&nlmsg_len);
+    buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    buf[6..8].copy_from_slice(&(libc::NLM_F_REQUEST as u16).to_ne_bytes());
+    // seq=1, pid=0
+
+    // inet_diag_req_v2
+    let req = &mut buf[NLMSG_HDR_LEN..];
+    req[0] = family;
+    req[1] = ipproto;
+    // idiag_ext = 0, pad = 0
+    req[4..8].copy_from_slice(&0xffffffffu32.to_ne_bytes()); // idiag_states
+
+    // idiag_sockid starts at offset 8 within req
+    let sid = &mut req[8..];
+    sid[0..2].copy_from_slice(&src_port.to_be_bytes());
+    sid[2..4].copy_from_slice(&dst_port.to_be_bytes());
+
+    // src addr: always stored as 16 bytes (for IPv4, left-pad to 4 bytes, rest zero)
+    let ip_len = src_ip.len().min(16);
+    sid[4..4 + ip_len].copy_from_slice(&src_ip[..ip_len]);
+    let ip_len = dst_ip.len().min(16);
+    sid[20..20 + ip_len].copy_from_slice(&dst_ip[..ip_len]);
+    // idiag_if = 0, idiag_cookie = INET_DIAG_NOCOOKIE
+
+    // ── Open netlink socket and send ─────────────────────────────────────────
+    let fd = unsafe {
+        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_INET_DIAG)
+    };
+    if fd < 0 {
+        return None;
+    }
+    struct SocketGuard(libc::c_int);
+    impl Drop for SocketGuard {
+        fn drop(&mut self) { unsafe { libc::close(self.0); } }
+    }
+    let _guard = SocketGuard(fd);
+
+    let sent = unsafe {
+        libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0)
+    };
+    if sent < 0 {
+        return None;
+    }
+
+    // ── Read response ────────────────────────────────────────────────────────
+    // Response nlmsghdr + inet_diag_msg (minimum 72 bytes total)
+    // struct inet_diag_msg layout (56 bytes):
+    //   u8  idiag_family
+    //   u8  idiag_state
+    //   u8  idiag_timer
+    //   u8  idiag_retrans
+    //   struct inet_diag_sockid  (48 bytes, same as above)
+    //   u32 idiag_expires
+    //   u32 idiag_rqueue
+    //   u32 idiag_wqueue
+    //   u32 idiag_uid
+    //   u32 idiag_inode
+    const INET_DIAG_MSG_LEN: usize = 56;
+    const RESP_BUF_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_MSG_LEN;
+
+    let mut resp = [0u8; 512];
+    let rcvd = unsafe {
+        libc::recv(fd, resp.as_mut_ptr() as *mut libc::c_void, resp.len(), 0)
+    };
+    if rcvd < RESP_BUF_LEN as isize {
+        return None;
+    }
+
+    let msg = &resp[NLMSG_HDR_LEN..];
+    // Check for NLMSG_ERROR (type 2)
+    let nlmsg_type = u16::from_ne_bytes([resp[4], resp[5]]);
+    if nlmsg_type == 2 {
+        return None; // NLMSG_ERROR
+    }
+
+    let uid = u32::from_ne_bytes([msg[48], msg[49], msg[50], msg[51]]);
+    let inode = u32::from_ne_bytes([msg[52], msg[53], msg[54], msg[55]]);
+
+    if inode == 0 {
+        return None;
+    }
+
+    linux_pid_from_inode(inode as u64, uid)
+}
+
+/// Walk /proc/<pid>/fd/ to find which process owns the given socket inode.
+/// Pre-filters by UID to avoid stat-ing every FD of every process.
+#[cfg(target_os = "linux")]
+fn linux_pid_from_inode(inode: u64, uid: u32) -> Option<u32> {
     let target = format!("socket:[{}]", inode);
     let proc_dir = std::fs::read_dir("/proc").ok()?;
+
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
         let pid_str = name.to_string_lossy();
@@ -148,6 +226,13 @@ fn linux_pid_from_inode(inode: u64) -> Option<u32> {
             Ok(p) => p,
             Err(_) => continue,
         };
+
+        // Quick UID pre-filter: check /proc/<pid>/status for Uid: line.
+        // Skip processes whose real UID doesn't match to avoid unnecessary
+        // fd enumeration (same optimisation as mihomo).
+        if !linux_pid_uid_matches(pid, uid) {
+            continue;
+        }
 
         let fd_dir = format!("/proc/{}/fd", pid);
         if let Ok(fds) = std::fs::read_dir(&fd_dir) {
@@ -161,6 +246,24 @@ fn linux_pid_from_inode(inode: u64) -> Option<u32> {
         }
     }
     None
+}
+
+/// Check whether /proc/<pid>/status shows the given UID as the real UID.
+#[cfg(target_os = "linux")]
+fn linux_pid_uid_matches(pid: u32, uid: u32) -> bool {
+    let status = match std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            // Format: "Uid:\tREAL\tEFFECTIVE\tSAVED\tFSUID"
+            if let Some(real_uid_str) = rest.split_whitespace().next() {
+                return real_uid_str.parse::<u32>().ok() == Some(uid);
+            }
+        }
+    }
+    false
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -333,3 +436,4 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
         Some(name.to_string())
     }
 }
+
