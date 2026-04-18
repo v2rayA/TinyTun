@@ -1,0 +1,18 @@
+[package]
+name = "tinytun-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+# This crate targets BPF: it must be compiled with:
+#   cargo +nightly build -Z build-std=core \
+#       --target bpfel-unknown-none --release
+# The resulting .o object is embedded into the main binary via include_bytes!.
+
+[dependencies]
+aya-ebpf = { version = "0.1", features = ["bpf-probe-read"] }
+aya-log-ebpf = "0.1"
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
