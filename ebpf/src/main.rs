@@ -43,7 +43,7 @@ use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_socket_cookie},
     macros::{cgroup_sock, cgroup_sock_addr, map, classifier},
     maps::{LruHashMap, HashMap},
-    programs::{sk_buff::SkBuff, SockContext, SockAddrContext},
+    programs::{TcContext, SockContext, SockAddrContext},
 };
 
 // ── BPF Maps ─────────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ pub fn cg_sendmsg6(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock(post_bind4)]
 pub fn cg_sock_release(ctx: SockContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr() as *mut _) };
-    let _ = unsafe { COOKIE_PNAME_MAP.remove(&cookie) };
+    let _ = COOKIE_PNAME_MAP.remove(&cookie);
     0
 }
 
@@ -155,7 +155,7 @@ pub fn cg_sock_release(ctx: SockContext) -> i32 {
 /// This mirrors dae's `do_tproxy_wan_egress` routing decision: excluded
 /// processes' packets never enter user space — zero overhead direct path.
 #[classifier]
-pub fn tc_egress(ctx: SkBuff) -> i32 {
+pub fn tc_egress(ctx: TcContext) -> i32 {
     // bpf_get_socket_cookie on an skb may return 0 for non-socket packets
     // (e.g. kernel-generated ICMP); pass those through untouched.
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr() as *mut _) };
