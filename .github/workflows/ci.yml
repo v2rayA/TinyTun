@@ -130,6 +130,10 @@ jobs:
         with:
           components: rust-src
 
+      - name: Install bpf-linker
+        if: matrix.has_ebpf == true
+        run: cargo binstall bpf-linker --locked --force
+
       - name: Build eBPF kernel object
         if: matrix.has_ebpf == true
         working-directory: ebpf
