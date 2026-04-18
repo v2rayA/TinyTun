@@ -9,7 +9,7 @@ edition = "2021"
 # The resulting .o object is embedded into the main binary via include_bytes!.
 
 [dependencies]
-aya-ebpf = { version = "0.1", features = ["bpf-probe-read"] }
+aya-ebpf = { version = "0.1" }
 aya-log-ebpf = "0.1"
 
 [profile.release]
