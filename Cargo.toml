@@ -22,7 +22,6 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
 etherparse = "0.14"
-netstat2 = "0.11.2"
 
 # SOCKS5 implementation
 socks5-impl = "0.1.0"
@@ -45,6 +44,11 @@ serde_yaml = "0.9"
 clap = { version = "4.0", features = ["derive"] }
 thiserror = "1.0"
 libc = "0.2"
+
+# sysinfo is not used on FreeBSD because its FreeBSD backend requires libkvm/libprocstat
+# which are unavailable in Zig cross-compilation sysroots. FreeBSD uses sysctl instead.
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 ipconfig = "0.3"
