@@ -1,0 +1,27 @@
+name: Build eBPF kernel object
+description: >
+  Build the eBPF kernel object (bpfel-unknown-none).
+  Requires Rust nightly with rust-src to already be installed in the calling workflow.
+
+inputs:
+  install_bpf_linker:
+    description: Install bpf-linker before building (needed for cross-compilation)
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Install bpf-linker
+      if: inputs.install_bpf_linker == 'true'
+      shell: bash
+      run: |
+        curl -L --proto '=https' --tlsv1.2 -sSf \
+          https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+          | bash
+        cargo binstall bpf-linker --locked --force
+
+    - name: Build eBPF kernel object
+      working-directory: ebpf
+      shell: bash
+      run: cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release

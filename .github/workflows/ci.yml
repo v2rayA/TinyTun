@@ -32,34 +32,34 @@ jobs:
             runner: windows-11-arm
             build_tool: cargo-gnullvm
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: armv7-unknown-linux-gnueabihf
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: armv7-unknown-linux-musleabihf
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: x86_64-unknown-freebsd
-            runner: ubuntu-latest
+            runner: ubuntu-slim
             build_tool: actions-rust-cross
           # - target: aarch64-unknown-freebsd
-          #   runner: ubuntu-latest
+          #   runner: ubuntu-slim
           #   build_tool: actions-rust-cross
           - target: x86_64-apple-darwin
             runner: macos-26-intel
@@ -73,10 +73,11 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         if: matrix.target != 'x86_64-pc-windows-gnu' && matrix.target != 'x86_64-pc-windows-gnullvm' && matrix.target != 'aarch64-pc-windows-gnullvm'
         with:
           targets: ${{ matrix.target }}
+          components: ${{ matrix.has_ebpf == true && 'rust-src' || '' }}
 
       - name: Install Zig
         if: matrix.build_tool == 'cargo-zigbuild'
@@ -124,22 +125,11 @@ jobs:
             mingw-w64-clang-aarch64-llvm
             mingw-w64-clang-aarch64-rust 
 
-      - name: Install Rust nightly with rust-src (for eBPF object build)
-        if: matrix.has_ebpf == true
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-
-      - name: Install bpf-linker
-        if: matrix.has_ebpf == true
-        run: | 
-          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-          cargo binstall bpf-linker --locked --force
-
       - name: Build eBPF kernel object
         if: matrix.has_ebpf == true
-        working-directory: ebpf
-        run: cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release
+        uses: ./.github/actions/build-ebpf
+        with:
+          install_bpf_linker: 'true'
 
       - name: Build (cargo)
         if: matrix.build_tool == 'cargo'
@@ -206,7 +196,7 @@ jobs:
   release:
     name: release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
