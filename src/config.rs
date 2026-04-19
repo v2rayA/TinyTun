@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::fs;
@@ -280,6 +281,26 @@ pub struct FilteringConfig {
     pub allow_ports: Vec<u16>,
     #[serde(default)]
     pub exclude_processes: Vec<String>,
+    // ── Runtime-only: built by `finalize()`, never serialised ────────────
+    /// Fast O(1) lookup set for exact-IP matching; mirrors `skip_ips`.
+    #[serde(skip)]
+    pub(crate) skip_ips_set: HashSet<IpAddr>,
+    /// Pre-parsed CIDR networks; mirrors `skip_networks` (no per-packet re-parsing).
+    #[serde(skip)]
+    pub(crate) skip_networks_parsed: Vec<ipnetwork::IpNetwork>,
+}
+
+impl FilteringConfig {
+    /// Rebuild the runtime lookup structures from `skip_ips` and `skip_networks`.
+    /// Call this once after construction and again after any `push` to those vecs.
+    pub fn finalize(&mut self) {
+        self.skip_ips_set = self.skip_ips.iter().copied().collect();
+        self.skip_networks_parsed = self
+            .skip_networks
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,7 +422,7 @@ impl Default for DnsHijackConfig {
 
 impl Default for FilteringConfig {
     fn default() -> Self {
-        Self {
+        let mut cfg = Self {
             skip_ips: vec![
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // localhost
                 IpAddr::V6(Ipv6Addr::LOCALHOST), // localhost v6
@@ -417,7 +438,11 @@ impl Default for FilteringConfig {
             block_ports: vec![22, 23, 25, 110, 143], // Common blocked ports
             allow_ports: vec![80, 443, 53],           // Always allow HTTP, HTTPS, DNS
             exclude_processes: Vec::new(),
-        }
+            skip_ips_set: HashSet::new(),
+            skip_networks_parsed: Vec::new(),
+        };
+        cfg.finalize();
+        cfg
     }
 }
 
@@ -435,35 +460,30 @@ impl Config {
         let path = path.as_ref();
         let content = fs::read_to_string(path)?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
-        match ext {
+        let mut config = match ext {
             "yaml" | "yml" => {
                 let yaml_config: YamlConfig = serde_yaml::from_str(&content)?;
-                yaml_config.into_config()
+                yaml_config.into_config()?
             }
             _ => {
                 let config: Config = serde_json::from_str(&content)?;
-                Ok(config)
+                config
             }
-        }
+        };
+        // Rebuild the runtime lookup structures (CIDR pre-parsing, IP HashSet).
+        config.filtering.finalize();
+        Ok(config)
     }
 
-    /// Check if an IP address should be skipped (not proxied)
+    /// Check if an IP address should be skipped (not proxied).
+    ///
+    /// Uses pre-built runtime structures (populated by `FilteringConfig::finalize`)
+    /// for O(1) exact-IP lookup and zero per-call CIDR string parsing.
     pub fn should_skip_ip(&self, ip: IpAddr) -> bool {
-        // Check exact IP matches
-        if self.filtering.skip_ips.contains(&ip) {
+        if self.filtering.skip_ips_set.contains(&ip) {
             return true;
         }
-        
-        // Check network ranges
-        for network_str in &self.filtering.skip_networks {
-            if let Ok(network) = network_str.parse::<ipnetwork::IpNetwork>() {
-                if network.contains(ip) {
-                    return true;
-                }
-            }
-        }
-        
-        false
+        self.filtering.skip_networks_parsed.iter().any(|n| n.contains(ip))
     }
     
     /// Check if a port should be skipped

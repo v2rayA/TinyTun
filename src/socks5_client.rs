@@ -17,11 +17,14 @@ pub struct Socks5UdpSession {
 #[derive(Clone)]
 pub struct Socks5Client {
     config: ProxyConfig,
+    /// On Linux with auto_route enabled, bind SOCKS5 sockets to this physical
+    /// interface via SO_BINDTODEVICE so they never traverse the TUN device.
+    outbound_interface: Option<String>,
 }
 
 impl Socks5Client {
-    pub fn new(config: ProxyConfig) -> Self {
-        Self { config }
+    pub fn new(config: ProxyConfig, outbound_interface: Option<String>) -> Self {
+        Self { config, outbound_interface }
     }
 
     /// Return a `socks5h://[user:pass@]host:port` URL for use with HTTP clients
@@ -57,10 +60,50 @@ fn percent_encode(s: &str) -> String {
 }
 
 impl Socks5Client {
+    /// Open a TCP connection to the SOCKS5 proxy.
+    ///
+    /// On Linux, if an outbound interface is configured the socket is bound to
+    /// that interface via `SO_BINDTODEVICE` so SOCKS5 traffic never traverses
+    /// the TUN device, preventing routing loops and EADDRNOTAVAIL errors.
+    async fn open_tcp_to_proxy(&self) -> Result<TcpStream> {
+        #[cfg(target_os = "linux")]
+        if let Some(ref iface) = self.outbound_interface {
+            use std::os::unix::io::AsRawFd;
+            use tokio::net::TcpSocket;
+
+            let socket = if self.config.address.is_ipv6() {
+                TcpSocket::new_v6()?
+            } else {
+                TcpSocket::new_v4()?
+            };
+            let fd = socket.as_raw_fd();
+            let iface_c = std::ffi::CString::new(iface.as_str())
+                .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    iface_c.as_ptr() as *const libc::c_void,
+                    iface_c.to_bytes_with_nul().len() as libc::socklen_t,
+                )
+            };
+            if ret == 0 {
+                return Ok(socket.connect(self.config.address).await?);
+            }
+            debug!(
+                "SO_BINDTODEVICE to '{}' failed ({}), using default route",
+                iface,
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(TcpStream::connect(&self.config.address).await?)
+    }
+
     pub async fn connect(&self, target_addr: SocketAddr) -> Result<TcpStream> {
         debug!("Connecting to SOCKS5 proxy {}: target {}", self.config.address, target_addr);
 
-        let mut stream = TcpStream::connect(&self.config.address).await?;
+        let mut stream = self.open_tcp_to_proxy().await?;
         stream.set_nodelay(true)?;
 
         self.perform_handshake(&mut stream).await?;
@@ -76,7 +119,7 @@ impl Socks5Client {
             target_hint
         );
 
-        let mut control = TcpStream::connect(&self.config.address).await?;
+        let mut control = self.open_tcp_to_proxy().await?;
         control.set_nodelay(true)?;
         self.perform_handshake(&mut control).await?;
 

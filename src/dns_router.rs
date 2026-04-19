@@ -130,7 +130,7 @@ impl DnsRouter {
     ///
     /// Returns an error if any `geosite` rule references a file that cannot
     /// be read or parsed.
-    pub fn new(config: DnsConfig, app_config: &Config) -> Result<Self> {
+    pub fn new(config: DnsConfig, app_config: &Config, outbound_interface: Option<String>) -> Result<Self> {
         let capacity = NonZeroUsize::new(config.routing.cache_capacity.max(1)).unwrap();
         let cache = LruCache::new(capacity);
 
@@ -258,7 +258,7 @@ impl DnsRouter {
         // Build named SOCKS5 clients for every configured proxy.
         let proxy_clients: HashMap<String, Socks5Client> = app_config
             .all_proxies()
-            .map(|p| (p.name.clone(), Socks5Client::new(p.clone())))
+            .map(|p| (p.name.clone(), Socks5Client::new(p.clone(), outbound_interface.clone())))
             .collect();
 
         // Build per-proxy HTTP clients for groups using protocol=DoH and upstream=Named.

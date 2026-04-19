@@ -811,12 +811,18 @@ fn load_config(
         config.filtering.skip_ips.push(tun_v6);
     }
 
-    // Ensure the SOCKS5 proxy IP is never captured by the TUN device (prevents routing loops).
-    let proxy_ip = config.socks5.address.ip();
-    if !config.should_skip_ip(proxy_ip) {
+    // Ensure all proxy IPs are never captured by the TUN device (prevents routing loops).
+    let proxy_ips: Vec<std::net::IpAddr> = config.all_proxies()
+        .map(|p| p.address.ip())
+        .filter(|ip| !config.should_skip_ip(*ip))
+        .collect();
+    for proxy_ip in proxy_ips {
         config.filtering.skip_ips.push(proxy_ip);
     }
-    
+
+    // Rebuild runtime lookup structures after all push() operations above.
+    config.filtering.finalize();
+
     Ok(config)
 }
 

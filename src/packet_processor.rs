@@ -72,8 +72,10 @@ struct ProcessLookupEntry {
 }
 
 struct TcpSession {
-    writer: Arc<Mutex<OwnedWriteHalf>>,
     state: Arc<Mutex<TcpFlowState>>,
+    /// Channel used to pass forward payloads to the per-session writer task,
+    /// keeping the main packet loop non-blocking.
+    forward_tx: mpsc::Sender<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -165,8 +167,8 @@ impl PacketProcessor {
         tun_writer: Arc<tun_rs::AsyncDevice>,
         outbound_interface: Option<String>,
     ) -> Result<Self> {
-        let socks5_client = Socks5Client::new(config.socks5.clone());
-        let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), &config)?);
+        let socks5_client = Socks5Client::new(config.socks5.clone(), outbound_interface.clone());
+        let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), &config, outbound_interface.clone())?);
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
         let (tun_packet_tx, mut tun_packet_rx) = mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
 
@@ -299,21 +301,21 @@ impl PacketProcessor {
         }
 
         let tcp_data = &packet[ip_packet.header_len..];
-        
+
         if tcp_data.len() < 20 {
             return Err(anyhow::anyhow!("TCP data too short"));
         }
-        
+
         let tcp_header = TcpHeaderSlice::from_slice(tcp_data)?;
         let source_port = tcp_header.source_port();
         let dest_port = tcp_header.destination_port();
-        
+
         // Check if we should skip this port
         if self.config.should_skip_port(dest_port) {
             debug!("Skipping TCP packet to port {}", dest_port);
             return Ok(());
         }
-        
+
         let target_addr = SocketAddr::new(ip_packet.dst, dest_port);
         let source_addr = SocketAddr::new(ip_packet.src, source_port);
         let flow_key = FlowKey {
@@ -327,119 +329,180 @@ impl PacketProcessor {
         }
 
         let payload = &tcp_data[tcp_header_len..];
+
+        // ── Non-SYN fast path ─────────────────────────────────────────────────
+        // For data / ACK / FIN / RST packets, check the session table first.
+        // Admitted sessions bypass the process-exclusion check entirely, which
+        // eliminates async Mutex contention on the process cache for every
+        // data packet on an established connection.
+        if !tcp_header.syn() {
+            let session = {
+                let table = self.tcp_sessions.lock().await;
+                table.get(&flow_key).cloned()
+            };
+
+            if let Some(session) = session {
+                let is_ack_only_or_window_update =
+                    payload.is_empty() && !tcp_header.fin() && !tcp_header.rst();
+
+                if tcp_header.rst() || tcp_header.fin() {
+                    if tcp_header.fin() {
+                        let (sequence_number, acknowledgment_number) = {
+                            let mut state = session.state.lock().await;
+                            if Self::seq_at_or_after(
+                                tcp_header.sequence_number(),
+                                state.client_next_seq,
+                            ) {
+                                state.client_next_seq = state.client_next_seq.wrapping_add(1);
+                            }
+                            let seq = state.server_next_seq;
+                            state.server_next_seq = state.server_next_seq.wrapping_add(1);
+                            state.lifecycle = TcpLifecycle::FinSent;
+                            state.last_activity = Instant::now();
+                            (seq, state.client_next_seq)
+                        };
+                        self.inject_tcp_control_packet(
+                            &flow_key,
+                            sequence_number,
+                            acknowledgment_number,
+                            false,
+                            true,
+                            false,
+                        )
+                        .await?;
+                    }
+
+                    if tcp_header.rst() {
+                        let mut state = session.state.lock().await;
+                        state.lifecycle = TcpLifecycle::Closed;
+                        self.tcp_sessions.lock().await.remove(&flow_key);
+                        return Ok(());
+                    }
+                }
+
+                if tcp_header.ack() {
+                    let should_close = {
+                        let mut state = session.state.lock().await;
+                        state.client_window = tcp_header.window_size();
+                        // Complete three-way handshake if still in SynReceived.
+                        if state.lifecycle == TcpLifecycle::SynReceived {
+                            state.lifecycle = TcpLifecycle::Established;
+                        }
+                        if Self::seq_at_or_after(
+                            tcp_header.acknowledgment_number(),
+                            state.server_acked_seq,
+                        ) {
+                            state.server_acked_seq = tcp_header.acknowledgment_number();
+                        }
+                        if state.lifecycle == TcpLifecycle::FinSent
+                            && tcp_header.acknowledgment_number() == state.server_next_seq
+                        {
+                            state.lifecycle = TcpLifecycle::Closed;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_close {
+                        self.tcp_sessions.lock().await.remove(&flow_key);
+                        return Ok(());
+                    }
+                }
+
+                let lifecycle = { session.state.lock().await.lifecycle };
+                if lifecycle == TcpLifecycle::Closed || lifecycle == TcpLifecycle::FinSent {
+                    return Ok(());
+                }
+
+                if is_ack_only_or_window_update {
+                    return Ok(());
+                }
+
+                if !payload.is_empty() {
+                    let forward_payload = {
+                        let mut state = session.state.lock().await;
+                        let merged = Self::collect_in_order_payload(
+                            &mut state,
+                            tcp_header.sequence_number(),
+                            payload,
+                        );
+                        state.last_activity = Instant::now();
+                        merged
+                    };
+
+                    if forward_payload.is_empty() {
+                        debug!(
+                            "Buffered/dropped non-forwardable TCP segment {}:{} -> {}:{}",
+                            ip_packet.src, source_port, ip_packet.dst, dest_port
+                        );
+                        return Ok(());
+                    }
+
+                    if session.forward_tx.try_send(forward_payload).is_err() {
+                        let (sequence_number, acknowledgment_number) = {
+                            let state = session.state.lock().await;
+                            (state.server_next_seq, state.client_next_seq)
+                        };
+                        let _ = self
+                            .inject_tcp_control_packet(
+                                &flow_key,
+                                sequence_number,
+                                acknowledgment_number,
+                                false,
+                                false,
+                                true,
+                            )
+                            .await;
+                        self.tcp_sessions.lock().await.remove(&flow_key);
+                        warn!(
+                            "TCP forward channel full for flow {:?}: resetting connection",
+                            flow_key
+                        );
+                        return Ok(());
+                    }
+                }
+
+                debug!(
+                    "TCP flow active {}:{} -> {}:{}",
+                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                );
+                return Ok(());
+            }
+
+            // Non-SYN with no session: silently drop unless a connect is pending.
+            {
+                let pending = self.pending_connections.lock().await;
+                if !pending.contains(&flow_key) {
+                    debug!(
+                        "Dropping unknown non-SYN TCP packet {}:{} -> {}:{}",
+                        ip_packet.src, source_port, ip_packet.dst, dest_port
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        // ── SYN path ──────────────────────────────────────────────────────────
+        // Process exclusion is only evaluated for new connection attempts (SYNs),
+        // not for every data packet on established flows.
         if self
             .should_exclude_process_flow(TransportProtocol::Tcp, source_addr, target_addr)
             .await
         {
-            // If a SOCKS5 session was already established for this flow before the process
-            // lookup completed, remove it now so it does not become a ghost entry that keeps
-            // forwarding data forever.
-            let had_session = {
-                let mut table = self.tcp_sessions.lock().await;
-                table.remove(&flow_key).is_some()
-            };
-
-            // Inject a RST when:
-            //   • auto_route is OFF  (client must reconnect; it will be rejected again), OR
-            //   • a live session was just torn down (wake the client so it retries; the retry
-            //     SYN will go via the bypass route that we install below).
-            let mut should_reset = !self.config.tun.auto_route || had_session;
-
-            if self.config.tun.auto_route {
-                // Install bypass route for SYN packets *or* when a ghost session was just
-                // removed (so the imminent client reconnect is routed around the TUN).
-                let needs_bypass = (tcp_header.syn() && !tcp_header.ack()) || had_session;
-                if needs_bypass {
-                    if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
-                        warn!(
-                            "Failed to install dynamic bypass route for excluded flow {}:{} -> {}:{}: {}",
-                            ip_packet.src,
-                            source_port,
-                            ip_packet.dst,
-                            dest_port,
-                            err
-                        );
-                        should_reset = true;
+            // ── Preferred path: transparent direct proxy via physical NIC ──────
+            // When an outbound interface is known, accept the SYN and proxy the
+            // TCP connection directly to the destination via SO_BINDTODEVICE.
+            // The TUN session is set up identically to the SOCKS5 path — no RST,
+            // no reconnect, no connection interruption for the application.
+            if let Some(iface) = self.outbound_interface.clone() {
+                {
+                    let mut pending = self.pending_connections.lock().await;
+                    if pending.contains(&flow_key) {
+                        return Ok(());
                     }
-                }
-            }
-
-            if should_reset {
-                let payload_seq_advance = (payload.len() as u32)
-                    .wrapping_add(if tcp_header.syn() { 1 } else { 0 })
-                    .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
-                let acknowledgment_number = tcp_header
-                    .sequence_number()
-                    .wrapping_add(payload_seq_advance);
-                let _ = self
-                    .inject_tcp_control_packet(
-                        &flow_key,
-                        0,
-                        acknowledgment_number,
-                        false,
-                        false,
-                        true,
-                    )
-                    .await;
-            }
-            debug!(
-                "Excluded process flow (TCP) {}:{} -> {}:{}",
-                ip_packet.src,
-                source_port,
-                ip_packet.dst,
-                dest_port
-            );
-            return Ok(());
-        }
-
-        let is_ack_only_or_window_update = payload.is_empty()
-            && !tcp_header.syn()
-            && !tcp_header.fin()
-            && !tcp_header.rst();
-        // Reuse existing SOCKS5 stream for the same flow when available.
-        let session = if let Some(existing) = {
-            let table = self.tcp_sessions.lock().await;
-            table.get(&flow_key).cloned()
-        } {
-            let mut resend_syn_ack = None;
-            {
-                let mut state = existing.state.lock().await;
-                state.last_activity = Instant::now();
-                if state.lifecycle == TcpLifecycle::SynReceived && tcp_header.ack() {
-                    state.lifecycle = TcpLifecycle::Established;
+                    pending.insert(flow_key.clone());
                 }
 
-                // Handle SYN retransmission during handshake by re-sending SYN-ACK.
-                if state.lifecycle == TcpLifecycle::SynReceived && tcp_header.syn() && !tcp_header.ack() {
-                    resend_syn_ack = Some((state.server_next_seq.wrapping_sub(1), state.client_next_seq));
-                }
-            }
-
-            if let Some((sequence_number, acknowledgment_number)) = resend_syn_ack {
-                self.inject_tcp_control_packet(
-                    &flow_key,
-                    sequence_number,
-                    acknowledgment_number,
-                    true,
-                    false,
-                    false,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            existing
-        } else {
-            if tcp_header.syn() {
-                // Spawn SOCKS5 connection in background so the packet loop is not blocked.
-                let mut pending = self.pending_connections.lock().await;
-                if pending.contains(&flow_key) {
-                    return Ok(());
-                }
-                pending.insert(flow_key.clone());
-                drop(pending);
-
-                let socks5_client = self.socks5_client.clone();
                 let tun_packet_tx = self.tun_packet_tx.clone();
                 let tcp_sessions = self.tcp_sessions.clone();
                 let pending_connections = self.pending_connections.clone();
@@ -450,10 +513,10 @@ impl PacketProcessor {
                 tokio::spawn(async move {
                     let connect_result = timeout(
                         PacketProcessor::TCP_CONNECT_TIMEOUT,
-                        socks5_client.connect(fk.dst),
-                    ).await;
+                        PacketProcessor::open_direct_tcp(fk.dst, iface),
+                    )
+                    .await;
 
-                    // Always remove from pending set.
                     {
                         let mut pending = pending_connections.lock().await;
                         pending.remove(&fk);
@@ -462,9 +525,10 @@ impl PacketProcessor {
                     match connect_result {
                         Ok(Ok(stream)) => {
                             let (reader, writer) = stream.into_split();
+                            let writer = Arc::new(Mutex::new(writer));
+                            let (forward_tx, forward_rx) = mpsc::channel::<Vec<u8>>(64);
 
                             let session = Arc::new(TcpSession {
-                                writer: Arc::new(Mutex::new(writer)),
                                 state: Arc::new(Mutex::new(TcpFlowState {
                                     client_next_seq: client_isn.wrapping_add(1),
                                     server_next_seq: 1,
@@ -475,9 +539,9 @@ impl PacketProcessor {
                                     lifecycle: TcpLifecycle::SynReceived,
                                     last_activity: Instant::now(),
                                 })),
+                                forward_tx,
                             });
 
-                            // Advance server_next_seq for the SYN before registering.
                             let syn_ack_seq = {
                                 let mut state = session.state.lock().await;
                                 let seq = state.server_next_seq;
@@ -490,6 +554,15 @@ impl PacketProcessor {
                                 table.insert(fk.clone(), session.clone());
                             }
 
+                            PacketProcessor::spawn_forward_writer_task(
+                                fk.clone(),
+                                forward_rx,
+                                writer,
+                                session.state.clone(),
+                                tcp_sessions.clone(),
+                                tun_packet_tx.clone(),
+                            );
+
                             PacketProcessor::spawn_reverse_tcp_task(
                                 fk.clone(),
                                 reader,
@@ -500,198 +573,240 @@ impl PacketProcessor {
                             );
 
                             let _ = PacketProcessor::inject_tcp_control(
-                                &tun_packet_tx, &fk,
-                                syn_ack_seq, client_isn.wrapping_add(1),
-                                true, false, false,
-                            ).await;
+                                &tun_packet_tx,
+                                &fk,
+                                syn_ack_seq,
+                                client_isn.wrapping_add(1),
+                                true,
+                                false,
+                                false,
+                            )
+                            .await;
+                            debug!("Direct TCP proxy established for excluded flow {:?}", fk);
                         }
                         Ok(Err(err)) => {
-                            warn!("SOCKS5 connect failed for {:?}: {}", fk, err);
+                            warn!("Direct TCP connect failed for excluded flow {:?}: {}", fk, err);
                             let _ = PacketProcessor::inject_tcp_control(
-                                &tun_packet_tx, &fk,
-                                0, client_isn.wrapping_add(1),
-                                false, false, true,
-                            ).await;
+                                &tun_packet_tx,
+                                &fk,
+                                0,
+                                client_isn.wrapping_add(1),
+                                false,
+                                false,
+                                true,
+                            )
+                            .await;
                         }
                         Err(_) => {
-                            warn!("SOCKS5 connect timed out for {:?}", fk);
+                            warn!("Direct TCP connect timed out for excluded flow {:?}", fk);
                             let _ = PacketProcessor::inject_tcp_control(
-                                &tun_packet_tx, &fk,
-                                0, client_isn.wrapping_add(1),
-                                false, false, true,
-                            ).await;
+                                &tun_packet_tx,
+                                &fk,
+                                0,
+                                client_isn.wrapping_add(1),
+                                false,
+                                false,
+                                true,
+                            )
+                            .await;
                         }
                     }
                 });
 
-                return Ok(());
-            }
-
-            // Non-SYN for unknown flow: silently drop if SOCKS5 connect is in progress.
-            {
-                let pending = self.pending_connections.lock().await;
-                if pending.contains(&flow_key) {
-                    return Ok(());
-                }
-            }
-            debug!(
-                "Dropping unknown non-SYN TCP packet {}:{} -> {}:{}",
-                ip_packet.src,
-                source_port,
-                ip_packet.dst,
-                dest_port
-            );
-            return Ok(());
-        };
-
-        if tcp_header.rst() || tcp_header.fin() {
-            if tcp_header.fin() {
-                let (sequence_number, acknowledgment_number) = {
-                    let mut state = session.state.lock().await;
-                    // FIN consumes one sequence number when it is at/after expected seq.
-                    if Self::seq_at_or_after(tcp_header.sequence_number(), state.client_next_seq) {
-                        state.client_next_seq = state.client_next_seq.wrapping_add(1);
-                    }
-                    let seq = state.server_next_seq;
-                    state.server_next_seq = state.server_next_seq.wrapping_add(1);
-                    state.lifecycle = TcpLifecycle::FinSent;
-                    state.last_activity = Instant::now();
-                    (seq, state.client_next_seq)
-                };
-
-                self.inject_tcp_control_packet(
-                    &flow_key,
-                    sequence_number,
-                    acknowledgment_number,
-                    false,
-                    true,
-                    false,
-                )
-                .await?;
-            }
-
-            if tcp_header.rst() {
-                let mut state = session.state.lock().await;
-                state.lifecycle = TcpLifecycle::Closed;
-                let mut table = self.tcp_sessions.lock().await;
-                table.remove(&flow_key);
-                return Ok(());
-            }
-        }
-
-        if tcp_header.ack() {
-            let should_close = {
-                let mut state = session.state.lock().await;
-                // Track peer ACK/window for reverse flow-control.
-                state.client_window = tcp_header.window_size();
-                if Self::seq_at_or_after(tcp_header.acknowledgment_number(), state.server_acked_seq) {
-                    state.server_acked_seq = tcp_header.acknowledgment_number();
-                }
-
-                if state.lifecycle == TcpLifecycle::FinSent
-                    && tcp_header.acknowledgment_number() == state.server_next_seq
-                {
-                    state.lifecycle = TcpLifecycle::Closed;
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if should_close {
-                let mut table = self.tcp_sessions.lock().await;
-                table.remove(&flow_key);
-                return Ok(());
-            }
-        }
-
-        let lifecycle = {
-            let state = session.state.lock().await;
-            state.lifecycle
-        };
-
-        if lifecycle == TcpLifecycle::Closed || lifecycle == TcpLifecycle::FinSent {
-            return Ok(());
-        }
-
-        if is_ack_only_or_window_update {
-            // No payload to forward to SOCKS; treat as local TCP state maintenance only.
-            return Ok(());
-        }
-
-        if !payload.is_empty() {
-            let forward_payload = {
-                let mut state = session.state.lock().await;
-                let merged = Self::collect_in_order_payload(
-                    &mut state,
-                    tcp_header.sequence_number(),
-                    payload,
-                );
-                state.last_activity = Instant::now();
-                merged
-            };
-
-            if forward_payload.is_empty() {
                 debug!(
-                    "Buffered/dropped non-forwardable TCP segment {}:{} -> {}:{}",
-                    ip_packet.src,
-                    source_port,
-                    ip_packet.dst,
-                    dest_port
+                    "Excluded process flow (TCP) {}:{} -> {}:{}: direct-proxying",
+                    ip_packet.src, source_port, ip_packet.dst, dest_port
                 );
                 return Ok(());
             }
 
-            let write_result = {
-                let mut writer = session.writer.lock().await;
-                writer.write_all(&forward_payload).await
+            // ── Fallback: route-based bypass (RST + reconnect) ────────────────
+            // No outbound interface is configured; install a kernel /32 route so
+            // the app's next reconnect goes via the physical NIC directly.
+            // Defensively remove any ghost session.
+            let had_session = {
+                let mut table = self.tcp_sessions.lock().await;
+                table.remove(&flow_key).is_some()
             };
 
-            if let Err(err) = write_result {
-                let (sequence_number, acknowledgment_number) = {
-                    let state = session.state.lock().await;
-                    (state.server_next_seq, state.client_next_seq)
-                };
+            let mut should_reset = !self.config.tun.auto_route || had_session;
 
+            if self.config.tun.auto_route {
+                if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
+                    warn!(
+                        "Failed to install dynamic bypass route for excluded flow {}:{} -> {}:{}: {}",
+                        ip_packet.src, source_port, ip_packet.dst, dest_port, err
+                    );
+                    should_reset = true;
+                }
+            }
+
+            if should_reset {
                 let _ = self
                     .inject_tcp_control_packet(
                         &flow_key,
-                        sequence_number,
-                        acknowledgment_number,
+                        0,
+                        tcp_header.sequence_number().wrapping_add(1),
                         false,
                         false,
                         true,
                     )
                     .await;
-
-                let mut table = self.tcp_sessions.lock().await;
-                table.remove(&flow_key);
-                warn!("TCP write failed for flow {:?}: {}", flow_key, err);
-                return Ok(());
             }
+            debug!(
+                "Excluded process flow (TCP) {}:{} -> {}:{}: route-based bypass",
+                ip_packet.src, source_port, ip_packet.dst, dest_port
+            );
+            return Ok(());
+        }
 
-            // Send ACK back to client to confirm receipt of forwarded data.
-            let (ack_seq, ack_ack) = {
+        // SYN retransmit for an already-admitted connection?
+        if let Some(session) = {
+            let table = self.tcp_sessions.lock().await;
+            table.get(&flow_key).cloned()
+        } {
+            let resend_syn_ack = {
                 let mut state = session.state.lock().await;
                 state.last_activity = Instant::now();
                 if state.lifecycle == TcpLifecycle::SynReceived {
-                    state.lifecycle = TcpLifecycle::Established;
+                    Some((state.server_next_seq.wrapping_sub(1), state.client_next_seq))
+                } else {
+                    None
                 }
-                (state.server_next_seq, state.client_next_seq)
             };
-            let _ = self.inject_tcp_control_packet(
-                &flow_key, ack_seq, ack_ack, false, false, false,
-            ).await;
+            if let Some((sequence_number, acknowledgment_number)) = resend_syn_ack {
+                self.inject_tcp_control_packet(
+                    &flow_key,
+                    sequence_number,
+                    acknowledgment_number,
+                    true,
+                    false,
+                    false,
+                )
+                .await?;
+            }
+            return Ok(());
         }
 
-        debug!(
-            "TCP flow active {}:{} -> {}:{}",
-            ip_packet.src,
-            source_port,
-            ip_packet.dst,
-            dest_port
-        );
-        
+        // Fresh SYN: spawn a SOCKS5 connection in the background.
+        {
+            let mut pending = self.pending_connections.lock().await;
+            if pending.contains(&flow_key) {
+                return Ok(());
+            }
+            pending.insert(flow_key.clone());
+        }
+
+        let socks5_client = self.socks5_client.clone();
+        let tun_packet_tx = self.tun_packet_tx.clone();
+        let tcp_sessions = self.tcp_sessions.clone();
+        let pending_connections = self.pending_connections.clone();
+        let mtu = self.config.tun.mtu as usize;
+        let client_isn = tcp_header.sequence_number();
+        let fk = flow_key.clone();
+
+        tokio::spawn(async move {
+            let connect_result = timeout(
+                PacketProcessor::TCP_CONNECT_TIMEOUT,
+                socks5_client.connect(fk.dst),
+            )
+            .await;
+
+            {
+                let mut pending = pending_connections.lock().await;
+                pending.remove(&fk);
+            }
+
+            match connect_result {
+                Ok(Ok(stream)) => {
+                    let (reader, writer) = stream.into_split();
+                    let writer = Arc::new(Mutex::new(writer));
+                    let (forward_tx, forward_rx) = mpsc::channel::<Vec<u8>>(64);
+
+                    let session = Arc::new(TcpSession {
+                        state: Arc::new(Mutex::new(TcpFlowState {
+                            client_next_seq: client_isn.wrapping_add(1),
+                            server_next_seq: 1,
+                            server_acked_seq: 1,
+                            client_window: 65535,
+                            reorder_buffer: BTreeMap::new(),
+                            reorder_bytes: 0,
+                            lifecycle: TcpLifecycle::SynReceived,
+                            last_activity: Instant::now(),
+                        })),
+                        forward_tx,
+                    });
+
+                    let syn_ack_seq = {
+                        let mut state = session.state.lock().await;
+                        let seq = state.server_next_seq;
+                        state.server_next_seq = seq.wrapping_add(1);
+                        seq
+                    };
+
+                    {
+                        let mut table = tcp_sessions.lock().await;
+                        table.insert(fk.clone(), session.clone());
+                    }
+
+                    PacketProcessor::spawn_forward_writer_task(
+                        fk.clone(),
+                        forward_rx,
+                        writer,
+                        session.state.clone(),
+                        tcp_sessions.clone(),
+                        tun_packet_tx.clone(),
+                    );
+
+                    PacketProcessor::spawn_reverse_tcp_task(
+                        fk.clone(),
+                        reader,
+                        session,
+                        tcp_sessions,
+                        tun_packet_tx.clone(),
+                        mtu,
+                    );
+
+                    let _ = PacketProcessor::inject_tcp_control(
+                        &tun_packet_tx,
+                        &fk,
+                        syn_ack_seq,
+                        client_isn.wrapping_add(1),
+                        true,
+                        false,
+                        false,
+                    )
+                    .await;
+                }
+                Ok(Err(err)) => {
+                    warn!("SOCKS5 connect failed for {:?}: {}", fk, err);
+                    let _ = PacketProcessor::inject_tcp_control(
+                        &tun_packet_tx,
+                        &fk,
+                        0,
+                        client_isn.wrapping_add(1),
+                        false,
+                        false,
+                        true,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    warn!("SOCKS5 connect timed out for {:?}", fk);
+                    let _ = PacketProcessor::inject_tcp_control(
+                        &tun_packet_tx,
+                        &fk,
+                        0,
+                        client_isn.wrapping_add(1),
+                        false,
+                        false,
+                        true,
+                    )
+                    .await;
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -798,6 +913,89 @@ impl PacketProcessor {
             .should_exclude_process_flow(TransportProtocol::Udp, source_addr, target_addr)
             .await
         {
+            // ── Preferred path: direct UDP exchange via physical NIC ───────────
+            // Relay the datagram through a socket bound to the physical interface
+            // and inject the response back to TUN. The application never sees a
+            // dropped packet, so no connection is interrupted.
+            if let Some(iface) = self.outbound_interface.clone() {
+                let udp_permit = match self.udp_task_limiter.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        debug!(
+                            "Dropping excluded UDP packet (rate limit) {}:{} -> {}:{}",
+                            ip_packet.src, source_port, ip_packet.dst, dest_port
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
+                let tun_packet_tx = self.tun_packet_tx.clone();
+                let src_ip = ip_packet.src;
+                let dst_ip = ip_packet.dst;
+
+                tokio::spawn(async move {
+                    let _permit = udp_permit;
+
+                    match timeout(
+                        PacketProcessor::UDP_PROXY_TIMEOUT,
+                        PacketProcessor::direct_udp_exchange(target_addr, udp_payload, iface),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response_payload)) => {
+                            let response_builder = match (dst_ip, src_ip) {
+                                (IpAddr::V4(dst), IpAddr::V4(src)) => {
+                                    PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
+                                        .udp(dest_port, source_port)
+                                }
+                                (IpAddr::V6(dst), IpAddr::V6(src)) => {
+                                    PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
+                                        .udp(dest_port, source_port)
+                                }
+                                _ => return,
+                            };
+                            let mut response_packet =
+                                Vec::with_capacity(response_builder.size(response_payload.len()));
+                            if response_builder
+                                .write(&mut response_packet, &response_payload)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let _ = PacketProcessor::write_tun_packet_with(
+                                tun_packet_tx,
+                                response_packet,
+                            )
+                            .await;
+                            debug!(
+                                "Direct UDP exchange completed for excluded flow {}:{} -> {}:{}",
+                                src_ip, source_port, dst_ip, dest_port
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            debug!(
+                                "Direct UDP exchange failed for excluded flow {}:{} -> {}:{}: {}",
+                                src_ip, source_port, dst_ip, dest_port, err
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                "Direct UDP exchange timed out for excluded flow {}:{} -> {}:{}",
+                                src_ip, source_port, dst_ip, dest_port
+                            );
+                        }
+                    }
+                });
+
+                debug!(
+                    "Excluded process flow (UDP) {}:{} -> {}:{}: direct forwarding",
+                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                );
+                return Ok(());
+            }
+
+            // ── Fallback: route-based bypass ───────────────────────────────────
             if self.config.tun.auto_route {
                 if let Err(err) = self.ensure_dynamic_bypass_for_ip(target_addr.ip()).await {
                     warn!(
@@ -812,7 +1010,7 @@ impl PacketProcessor {
             }
 
             debug!(
-                "Excluded process flow (UDP) {}:{} -> {}:{}",
+                "Excluded process flow (UDP) {}:{} -> {}:{}: route-based bypass",
                 ip_packet.src,
                 source_port,
                 ip_packet.dst,
@@ -937,6 +1135,10 @@ impl PacketProcessor {
         tokio::spawn(async move {
             let _permit = udp_permit;
 
+            // Keep a reference so the timeout branch can clean up a stale
+            // pending-session entry if the future is cancelled mid-way.
+            let pending_for_cleanup = pending_udp_sessions.clone();
+
             let response_payload = match timeout(
                 PacketProcessor::UDP_PROXY_TIMEOUT,
                 PacketProcessor::proxy_udp_with_reused_session_shared(
@@ -971,6 +1173,9 @@ impl PacketProcessor {
                     return;
                 }
                 Err(_) => {
+                    // The future was dropped by timeout; it may not have had a
+                    // chance to remove the flow key from pending_udp_sessions.
+                    pending_for_cleanup.lock().await.remove(&udp_flow_key);
                     PacketProcessor::mark_udp_flow_backoff_shared(
                         udp_timeout_backoff.clone(),
                         udp_flow_key.clone(),
@@ -1378,6 +1583,98 @@ impl PacketProcessor {
         false
     }
 
+    /// Connect directly to `dst` via the physical outbound interface, bypassing
+    /// the TUN device. Uses `SO_BINDTODEVICE` on Linux so the socket is pinned
+    /// to the physical NIC and never re-enters the TUN routing path.
+    async fn open_direct_tcp(dst: SocketAddr, outbound_interface: String) -> Result<tokio::net::TcpStream> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            use tokio::net::TcpSocket;
+
+            let socket = if dst.is_ipv6() {
+                TcpSocket::new_v6()?
+            } else {
+                TcpSocket::new_v4()?
+            };
+            let fd = socket.as_raw_fd();
+            let iface_c = std::ffi::CString::new(outbound_interface.as_str())
+                .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    iface_c.as_ptr() as *const libc::c_void,
+                    iface_c.to_bytes_with_nul().len() as libc::socklen_t,
+                )
+            };
+            if ret == 0 {
+                let stream = socket.connect(dst).await?;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            debug!(
+                "SO_BINDTODEVICE to '{}' failed ({}); direct TCP connect may re-enter TUN",
+                outbound_interface,
+                std::io::Error::last_os_error()
+            );
+        }
+        let stream = tokio::net::TcpStream::connect(dst).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    }
+
+    /// Send a single UDP datagram directly to `dst` via the physical outbound
+    /// interface and return the first response datagram. Uses `SO_BINDTODEVICE`
+    /// on Linux to prevent the socket from re-entering the TUN device.
+    async fn direct_udp_exchange(
+        dst: SocketAddr,
+        payload: Vec<u8>,
+        outbound_interface: String,
+    ) -> Result<Vec<u8>> {
+        use tokio::net::UdpSocket;
+
+        let bind_addr: SocketAddr = if dst.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
+
+        let socket = UdpSocket::bind(bind_addr).await?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            let iface_c = std::ffi::CString::new(outbound_interface.as_str())
+                .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    iface_c.as_ptr() as *const libc::c_void,
+                    iface_c.to_bytes_with_nul().len() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                debug!(
+                    "SO_BINDTODEVICE to '{}' for direct UDP failed ({}); datagram may re-enter TUN",
+                    outbound_interface,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        socket.connect(dst).await?;
+        socket.send(&payload).await?;
+        let mut buf = vec![0u8; 65535];
+        let n = socket.recv(&mut buf).await?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     async fn ensure_dynamic_bypass_for_ip(&self, ip: IpAddr) -> Result<()> {
         if !self.config.tun.auto_route || self.config.should_skip_ip(ip) {
             return Ok(());
@@ -1515,6 +1812,68 @@ impl PacketProcessor {
                 err
             ))?;
         Ok(())
+    }
+
+    /// Spawn a task that drains the per-session forward channel and writes
+    /// each payload to the SOCKS5 TCP stream in order, then ACKs it back to
+    /// the TUN-side client.  Running this separately keeps the main packet
+    /// loop non-blocking even when the SOCKS5 connection is congested.
+    fn spawn_forward_writer_task(
+        flow_key: FlowKey,
+        mut forward_rx: mpsc::Receiver<Vec<u8>>,
+        writer: Arc<Mutex<OwnedWriteHalf>>,
+        state: Arc<Mutex<TcpFlowState>>,
+        sessions: Arc<Mutex<HashMap<FlowKey, Arc<TcpSession>>>>,
+        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(payload) = forward_rx.recv().await {
+                let write_result = {
+                    let mut w = writer.lock().await;
+                    w.write_all(&payload).await
+                };
+
+                if let Err(err) = write_result {
+                    let (sequence_number, acknowledgment_number) = {
+                        let s = state.lock().await;
+                        (s.server_next_seq, s.client_next_seq)
+                    };
+                    let _ = PacketProcessor::inject_tcp_control(
+                        &tun_packet_tx,
+                        &flow_key,
+                        sequence_number,
+                        acknowledgment_number,
+                        false,
+                        false,
+                        true,
+                    )
+                    .await;
+                    sessions.lock().await.remove(&flow_key);
+                    warn!("TCP write failed for flow {:?}: {}", flow_key, err);
+                    return;
+                }
+
+                // ACK the data that was just forwarded to SOCKS5.
+                let (ack_seq, ack_ack) = {
+                    let mut s = state.lock().await;
+                    s.last_activity = Instant::now();
+                    if s.lifecycle == TcpLifecycle::SynReceived {
+                        s.lifecycle = TcpLifecycle::Established;
+                    }
+                    (s.server_next_seq, s.client_next_seq)
+                };
+                let _ = PacketProcessor::inject_tcp_control(
+                    &tun_packet_tx,
+                    &flow_key,
+                    ack_seq,
+                    ack_ack,
+                    false,
+                    false,
+                    false,
+                )
+                .await;
+            }
+        });
     }
 
     fn spawn_reverse_tcp_task(

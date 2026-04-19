@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "freebsd"))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -214,8 +216,46 @@ fn netlink_find_pid(
 
 /// Walk /proc/<pid>/fd/ to find which process owns the given socket inode.
 /// Pre-filters by UID to avoid stat-ing every FD of every process.
+///
+/// Results are cached in a module-level static for `INODE_PID_CACHE_TTL`.
+/// Multiple connections from the same process hit the cache for the inode →
+/// pid mapping, avoiding repeated /proc walks.
 #[cfg(target_os = "linux")]
 fn linux_pid_from_inode(inode: u64, uid: u32) -> Option<u32> {
+    use std::sync::{Mutex, OnceLock};
+
+    // (inode, uid) → (pid, recorded_at)
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u64, u32), (u32, Instant)>>> =
+        OnceLock::new();
+    const CACHE_TTL: Duration = Duration::from_secs(5);
+
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    // Fast path: check cache.
+    if let Ok(guard) = cache.lock() {
+        if let Some(&(pid, recorded_at)) = guard.get(&(inode, uid)) {
+            if recorded_at.elapsed() < CACHE_TTL {
+                // Verify the pid is still alive (cheap stat check).
+                if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+
+    // Slow path: walk /proc.
+    let pid = linux_pid_from_inode_slow(inode, uid)?;
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert((inode, uid), (pid, Instant::now()));
+    }
+
+    Some(pid)
+}
+
+/// Inner slow-path: walks /proc to resolve inode → pid.
+#[cfg(target_os = "linux")]
+fn linux_pid_from_inode_slow(inode: u64, uid: u32) -> Option<u32> {
     let target = format!("socket:[{}]", inode);
     let proc_dir = std::fs::read_dir("/proc").ok()?;
 
@@ -321,54 +361,194 @@ fn bsd_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Windows: parse `netstat -ano` output
+// Windows: GetExtendedTcpTable / GetExtendedUdpTable (iphlpapi)
+//
+// Replaces the previous `netstat -ano` subprocess approach. Using the kernel
+// API directly is O(1) per query and avoids spawning a child process for every
+// process lookup, which was O(flows/second) subprocess launches under load.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-fn windows_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -> Option<u32> {
-    use std::process::Command;
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetExtendedTcpTable(
+        p_tcp_table: *mut core::ffi::c_void,
+        pdw_size: *mut u32,
+        b_order: i32,
+        dw_af: u32,
+        table_class: u32,
+        reserved: u32,
+    ) -> u32;
 
-    let output = Command::new("netstat").args(["-ano"]).output().ok()?;
-    if !output.status.success() {
+    fn GetExtendedUdpTable(
+        p_udp_table: *mut core::ffi::c_void,
+        pdw_size: *mut u32,
+        b_order: i32,
+        dw_af: u32,
+        table_class: u32,
+        reserved: u32,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+fn windows_find_pid(protocol: TransportProtocol, src: SocketAddr, _dst: SocketAddr) -> Option<u32> {
+    use std::net::IpAddr;
+    match (protocol, src.ip()) {
+        (TransportProtocol::Tcp, IpAddr::V4(src_v4)) => {
+            windows_tcp_pid_v4(src_v4, src.port(), _dst)
+        }
+        (TransportProtocol::Udp, IpAddr::V4(src_v4)) => {
+            windows_udp_pid_v4(src_v4, src.port())
+        }
+        // IPv6 flows: fall back to none (IPv4 covers the primary TUN use-case).
+        _ => None,
+    }
+}
+
+/// Decode a Windows port field: ports are stored as big-endian u16 in
+/// the low two bytes of a little-endian u32.
+#[cfg(windows)]
+#[inline]
+fn win_port(dw: u32) -> u16 {
+    u16::from_be(dw as u16)
+}
+
+/// Decode a Windows IPv4 address field (little-endian u32 → Ipv4Addr).
+#[cfg(windows)]
+#[inline]
+fn win_ipv4(dw: u32) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(dw.swap_bytes())
+}
+
+#[cfg(windows)]
+fn windows_tcp_pid_v4(
+    src_ip: std::net::Ipv4Addr,
+    src_port: u16,
+    dst: SocketAddr,
+) -> Option<u32> {
+    // MIB_TCPROW_OWNER_PID layout (24 bytes):
+    //   u32 dwState, u32 dwLocalAddr, u32 dwLocalPort,
+    //   u32 dwRemoteAddr, u32 dwRemotePort, u32 dwOwningPid
+    const ROW_SIZE: usize = 24;
+    const AF_INET: u32 = 2;
+    const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    let mut size: u32 = 0;
+    // First call to get required buffer size.
+    unsafe {
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+    }
+    if size == 0 {
         return None;
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let proto_prefix = match protocol {
-        TransportProtocol::Tcp => "TCP",
-        TransportProtocol::Udp => "UDP",
+    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    let ret = unsafe {
+        GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    // 0 = ERROR_SUCCESS
+    if ret != 0 && ret != ERROR_INSUFFICIENT_BUFFER {
+        return None;
+    }
+    if (buf.len() as u32) < size || buf.len() < 4 {
+        return None;
+    }
+
+    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let dst_v4 = match dst.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => return None,
     };
 
-    let src_str = src.to_string();
-    let dst_str = dst.to_string();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with(proto_prefix) {
-            continue;
+    for i in 0..num_entries {
+        let offset = 4 + i * ROW_SIZE;
+        if offset + ROW_SIZE > buf.len() {
+            break;
         }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // TCP: Proto Local Foreign State PID  (5 fields)
-        // UDP: Proto Local Foreign PID        (4 fields)
-        let (local, remote, pid_field) = match (protocol, fields.len()) {
-            (TransportProtocol::Tcp, 5) => (fields[1], fields[2], fields[4]),
-            (TransportProtocol::Udp, 4) => (fields[1], fields[2], fields[3]),
-            _ => continue,
-        };
+        let row = &buf[offset..offset + ROW_SIZE];
+        let local_addr = win_ipv4(u32::from_ne_bytes([row[4], row[5], row[6], row[7]]));
+        let local_port = win_port(u32::from_ne_bytes([row[8], row[9], row[10], row[11]]));
+        let remote_addr = win_ipv4(u32::from_ne_bytes([row[12], row[13], row[14], row[15]]));
+        let remote_port = win_port(u32::from_ne_bytes([row[16], row[17], row[18], row[19]]));
+        let pid = u32::from_ne_bytes([row[20], row[21], row[22], row[23]]);
 
-        if local != src_str {
-            continue;
+        if local_addr == src_ip
+            && local_port == src_port
+            && remote_addr == dst_v4
+            && remote_port == dst.port()
+        {
+            return Some(pid);
         }
+    }
+    None
+}
 
-        let remote_ok = match protocol {
-            TransportProtocol::Tcp => remote == dst_str,
-            TransportProtocol::Udp => remote == dst_str || remote == "*:*",
-        };
-        if !remote_ok {
-            continue;
+#[cfg(windows)]
+fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> {
+    // MIB_UDPROW_OWNER_PID layout (12 bytes):
+    //   u32 dwLocalAddr, u32 dwLocalPort, u32 dwOwningPid
+    const ROW_SIZE: usize = 12;
+    const AF_INET: u32 = 2;
+    const UDP_TABLE_OWNER_PID: u32 = 1;
+
+    let mut size: u32 = 0;
+    unsafe {
+        GetExtendedUdpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0,
+        );
+    }
+    if size == 0 {
+        return None;
+    }
+
+    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    let ret = unsafe {
+        GetExtendedUdpTable(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+            0,
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
+    };
+    if ret != 0 || buf.len() < 4 {
+        return None;
+    }
+
+    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+
+    for i in 0..num_entries {
+        let offset = 4 + i * ROW_SIZE;
+        if offset + ROW_SIZE > buf.len() {
+            break;
         }
+        let row = &buf[offset..offset + ROW_SIZE];
+        let local_addr = win_ipv4(u32::from_ne_bytes([row[0], row[1], row[2], row[3]]));
+        let local_port = win_port(u32::from_ne_bytes([row[4], row[5], row[6], row[7]]));
+        let pid = u32::from_ne_bytes([row[8], row[9], row[10], row[11]]);
 
-        if let Ok(pid) = pid_field.parse::<u32>() {
+        if local_addr == src_ip && local_port == src_port {
             return Some(pid);
         }
     }
