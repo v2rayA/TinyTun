@@ -84,7 +84,7 @@ jobs:
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install zig
-          
+
       - name: Install cargo-zigbuild
         if: matrix.build_tool == 'cargo-zigbuild'
         uses: taiki-e/install-action@v2
@@ -138,6 +138,8 @@ jobs:
       - name: Build (cargo-zigbuild)
         if: matrix.build_tool == 'cargo-zigbuild'
         run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install zig
           rustup target add ${{ matrix.target }} 
           cargo zigbuild --locked --release --target ${{ matrix.target }} ${{ matrix.has_ebpf == true && '--features ebpf' || '' }}
 
