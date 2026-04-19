@@ -32,34 +32,34 @@ jobs:
             runner: windows-11-arm
             build_tool: cargo-gnullvm
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: armv7-unknown-linux-gnueabihf
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: armv7-unknown-linux-musleabihf
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
           - target: x86_64-unknown-freebsd
             runner: ubuntu-latest
             build_tool: actions-rust-cross
           # - target: aarch64-unknown-freebsd
-          #   runner: ubuntu-slim
+          #   runner: ubuntu-latest
           #   build_tool: actions-rust-cross
           - target: x86_64-apple-darwin
             runner: macos-26-intel
@@ -81,10 +81,10 @@ jobs:
 
       - name: Install Zig
         if: matrix.build_tool == 'cargo-zigbuild'
-        uses: https://codeberg.org/mlugg/setup-zig@v2
-        with:
-          version: '0.14.0'
-
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install zig
+          
       - name: Install cargo-zigbuild
         if: matrix.build_tool == 'cargo-zigbuild'
         uses: taiki-e/install-action@v2
@@ -196,7 +196,7 @@ jobs:
   release:
     name: release
     needs: build
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
