@@ -1584,8 +1584,9 @@ impl PacketProcessor {
     }
 
     /// Connect directly to `dst` via the physical outbound interface, bypassing
-    /// the TUN device. Uses `SO_BINDTODEVICE` on Linux so the socket is pinned
-    /// to the physical NIC and never re-enters the TUN routing path.
+    /// the TUN device. Uses `SO_BINDTODEVICE` (Linux) or `IP_BOUND_IF`/
+    /// `IPV6_BOUND_IF` (macOS/FreeBSD) so the socket is pinned to the physical
+    /// NIC and never re-enters the TUN routing path.
     async fn open_direct_tcp(dst: SocketAddr, outbound_interface: String) -> Result<tokio::net::TcpStream> {
         #[cfg(target_os = "linux")]
         {
@@ -1620,6 +1621,60 @@ impl PacketProcessor {
                 std::io::Error::last_os_error()
             );
         }
+
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        {
+            use std::os::unix::io::AsRawFd;
+            use tokio::net::TcpSocket;
+
+            // Resolve interface name → index once.
+            let if_index = unsafe {
+                let iface_c = std::ffi::CString::new(outbound_interface.as_str())
+                    .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
+                libc::if_nametoindex(iface_c.as_ptr())
+            };
+            if if_index != 0 {
+                let socket = if dst.is_ipv6() {
+                    TcpSocket::new_v6()?
+                } else {
+                    TcpSocket::new_v4()?
+                };
+                let fd = socket.as_raw_fd();
+                // IP_BOUND_IF = 25 (IPv4), IPV6_BOUND_IF = 125 (IPv6)
+                let (level, optname) = if dst.is_ipv6() {
+                    (libc::IPPROTO_IPV6, 125i32)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_BOUND_IF as i32)
+                };
+                let idx = if_index;
+                let ret = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        level,
+                        optname,
+                        &idx as *const libc::c_uint as *const libc::c_void,
+                        std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                    )
+                };
+                if ret == 0 {
+                    let stream = socket.connect(dst).await?;
+                    stream.set_nodelay(true)?;
+                    return Ok(stream);
+                }
+                debug!(
+                    "IP_BOUND_IF/IPV6_BOUND_IF to '{}' (index={}) failed ({}); direct TCP connect may re-enter TUN",
+                    outbound_interface,
+                    if_index,
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                debug!(
+                    "if_nametoindex('{}') failed; direct TCP connect may re-enter TUN",
+                    outbound_interface
+                );
+            }
+        }
+
         let stream = tokio::net::TcpStream::connect(dst).await?;
         stream.set_nodelay(true)?;
         Ok(stream)
@@ -1627,7 +1682,8 @@ impl PacketProcessor {
 
     /// Send a single UDP datagram directly to `dst` via the physical outbound
     /// interface and return the first response datagram. Uses `SO_BINDTODEVICE`
-    /// on Linux to prevent the socket from re-entering the TUN device.
+    /// (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS/FreeBSD) to prevent
+    /// the socket from re-entering the TUN device.
     async fn direct_udp_exchange(
         dst: SocketAddr,
         payload: Vec<u8>,
@@ -1663,6 +1719,45 @@ impl PacketProcessor {
                     "SO_BINDTODEVICE to '{}' for direct UDP failed ({}); datagram may re-enter TUN",
                     outbound_interface,
                     std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        {
+            use std::os::unix::io::AsRawFd;
+            let if_index = unsafe {
+                let iface_c = std::ffi::CString::new(outbound_interface.as_str())
+                    .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
+                libc::if_nametoindex(iface_c.as_ptr())
+            };
+            if if_index != 0 {
+                let fd = socket.as_raw_fd();
+                let (level, optname) = if dst.is_ipv6() {
+                    (libc::IPPROTO_IPV6, 125i32)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_BOUND_IF as i32)
+                };
+                let ret = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        level,
+                        optname,
+                        &if_index as *const libc::c_uint as *const libc::c_void,
+                        std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                    )
+                };
+                if ret != 0 {
+                    debug!(
+                        "IP_BOUND_IF/IPV6_BOUND_IF to '{}' for direct UDP failed ({}); datagram may re-enter TUN",
+                        outbound_interface,
+                        std::io::Error::last_os_error()
+                    );
+                }
+            } else {
+                debug!(
+                    "if_nametoindex('{}') failed for direct UDP; datagram may re-enter TUN",
+                    outbound_interface
                 );
             }
         }

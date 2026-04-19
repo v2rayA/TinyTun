@@ -307,8 +307,41 @@ fn linux_pid_uid_matches(pid: u32, uid: u32) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 // macOS / FreeBSD: parse `sockstat -l` output
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Match a `sockstat` address field against a `SocketAddr`.
+///
+/// `sockstat` uses `addr.port` notation (dot-separated) for both IPv4 and
+/// IPv6: e.g. `192.168.1.1.80`, `2001:db8::1.80`.  Rust's `SocketAddr::to_string()`
+/// uses `addr:port` for IPv4 and `[addr]:port` for IPv6.  Both forms are tried
+/// so that the comparison is format-agnostic.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn sockstat_field_matches(field: &str, addr: SocketAddr) -> bool {
+    use std::net::IpAddr;
+
+    // Rust canonical form ("192.0.2.1:80" or "[::1]:80")
+    if field == addr.to_string() {
+        return true;
+    }
+
+    let port = addr.port();
+    // sockstat dot form: "<raw_ip>.<port>"
+    let dot_form = match addr.ip() {
+        IpAddr::V4(v4) => format!("{}.{}", v4, port),
+        IpAddr::V6(v6) => format!("{}.{}", v6, port),
+    };
+    if field == dot_form {
+        return true;
+    }
+
+    // Bracketed IPv6 with colon: "[::1]:80" (some sockstat versions)
+    // Already covered by the Rust canonical form check above, but kept for clarity.
+
+    // Last resort: just match the trailing port separator regardless of IP.
+    field.ends_with(&format!(":{}", port)) || field.ends_with(&format!(".{}", port))
+}
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn bsd_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -> Option<u32> {
@@ -330,8 +363,6 @@ fn bsd_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let src_str = src.to_string();
-    let dst_str = dst.to_string();
 
     for line in text.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -342,16 +373,23 @@ fn bsd_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -
         let local = fields[5];
         let remote = fields[6];
 
-        let local_matches = local == src_str || local.ends_with(&format!(":{}", src.port()));
+        if !sockstat_field_matches(local, src) {
+            continue;
+        }
+
         let remote_matches = match protocol {
-            TransportProtocol::Tcp => remote == dst_str,
-            // UDP remote endpoint may be "*.*" in the table
+            TransportProtocol::Tcp => sockstat_field_matches(remote, dst),
+            // UDP remote endpoint may be "*.*" or "*:*" in the table
             TransportProtocol::Udp => {
-                remote == dst_str || remote == "*.*" || remote.starts_with("*:")
+                sockstat_field_matches(remote, dst)
+                    || remote == "*.*"
+                    || remote == "*:*"
+                    || remote.starts_with("*:")
+                    || remote.starts_with("*.")
             }
         };
 
-        if local_matches && remote_matches {
+        if remote_matches {
             if let Ok(pid) = pid_str.parse::<u32>() {
                 return Some(pid);
             }

@@ -211,12 +211,16 @@ where
     let v4_base = select_default_with_fallback(true, outbound_interface)?;
     let v6_base = select_default_with_fallback(false, outbound_interface)?;
 
-    if has_v4_targets && has_v4_default && v4_base.is_none() {
+    // Error even if no system-wide default route of that family exists: callers
+    // (e.g. ensure_dynamic_bypass_for_ip) must receive an error so they can
+    // send a RST instead of silently dropping the packet.
+    if has_v4_targets && v4_base.is_none() {
         return Err(anyhow!("no usable IPv4 default route found for bypass setup"));
     }
-    if has_v6_targets && has_v6_default && v6_base.is_none() {
+    if has_v6_targets && v6_base.is_none() {
         return Err(anyhow!("no usable IPv6 default route found for bypass setup"));
     }
+    let _ = (has_v4_default, has_v6_default); // queried above for diagnostic purposes only
 
     for (ip, prefix) in entries {
         let base = if ip.is_ipv4() {
