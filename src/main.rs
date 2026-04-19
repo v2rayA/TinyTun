@@ -592,11 +592,26 @@ async fn run_proxy(config: Config) -> Result<()> {
     });
     
     // Handle shutdown signals
+    // Listen for both Ctrl+C (SIGINT) and SIGTERM (sent by kill / systemd stop /
+    // container runtimes) so cleanup always runs before the process exits.
     let shutdown_signal = async {
-        let _ = signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = signal::ctrl_c().await;
+        }
         info!("Received shutdown signal");
     };
-    
+
     let mut shutdown_error: Option<String> = None;
     tokio::select! {
         _ = shutdown_signal => {
@@ -607,9 +622,11 @@ async fn run_proxy(config: Config) -> Result<()> {
             shutdown_error = msg;
         }
     }
-    
-    // Cleanup
+
+    // Stop packet processor first so no new dynamic bypass routes are inserted
+    // while we collect the cleanup snapshot below.
     processor_handle.abort();
+    let _ = processor_handle.await;
     if let Some(handle) = interface_monitor_handle {
         handle.abort();
     }

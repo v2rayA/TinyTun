@@ -1585,7 +1585,7 @@ impl PacketProcessor {
 
     /// Connect directly to `dst` via the physical outbound interface, bypassing
     /// the TUN device. Uses `SO_BINDTODEVICE` (Linux) or `IP_BOUND_IF`/
-    /// `IPV6_BOUND_IF` (macOS/FreeBSD) so the socket is pinned to the physical
+    /// `IPV6_BOUND_IF` (macOS) so the socket is pinned to the physical
     /// NIC and never re-enters the TUN routing path.
     async fn open_direct_tcp(dst: SocketAddr, outbound_interface: String) -> Result<tokio::net::TcpStream> {
         #[cfg(target_os = "linux")]
@@ -1622,7 +1622,7 @@ impl PacketProcessor {
             );
         }
 
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        #[cfg(target_os = "macos")]
         {
             use std::os::unix::io::AsRawFd;
             use tokio::net::TcpSocket;
@@ -1640,7 +1640,7 @@ impl PacketProcessor {
                     TcpSocket::new_v4()?
                 };
                 let fd = socket.as_raw_fd();
-                // IP_BOUND_IF = 25 (IPv4), IPV6_BOUND_IF = 125 (IPv6)
+                // IP_BOUND_IF = 25 (IPv4), IPV6_BOUND_IF = 125 (IPv6) — macOS only
                 let (level, optname) = if dst.is_ipv6() {
                     (libc::IPPROTO_IPV6, 125i32)
                 } else {
@@ -1682,7 +1682,7 @@ impl PacketProcessor {
 
     /// Send a single UDP datagram directly to `dst` via the physical outbound
     /// interface and return the first response datagram. Uses `SO_BINDTODEVICE`
-    /// (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS/FreeBSD) to prevent
+    /// (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS) to prevent
     /// the socket from re-entering the TUN device.
     async fn direct_udp_exchange(
         dst: SocketAddr,
@@ -1723,7 +1723,7 @@ impl PacketProcessor {
             }
         }
 
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        #[cfg(target_os = "macos")]
         {
             use std::os::unix::io::AsRawFd;
             let if_index = unsafe {
@@ -1733,6 +1733,7 @@ impl PacketProcessor {
             };
             if if_index != 0 {
                 let fd = socket.as_raw_fd();
+                // IP_BOUND_IF = 25 (IPv4), IPV6_BOUND_IF = 125 (IPv6) — macOS only
                 let (level, optname) = if dst.is_ipv6() {
                     (libc::IPPROTO_IPV6, 125i32)
                 } else {
