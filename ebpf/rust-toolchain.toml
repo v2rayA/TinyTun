@@ -1,0 +1,14 @@
+# Toolchain file for the TinyTun eBPF kernel sub-crate.
+#
+# When any tool (cargo, rustup, build.rs) runs inside this directory it
+# automatically uses Rust nightly with the rust-src component and the
+# bpfel-unknown-none target pre-declared.
+#
+# This removes the need for explicit `+nightly` flags in scripts and CI;
+# just `cargo build -Z build-std=core --target bpfel-unknown-none --release`
+# is sufficient.
+
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = ["bpfel-unknown-none"]

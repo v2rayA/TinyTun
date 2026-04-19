@@ -44,7 +44,8 @@ OS="$(uname -s)"
 # ── Helper: build the eBPF kernel object ─────────────────────────────────────
 build_ebpf() {
     echo "==> Checking Rust nightly toolchain..."
-    if ! "${CARGO}" +nightly --version &>/dev/null; then
+    # ebpf/rust-toolchain.toml pins nightly; verify it is installed via rustup.
+    if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
         echo ""
         echo "ERROR: Rust nightly toolchain is required to build the eBPF kernel object."
         echo "  Install with:"
@@ -58,7 +59,8 @@ build_ebpf() {
 
     echo "==> Building eBPF kernel object (bpfel-unknown-none)..."
     pushd ebpf >/dev/null
-    "${CARGO}" +nightly build -Z build-std=core --target bpfel-unknown-none --release
+    # rust-toolchain.toml in ebpf/ selects nightly automatically; no +nightly needed.
+    "${CARGO}" build -Z build-std=core --target bpfel-unknown-none --release
     popd >/dev/null
     echo "    Object: ebpf/target/bpfel-unknown-none/release/tinytun-ebpf"
 }

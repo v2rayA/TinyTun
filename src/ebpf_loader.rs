@@ -52,38 +52,33 @@ use aya::{
 };
 use log::info;
 
-/// Load the eBPF object bytes.
+/// eBPF object bytes embedded at compile time by `build.rs`.
 ///
-/// Looks for the pre-compiled object in the following locations (in order):
-///   1. `TINYTUN_EBPF_OBJECT` environment variable (path to `.o` file)
-///   2. `/usr/lib/tinytun/tinytun-ebpf.o`
-///   3. `./ebpf/target/bpfel-unknown-none/release/tinytun-ebpf`  (dev build)
-fn load_ebpf_bytes() -> Result<Vec<u8>> {
-    let candidates: &[&str] = &[
-        // Developer build path (relative to working directory)
-        "./ebpf/target/bpfel-unknown-none/release/tinytun-ebpf",
-        // Installed path
-        "/usr/lib/tinytun/tinytun-ebpf.o",
-    ];
+/// `build.rs` compiles `ebpf/` with nightly before the main crate is built,
+/// so this path is always present when the `ebpf` feature is enabled.
+/// The `TINYTUN_EBPF_OBJECT` env-var path (see `load_ebpf_bytes`) still works
+/// as an override for development and testing.
+static EMBEDDED_EBPF_OBJECT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/ebpf/target/bpfel-unknown-none/release/tinytun-ebpf"
+));
 
-    // Check env override first
+/// Return the eBPF object bytes to load into the kernel.
+///
+/// Resolution order:
+///   1. `TINYTUN_EBPF_OBJECT` environment variable — path to a `.o` file on
+///      disk.  Useful during development to test a patched object without
+///      recompiling the whole binary.
+///   2. Bytes embedded at compile time (the normal production path).
+fn load_ebpf_bytes() -> Result<Vec<u8>> {
+    // 1. Runtime override for development / testing.
     if let Ok(path) = std::env::var("TINYTUN_EBPF_OBJECT") {
         return fs::read(&path)
             .with_context(|| format!("failed to read eBPF object from TINYTUN_EBPF_OBJECT={}", path));
     }
 
-    for path in candidates {
-        if Path::new(path).exists() {
-            return fs::read(path)
-                .with_context(|| format!("failed to read eBPF object from {}", path));
-        }
-    }
-
-    anyhow::bail!(
-        "eBPF object not found. Build it with:\n  \
-         cd ebpf && cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release\n  \
-         or set TINYTUN_EBPF_OBJECT=/path/to/tinytun-ebpf.o"
-    )
+    // 2. Compile-time embedded bytes (built by build.rs).
+    Ok(EMBEDDED_EBPF_OBJECT.to_vec())
 }
 
 /// Handle to a loaded and attached eBPF process-exclusion program set.

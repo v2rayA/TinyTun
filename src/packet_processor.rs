@@ -280,10 +280,19 @@ impl PacketProcessor {
         // Check if we should skip this IP
         let dest_ip = parsed.dst;
         if self.config.should_skip_ip(dest_ip) {
-            debug!("Skipping packet to {}", dest_ip);
-            return Ok(());
+            // When an outbound interface is configured, TCP/UDP packets for
+            // statically-bypassed IPs are forwarded transparently through the
+            // physical NIC inside the protocol handlers rather than silently
+            // dropped.  Non-TCP/UDP traffic and the no-interface case still
+            // drop immediately (rely on routing to have excluded those flows).
+            let can_direct = self.outbound_interface.is_some()
+                && (parsed.protocol == 6 || parsed.protocol == 17);
+            if !can_direct {
+                debug!("Skipping packet to {}", dest_ip);
+                return Ok(());
+            }
         }
-        
+
         // Handle different protocols
         match parsed.protocol {
             6 => self.handle_tcp_packet(packet, &parsed).await,
@@ -483,17 +492,22 @@ impl PacketProcessor {
         }
 
         // ── SYN path ──────────────────────────────────────────────────────────
-        // Process exclusion is only evaluated for new connection attempts (SYNs),
-        // not for every data packet on established flows.
-        if self
-            .should_exclude_process_flow(TransportProtocol::Tcp, source_addr, target_addr)
-            .await
-        {
+        // Determine if this flow should bypass SOCKS5 and go directly via the
+        // physical NIC.  Static bypass IPs (skip_ips) always take this path;
+        // excluded processes only do so after the async name lookup confirms it.
+        let is_static_bypass = self.config.should_skip_ip(target_addr.ip());
+        let is_direct_flow = if is_static_bypass {
+            true // skip the async process-name lookup for static bypass IPs
+        } else {
+            self.should_exclude_process_flow(TransportProtocol::Tcp, source_addr, target_addr)
+                .await
+        };
+        if is_direct_flow {
             // ── Preferred path: transparent direct proxy via physical NIC ──────
-            // When an outbound interface is known, accept the SYN and proxy the
-            // TCP connection directly to the destination via SO_BINDTODEVICE.
-            // The TUN session is set up identically to the SOCKS5 path — no RST,
-            // no reconnect, no connection interruption for the application.
+            // Accept the SYN and proxy the TCP connection directly to the
+            // destination via SO_BINDTODEVICE.  The TUN session mirrors the
+            // SOCKS5 path — no RST, no reconnect, no interruption visible to
+            // the application.
             if let Some(iface) = self.outbound_interface.clone() {
                 {
                     let mut pending = self.pending_connections.lock().await;
@@ -614,7 +628,31 @@ impl PacketProcessor {
                 });
 
                 debug!(
-                    "Excluded process flow (TCP) {}:{} -> {}:{}: direct-proxying",
+                    "{} TCP {}:{} -> {}:{}: direct-proxying via physical NIC",
+                    if is_static_bypass { "Static bypass" } else { "Excluded process" },
+                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                );
+                return Ok(());
+            }
+
+            // ── Fallback: no outbound interface ───────────────────────────────
+            if is_static_bypass {
+                // Static bypass IP arrived at TUN but no physical interface is
+                // configured for direct forwarding.  The routing table should
+                // already route this IP around TUN; RST so the app fails fast
+                // rather than hanging indefinitely.
+                let _ = self
+                    .inject_tcp_control_packet(
+                        &flow_key,
+                        0,
+                        tcp_header.sequence_number().wrapping_add(1),
+                        false,
+                        false,
+                        true,
+                    )
+                    .await;
+                debug!(
+                    "Static bypass TCP {}:{} -> {}:{}: RST (no outbound interface configured)",
                     ip_packet.src, source_port, ip_packet.dst, dest_port
                 );
                 return Ok(());
@@ -909,10 +947,15 @@ impl PacketProcessor {
             return Ok(());
         }
 
-        if self
-            .should_exclude_process_flow(TransportProtocol::Udp, source_addr, target_addr)
-            .await
-        {
+        let is_static_bypass = self.config.should_skip_ip(target_addr.ip());
+        let is_direct_flow = if is_static_bypass {
+            true
+        } else {
+            self.should_exclude_process_flow(TransportProtocol::Udp, source_addr, target_addr)
+                .await
+        };
+
+        if is_direct_flow {
             // ── Preferred path: direct UDP exchange via physical NIC ───────────
             // Relay the datagram through a socket bound to the physical interface
             // and inject the response back to TUN. The application never sees a
@@ -989,7 +1032,17 @@ impl PacketProcessor {
                 });
 
                 debug!(
-                    "Excluded process flow (UDP) {}:{} -> {}:{}: direct forwarding",
+                    "{} UDP {}:{} -> {}:{}: direct forwarding via physical NIC",
+                    if is_static_bypass { "Static bypass" } else { "Excluded process" },
+                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                );
+                return Ok(());
+            }
+
+            // ── Fallback: no outbound interface ───────────────────────────────
+            if is_static_bypass {
+                debug!(
+                    "Static bypass UDP {}:{} -> {}:{}: dropped (no outbound interface configured)",
                     ip_packet.src, source_port, ip_packet.dst, dest_port
                 );
                 return Ok(());
@@ -1610,16 +1663,17 @@ impl PacketProcessor {
                     iface_c.to_bytes_with_nul().len() as libc::socklen_t,
                 )
             };
-            if ret == 0 {
-                let stream = socket.connect(dst).await?;
-                stream.set_nodelay(true)?;
-                return Ok(stream);
+            if ret != 0 {
+                let os_err = std::io::Error::last_os_error();
+                return Err(anyhow::anyhow!(
+                    "SO_BINDTODEVICE to '{}' failed: {}. \
+                     Ensure the process has CAP_NET_RAW capability or runs as root.",
+                    outbound_interface, os_err
+                ));
             }
-            debug!(
-                "SO_BINDTODEVICE to '{}' failed ({}); direct TCP connect may re-enter TUN",
-                outbound_interface,
-                std::io::Error::last_os_error()
-            );
+            let stream = socket.connect(dst).await?;
+            stream.set_nodelay(true)?;
+            return Ok(stream);
         }
 
         #[cfg(target_os = "macos")]
@@ -1656,25 +1710,32 @@ impl PacketProcessor {
                         std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
                     )
                 };
-                if ret == 0 {
-                    let stream = socket.connect(dst).await?;
-                    stream.set_nodelay(true)?;
-                    return Ok(stream);
+                if ret != 0 {
+                    let os_err = std::io::Error::last_os_error();
+                    return Err(anyhow::anyhow!(
+                        "IP_BOUND_IF/IPV6_BOUND_IF to '{}' (index={}) failed: {}",
+                        outbound_interface, if_index, os_err
+                    ));
                 }
-                debug!(
-                    "IP_BOUND_IF/IPV6_BOUND_IF to '{}' (index={}) failed ({}); direct TCP connect may re-enter TUN",
-                    outbound_interface,
-                    if_index,
-                    std::io::Error::last_os_error()
-                );
+                let stream = socket.connect(dst).await?;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
             } else {
-                debug!(
-                    "if_nametoindex('{}') failed; direct TCP connect may re-enter TUN",
+                return Err(anyhow::anyhow!(
+                    "if_nametoindex('{}') failed: interface not found",
                     outbound_interface
-                );
+                ));
             }
         }
 
+        // Interface binding is not supported on this platform.
+        // A plain connect may re-enter TUN if the routing table sends this
+        // destination through the TUN device.
+        warn!(
+            "direct TCP: interface binding not supported on this platform; \
+             socket to {} will use default routing (may re-enter TUN)",
+            dst
+        );
         let stream = tokio::net::TcpStream::connect(dst).await?;
         stream.set_nodelay(true)?;
         Ok(stream)
@@ -1715,11 +1776,12 @@ impl PacketProcessor {
                 )
             };
             if ret != 0 {
-                debug!(
-                    "SO_BINDTODEVICE to '{}' for direct UDP failed ({}); datagram may re-enter TUN",
-                    outbound_interface,
-                    std::io::Error::last_os_error()
-                );
+                let os_err = std::io::Error::last_os_error();
+                return Err(anyhow::anyhow!(
+                    "SO_BINDTODEVICE to '{}' for direct UDP failed: {}. \
+                     Ensure the process has CAP_NET_RAW capability or runs as root.",
+                    outbound_interface, os_err
+                ));
             }
         }
 
@@ -1749,17 +1811,17 @@ impl PacketProcessor {
                     )
                 };
                 if ret != 0 {
-                    debug!(
-                        "IP_BOUND_IF/IPV6_BOUND_IF to '{}' for direct UDP failed ({}); datagram may re-enter TUN",
-                        outbound_interface,
-                        std::io::Error::last_os_error()
-                    );
+                    let os_err = std::io::Error::last_os_error();
+                    return Err(anyhow::anyhow!(
+                        "IP_BOUND_IF/IPV6_BOUND_IF to '{}' for direct UDP failed: {}",
+                        outbound_interface, os_err
+                    ));
                 }
             } else {
-                debug!(
-                    "if_nametoindex('{}') failed for direct UDP; datagram may re-enter TUN",
+                return Err(anyhow::anyhow!(
+                    "if_nametoindex('{}') failed for direct UDP: interface not found",
                     outbound_interface
-                );
+                ));
             }
         }
 

@@ -113,6 +113,10 @@ pub struct DnsRouter {
     rules: Vec<CompiledRule>,
     /// Fast lookup: group name → group config.
     groups: HashMap<String, DnsGroup>,
+    /// Physical outbound interface name (e.g. "eth0") used to bind direct-mode
+    /// DNS sockets so that their traffic bypasses the TUN routing table and
+    /// avoids a routing loop when auto_route is active.
+    outbound_interface: Option<String>,
     cache: Arc<Mutex<LruCache<CacheKey, CacheEntry>>>,
     /// Shared TLS client config for DoT (DNS over TLS).
     tls_config: Arc<rustls::ClientConfig>,
@@ -299,6 +303,7 @@ impl DnsRouter {
             doq_tls_config,
             http_client,
             http_proxy_clients,
+            outbound_interface,
         })
     }
 
@@ -587,6 +592,7 @@ impl DnsRouter {
         let sni            = group.sni.clone();
         let payload        = payload.to_vec();
 
+        let outbound_interface = self.outbound_interface.clone();
         let futs: Vec<_> = group
             .servers
             .iter()
@@ -600,10 +606,12 @@ impl DnsRouter {
                 let sni = sni.clone();
                 let p   = payload.clone();
                 let up  = upstream.clone();
+                let oiface = outbound_interface.clone();
                 async move {
                     Self::query_server_static(
                         pc.as_ref(), &tc, &dqc, &hc, hp.as_ref(),
                         &p, &sv, protocol, sni.as_deref(), &up, timeout_duration,
+                        oiface.as_deref(),
                     ).await
                 }
                 .boxed()
@@ -695,6 +703,7 @@ impl DnsRouter {
             group.sni.as_deref(),
             &group.upstream,
             timeout_duration,
+            self.outbound_interface.as_deref(),
         )
         .await
     }
@@ -713,6 +722,7 @@ impl DnsRouter {
         group_sni: Option<&str>,
         upstream: &DnsUpstream,
         timeout_duration: Duration,
+        outbound_interface: Option<&str>,
     ) -> Result<Vec<u8>> {
         match protocol {
             DnsProtocol::Udp => {
@@ -721,7 +731,7 @@ impl DnsRouter {
                     let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
                     Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
                 } else {
-                    Self::query_udp_direct(payload, addr, timeout_duration).await
+                    Self::query_udp_direct(payload, addr, timeout_duration, outbound_interface).await
                 }
             }
             DnsProtocol::Tcp => {
@@ -730,7 +740,7 @@ impl DnsRouter {
                     let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
                     Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
                 } else {
-                    Self::query_tcp_direct(payload, addr, timeout_duration).await
+                    Self::query_tcp_direct(payload, addr, timeout_duration, outbound_interface).await
                 }
             }
             DnsProtocol::Dot => {
@@ -742,7 +752,7 @@ impl DnsRouter {
                         sc.clone(), payload, addr, &sni, tls_config, timeout_duration,
                     ).await
                 } else {
-                    Self::query_dot_direct(payload, addr, &sni, tls_config, timeout_duration).await
+                    Self::query_dot_direct(payload, addr, &sni, tls_config, timeout_duration, outbound_interface).await
                 }
             }
             DnsProtocol::Doh => {
@@ -776,13 +786,52 @@ impl DnsRouter {
         payload: &[u8],
         upstream: SocketAddr,
         timeout_duration: Duration,
+        outbound_interface: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let bind_addr = match upstream {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
+        let bind_addr: std::net::SocketAddr = match upstream {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
 
         let socket = UdpSocket::bind(bind_addr).await?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(iface) = outbound_interface {
+            use std::os::unix::io::AsRawFd;
+            let iface_cstr = std::ffi::CString::new(iface.as_bytes())?;
+            let ret = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    iface_cstr.as_ptr() as *const libc::c_void,
+                    iface_cstr.to_bytes().len() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                return Err(anyhow::anyhow!(
+                    "SO_BINDTODEVICE failed for iface '{}': {}",
+                    iface,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(iface) = outbound_interface {
+            use std::os::unix::io::AsRawFd;
+            let idx = unsafe { libc::if_nametoindex(std::ffi::CString::new(iface.as_bytes())?.as_ptr()) };
+            if idx != 0 {
+                let opt = if upstream.is_ipv6() { libc::IPV6_BOUND_IF } else { libc::IP_BOUND_IF };
+                let level = if upstream.is_ipv6() { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP };
+                unsafe {
+                    libc::setsockopt(socket.as_raw_fd(), level, opt,
+                        &idx as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&idx) as libc::socklen_t);
+                }
+            }
+        }
+
         timeout(timeout_duration, socket.send_to(payload, upstream)).await??;
 
         let mut buf = vec![0u8; 4096];
@@ -799,8 +848,14 @@ impl DnsRouter {
         payload: &[u8],
         upstream: SocketAddr,
         timeout_duration: Duration,
+        outbound_interface: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let mut stream = timeout(timeout_duration, TcpStream::connect(upstream)).await??;
+        let stream = if let Some(iface) = outbound_interface {
+            Self::open_direct_tcp_stream(upstream, iface).await?
+        } else {
+            timeout(timeout_duration, TcpStream::connect(upstream)).await??
+        };
+        let mut stream = stream;
         stream.set_nodelay(true)?;
         send_dns_tcp_framed(&mut stream, payload, timeout_duration).await?;
         recv_dns_tcp_framed(&mut stream, timeout_duration).await
@@ -816,13 +871,18 @@ impl DnsRouter {
         sni: &str,
         tls_config: &Arc<rustls::ClientConfig>,
         timeout_duration: Duration,
+        outbound_interface: Option<&str>,
     ) -> Result<Vec<u8>> {
         use tokio_rustls::TlsConnector;
 
         let server_name = make_server_name(sni)?;
         let connector   = TlsConnector::from(tls_config.clone());
 
-        let tcp_stream = timeout(timeout_duration, TcpStream::connect(upstream)).await??;
+        let tcp_stream = if let Some(iface) = outbound_interface {
+            Self::open_direct_tcp_stream(upstream, iface).await?
+        } else {
+            timeout(timeout_duration, TcpStream::connect(upstream)).await??
+        };
         let mut tls_stream = timeout(
             timeout_duration,
             connector.connect(server_name, tcp_stream),
@@ -967,6 +1027,71 @@ impl DnsRouter {
             return Err(anyhow::anyhow!("DoQ response truncated"));
         }
         Ok(raw[2..2 + resp_len].to_vec())
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct TCP helper — binds to outbound interface when provided
+    // -----------------------------------------------------------------------
+
+    /// Open a TCP connection to `dst`, optionally pinned to `iface` via
+    /// `SO_BINDTODEVICE` (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS).
+    /// This prevents direct-mode DNS sockets from re-entering TUN routing
+    /// when `auto_route` is active.
+    async fn open_direct_tcp_stream(dst: SocketAddr, iface: &str) -> Result<TcpStream> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            use tokio::net::TcpSocket;
+
+            let socket = if dst.is_ipv6() { TcpSocket::new_v6()? } else { TcpSocket::new_v4()? };
+            let iface_cstr = std::ffi::CString::new(iface.as_bytes())?;
+            let ret = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    iface_cstr.as_ptr() as *const libc::c_void,
+                    iface_cstr.to_bytes().len() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                return Err(anyhow::anyhow!(
+                    "SO_BINDTODEVICE({}) failed: {}",
+                    iface,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            return Ok(socket.connect(dst).await?);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            use tokio::net::TcpSocket;
+
+            let socket = if dst.is_ipv6() { TcpSocket::new_v6()? } else { TcpSocket::new_v4()? };
+            let idx = unsafe {
+                libc::if_nametoindex(std::ffi::CString::new(iface.as_bytes())?.as_ptr())
+            };
+            if idx != 0 {
+                let (level, opt) = if dst.is_ipv6() {
+                    (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+                };
+                unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(), level, opt,
+                        &idx as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&idx) as libc::socklen_t,
+                    );
+                }
+            }
+            return Ok(socket.connect(dst).await?);
+        }
+
+        #[allow(unreachable_code)]
+        Ok(TcpStream::connect(dst).await?)
     }
 
     // -----------------------------------------------------------------------

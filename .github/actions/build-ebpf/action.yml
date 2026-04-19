@@ -24,4 +24,5 @@ runs:
     - name: Build eBPF kernel object
       working-directory: ebpf
       shell: bash
-      run: cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release
+      # rust-toolchain.toml in ebpf/ pins nightly; no +nightly flag needed.
+      run: cargo build -Z build-std=core --target bpfel-unknown-none --release

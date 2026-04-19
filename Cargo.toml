@@ -1,9 +1,9 @@
 [package]
 name = "tinytun"
-version = "0.2.0"
+version = "0.0.2"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-description = "A pure eBPF inbound network router with custom routing and SOCKS5 proxy"
+authors = ["tinytun developers <tinytun@v2raya.org>"]
+description = "A tun2socks tool with custom routing and SOCKS5 proxy"
 license = "GPL-3.0-or-later"
 
 [features]
