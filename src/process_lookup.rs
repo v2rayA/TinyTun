@@ -438,8 +438,12 @@ fn windows_find_pid(protocol: TransportProtocol, src: SocketAddr, _dst: SocketAd
         (TransportProtocol::Udp, IpAddr::V4(src_v4)) => {
             windows_udp_pid_v4(src_v4, src.port())
         }
-        // IPv6 flows: fall back to none (IPv4 covers the primary TUN use-case).
-        _ => None,
+        (TransportProtocol::Tcp, IpAddr::V6(src_v6)) => {
+            windows_tcp_pid_v6(src_v6, src.port(), _dst)
+        }
+        (TransportProtocol::Udp, IpAddr::V6(src_v6)) => {
+            windows_udp_pid_v6(src_v6, src.port())
+        }
     }
 }
 
@@ -587,6 +591,160 @@ fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> 
         let pid = u32::from_ne_bytes([row[8], row[9], row[10], row[11]]);
 
         if local_addr == src_ip && local_port == src_port {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Look up the PID for a TCP/IPv6 flow using GetExtendedTcpTable with AF_INET6.
+///
+/// MIB_TCP6ROW_OWNER_PID layout (56 bytes total):
+///   ucLocalAddr[16]     – local IPv6 address (network byte order)
+///   dwLocalScopeId  u32 – scope ID (ignored for matching)
+///   dwLocalPort     u32 – big-endian port in low 2 bytes
+///   ucRemoteAddr[16]    – remote IPv6 address (network byte order)
+///   dwRemoteScopeId u32 – scope ID (ignored for matching)
+///   dwRemotePort    u32 – big-endian port in low 2 bytes
+///   dwState         u32 – connection state (ignored)
+///   dwOwningPid     u32 – owning process ID
+#[cfg(windows)]
+fn windows_tcp_pid_v6(
+    src_ip: std::net::Ipv6Addr,
+    src_port: u16,
+    dst: SocketAddr,
+) -> Option<u32> {
+    const ROW_SIZE: usize = 56;
+    const AF_INET6: u32 = 23;
+    const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    let dst_v6 = match dst.ip() {
+        std::net::IpAddr::V6(v6) => v6,
+        _ => return None,
+    };
+
+    let mut size: u32 = 0;
+    unsafe {
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET6,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+    }
+    if size == 0 {
+        return None;
+    }
+
+    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    let ret = unsafe {
+        GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+            0,
+            AF_INET6,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    if ret != 0 && ret != ERROR_INSUFFICIENT_BUFFER {
+        return None;
+    }
+    if (buf.len() as u32) < size || buf.len() < 4 {
+        return None;
+    }
+
+    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let src_octets: [u8; 16] = src_ip.octets();
+    let dst_octets: [u8; 16] = dst_v6.octets();
+
+    for i in 0..num_entries {
+        let offset = 4 + i * ROW_SIZE;
+        if offset + ROW_SIZE > buf.len() {
+            break;
+        }
+        let row = &buf[offset..offset + ROW_SIZE];
+        // offsets: local_addr[0..16], local_scope[16..20], local_port[20..24],
+        //          remote_addr[24..40], remote_scope[40..44], remote_port[44..48],
+        //          state[48..52], pid[52..56]
+        let local_addr = &row[0..16];
+        let local_port = win_port(u32::from_ne_bytes([row[20], row[21], row[22], row[23]]));
+        let remote_addr = &row[24..40];
+        let remote_port = win_port(u32::from_ne_bytes([row[44], row[45], row[46], row[47]]));
+        let pid = u32::from_ne_bytes([row[52], row[53], row[54], row[55]]);
+
+        if local_addr == src_octets
+            && local_port == src_port
+            && remote_addr == dst_octets
+            && remote_port == dst.port()
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Look up the PID for a UDP/IPv6 flow using GetExtendedUdpTable with AF_INET6.
+///
+/// MIB_UDP6ROW_OWNER_PID layout (28 bytes total):
+///   ucLocalAddr[16]     – local IPv6 address (network byte order)
+///   dwLocalScopeId  u32 – scope ID (ignored)
+///   dwLocalPort     u32 – big-endian port in low 2 bytes
+///   dwOwningPid     u32 – owning process ID
+#[cfg(windows)]
+fn windows_udp_pid_v6(src_ip: std::net::Ipv6Addr, src_port: u16) -> Option<u32> {
+    const ROW_SIZE: usize = 28;
+    const AF_INET6: u32 = 23;
+    const UDP_TABLE_OWNER_PID: u32 = 1;
+
+    let mut size: u32 = 0;
+    unsafe {
+        GetExtendedUdpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET6,
+            UDP_TABLE_OWNER_PID,
+            0,
+        );
+    }
+    if size == 0 {
+        return None;
+    }
+
+    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    let ret = unsafe {
+        GetExtendedUdpTable(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+            0,
+            AF_INET6,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
+    };
+    if ret != 0 || buf.len() < 4 {
+        return None;
+    }
+
+    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let src_octets: [u8; 16] = src_ip.octets();
+
+    for i in 0..num_entries {
+        let offset = 4 + i * ROW_SIZE;
+        if offset + ROW_SIZE > buf.len() {
+            break;
+        }
+        let row = &buf[offset..offset + ROW_SIZE];
+        // offsets: local_addr[0..16], local_scope[16..20], local_port[20..24], pid[24..28]
+        let local_addr = &row[0..16];
+        let local_port = win_port(u32::from_ne_bytes([row[20], row[21], row[22], row[23]]));
+        let pid = u32::from_ne_bytes([row[24], row[25], row[26], row[27]]);
+
+        if local_addr == src_octets && local_port == src_port {
             return Some(pid);
         }
     }

@@ -504,10 +504,12 @@ impl PacketProcessor {
         };
         if is_direct_flow {
             // ── Preferred path: transparent direct proxy via physical NIC ──────
-            // Accept the SYN and proxy the TCP connection directly to the
-            // destination via SO_BINDTODEVICE.  The TUN session mirrors the
-            // SOCKS5 path — no RST, no reconnect, no interruption visible to
-            // the application.
+            // Socket-level interface binding (SO_BINDTODEVICE on Linux,
+            // IP_BOUND_IF on macOS) is only available on those two platforms.
+            // On Windows, FreeBSD, etc. this entire block is excluded at
+            // compile time and execution falls through to the route-based
+            // bypass below, which installs a /32 host route and sends RST.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(iface) = self.outbound_interface.clone() {
                 {
                     let mut pending = self.pending_connections.lock().await;
@@ -635,12 +637,12 @@ impl PacketProcessor {
                 return Ok(());
             }
 
-            // ── Fallback: no outbound interface ───────────────────────────────
+            // ── Fallback: no outbound interface, or interface binding not ─────
+            // ── supported on this platform (Windows, FreeBSD, …)  ────────────
             if is_static_bypass {
-                // Static bypass IP arrived at TUN but no physical interface is
-                // configured for direct forwarding.  The routing table should
-                // already route this IP around TUN; RST so the app fails fast
-                // rather than hanging indefinitely.
+                // Static bypass IP arrived at TUN but direct forwarding is
+                // unavailable.  The routing table should already route this IP
+                // around TUN; RST so the app fails fast rather than hanging.
                 let _ = self
                     .inject_tcp_control_packet(
                         &flow_key,
@@ -957,9 +959,10 @@ impl PacketProcessor {
 
         if is_direct_flow {
             // ── Preferred path: direct UDP exchange via physical NIC ───────────
-            // Relay the datagram through a socket bound to the physical interface
-            // and inject the response back to TUN. The application never sees a
-            // dropped packet, so no connection is interrupted.
+            // Socket-level interface binding is only available on Linux/macOS.
+            // On other platforms this block is excluded at compile time and
+            // execution falls through to the route-based bypass below.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(iface) = self.outbound_interface.clone() {
                 let udp_permit = match self.udp_task_limiter.clone().try_acquire_owned() {
                     Ok(permit) => permit,
@@ -1039,7 +1042,7 @@ impl PacketProcessor {
                 return Ok(());
             }
 
-            // ── Fallback: no outbound interface ───────────────────────────────
+            // ── Fallback: no outbound interface or unsupported platform ─────────
             if is_static_bypass {
                 debug!(
                     "Static bypass UDP {}:{} -> {}:{}: dropped (no outbound interface configured)",
@@ -1728,17 +1731,15 @@ impl PacketProcessor {
             }
         }
 
-        // Interface binding is not supported on this platform.
-        // A plain connect may re-enter TUN if the routing table sends this
-        // destination through the TUN device.
-        warn!(
-            "direct TCP: interface binding not supported on this platform; \
-             socket to {} will use default routing (may re-enter TUN)",
-            dst
-        );
-        let stream = tokio::net::TcpStream::connect(dst).await?;
-        stream.set_nodelay(true)?;
-        Ok(stream)
+        // Neither the Linux nor the macOS cfg block applies here.  This
+        // platform does not support socket-level interface binding.
+        // Call sites should be gated with #[cfg(any(linux, macos))]; this
+        // Err acts as a safety net for any future unconstrained call sites.
+        Err(anyhow::anyhow!(
+            "direct TCP: socket-level interface binding is not supported on \
+             this platform (Linux requires SO_BINDTODEVICE, macOS requires \
+             IP_BOUND_IF); configure auto_route for excluded-process bypass"
+        ))
     }
 
     /// Send a single UDP datagram directly to `dst` via the physical outbound
@@ -1825,11 +1826,28 @@ impl PacketProcessor {
             }
         }
 
+        // Same safety net as open_direct_tcp: platforms that reach this point
+        // have no interface binding, so return Err rather than doing a plain
+        // connect that may re-enter the TUN device.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (&dst, &payload, &outbound_interface);
+            return Err(anyhow::anyhow!(
+                "direct UDP: socket-level interface binding is not supported on this platform"
+            ));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         socket.connect(dst).await?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         socket.send(&payload).await?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let mut buf = vec![0u8; 65535];
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let n = socket.recv(&mut buf).await?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         buf.truncate(n);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Ok(buf)
     }
 
