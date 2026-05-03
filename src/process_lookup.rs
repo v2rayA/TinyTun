@@ -154,6 +154,9 @@ fn netlink_find_pid(
     // idiag_if = 0, idiag_cookie = INET_DIAG_NOCOOKIE
 
     // ── Open netlink socket and send ─────────────────────────────────────────
+    // SAFETY: `libc::socket()` is a FFI call that returns a raw file descriptor.
+    // All arguments are valid constants; `SOCK_CLOEXEC` is safe and prevents fd leaks.
+    // The return value is checked (< 0) to detect errors before any use.
     let fd = unsafe {
         libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_INET_DIAG)
     };
@@ -162,10 +165,16 @@ fn netlink_find_pid(
     }
     struct SocketGuard(libc::c_int);
     impl Drop for SocketGuard {
+        // SAFETY: `self.0` is a valid file descriptor from `libc::socket()` above.
+        // `SocketGuard` is not `Clone`, ensuring `close()` is called exactly once.
+        // No other code holds a reference to this fd at drop time.
         fn drop(&mut self) { unsafe { libc::close(self.0); } }
     }
     let _guard = SocketGuard(fd);
 
+    // SAFETY: `fd` is a valid netlink socket. `buf.as_ptr()` points to a valid,
+    // initialized buffer of `buf.len()` bytes. `libc::send()` only reads from the
+    // buffer; no concurrent writes occur. Return value is checked for errors.
     let sent = unsafe {
         libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0)
     };
@@ -190,6 +199,9 @@ fn netlink_find_pid(
     const RESP_BUF_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_MSG_LEN;
 
     let mut resp = [0u8; 512];
+    // SAFETY: `fd` is a valid netlink socket. `resp.as_mut_ptr()` points to a valid,
+    // properly aligned buffer of `resp.len()` bytes. `libc::recv()` writes into this
+    // buffer; no other thread reads from `resp` concurrently. Return value is checked.
     let rcvd = unsafe {
         libc::recv(fd, resp.as_mut_ptr() as *mut libc::c_void, resp.len(), 0)
     };
@@ -404,6 +416,10 @@ fn bsd_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -
 // Replaces the previous `netstat -ano` subprocess approach. Using the kernel
 // API directly is O(1) per query and avoids spawning a child process for every
 // process lookup, which was O(flows/second) subprocess launches under load.
+//
+// Memory management uses RAII wrappers (HeapBuffer, ProcessHandle) to ensure
+// that heap-allocated buffers and kernel handles are always freed, even on
+// error paths.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
@@ -426,6 +442,135 @@ extern "system" {
         table_class: u32,
         reserved: u32,
     ) -> u32;
+}
+
+// ── RAII wrapper for Windows heap-allocated memory ──────────────────────────
+//
+// `HeapBuffer` owns a block of memory allocated via `HeapAlloc`. The memory is
+// automatically freed via `HeapFree` when the `HeapBuffer` is dropped, ensuring
+// no leaks on error paths. This replaces the previous manual `HeapAlloc`/`HeapFree`
+// pairs that were vulnerable to early-return leaks.
+
+/// RAII wrapper for a Windows heap-allocated buffer.
+///
+/// The buffer is allocated with `HEAP_ZERO_MEMORY` and freed on drop.
+/// This eliminates manual `HeapFree` calls and prevents memory leaks on
+/// error return paths.
+#[cfg(windows)]
+struct HeapBuffer {
+    ptr: *mut std::ffi::c_void,
+    size: usize,
+}
+
+// SAFETY: `HeapBuffer` owns a heap allocation that is only accessed through
+// `&self` or `&mut self` references. There is no shared mutable aliasing.
+// `HeapAlloc`/`HeapFree` are thread-safe (the process heap is synchronized).
+#[cfg(windows)]
+unsafe impl Send for HeapBuffer {}
+#[cfg(windows)]
+unsafe impl Sync for HeapBuffer {}
+
+#[cfg(windows)]
+impl HeapBuffer {
+    /// Allocate a zero-initialized heap buffer of the given size.
+    ///
+    /// Returns `None` if allocation fails (e.g., out of memory).
+    fn allocate(size: usize) -> Option<Self> {
+        // SAFETY: `GetProcessHeap()` returns the default process heap, which is always
+        // available. `HeapAlloc` with `HEAP_ZERO_MEMORY` zero-initializes the buffer.
+        // The returned pointer is checked for null to detect allocation failure.
+        let ptr = unsafe {
+            windows::Win32::System::Memory::HeapAlloc(
+                windows::Win32::System::Memory::GetProcessHeap(),
+                windows::Win32::System::Memory::HEAP_ZERO_MEMORY,
+                size,
+            )
+        };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr, size })
+        }
+    }
+
+    /// Return a const pointer to the buffer.
+    fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.ptr
+    }
+
+    /// Return a mutable pointer to the buffer.
+    fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+
+    /// Return the allocated size in bytes.
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeapBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was allocated by `HeapAlloc` on the process heap.
+        // `HeapFree` is the correct deallocation function. `HEAP_NO_SERIALIZE` is safe
+        // because no other thread is concurrently freeing this same pointer (each
+        // `HeapBuffer` owns a unique allocation). The process heap remains valid for
+        // the entire lifetime of the process.
+        unsafe {
+            windows::Win32::System::Memory::HeapFree(
+                windows::Win32::System::Memory::GetProcessHeap(),
+                windows::Win32::System::Memory::HEAP_NO_SERIALIZE,
+                self.ptr,
+            );
+        }
+    }
+}
+
+// ── RAII wrapper for a Windows kernel handle ────────────────────────────────
+//
+// `ProcessHandle` owns a `HANDLE` returned by `OpenProcess`. The handle is
+// automatically closed via `CloseHandle` on drop, preventing handle leaks.
+
+/// RAII wrapper for a Windows process handle (`HANDLE` from `OpenProcess`).
+///
+/// The handle is automatically closed via `CloseHandle` when the wrapper is
+/// dropped, preventing handle leaks on error paths.
+#[cfg(windows)]
+struct ProcessHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ProcessHandle {
+    /// Wrap an existing handle. The caller must ensure the handle is valid.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid handle returned by `OpenProcess` (or similar),
+    /// or `HANDLE::default()` (which represents an invalid handle). The handle
+    /// must not be closed elsewhere while this `ProcessHandle` is alive.
+    unsafe fn new(handle: windows::Win32::Foundation::HANDLE) -> Self {
+        Self(handle)
+    }
+
+    /// Return a reference to the inner `HANDLE`.
+    fn as_raw(&self) -> &windows::Win32::Foundation::HANDLE {
+        &self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid handle obtained from `OpenProcess` (or
+        // `HANDLE::default()` if opening failed). `CloseHandle` is the correct
+        // function to close it. Each `ProcessHandle` owns exactly one handle,
+        // so no double-close can occur.
+        if !self.0.is_invalid() {
+            unsafe {
+                windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -478,6 +623,9 @@ fn windows_tcp_pid_v4(
 
     let mut size: u32 = 0;
     // First call to get required buffer size.
+    // SAFETY: `GetExtendedTcpTable` with `null_mut()` is the documented way to query
+    // the required buffer size. `&mut size` is a valid pointer to a `u32`. The function
+    // only writes to `size`; no data races occur as this is the only thread accessing it.
     unsafe {
         GetExtendedTcpTable(
             std::ptr::null_mut(),
@@ -492,7 +640,14 @@ fn windows_tcp_pid_v4(
         return None;
     }
 
-    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    // Allocate a heap buffer via the RAII wrapper. The buffer is automatically freed
+    // when `HeapBuffer` is dropped, eliminating manual `HeapFree` calls on all paths.
+    let mut buf = HeapBuffer::allocate(size as usize)?;
+
+    // SAFETY: `buf.as_mut_ptr()` points to a valid, properly sized heap buffer of
+    // `size` bytes, zero-initialized by `HeapBuffer::allocate`. `GetExtendedTcpTable`
+    // writes into this buffer; no other thread reads from `buf` concurrently.
+    // The return value is checked (0 = ERROR_SUCCESS) before using the data.
     let ret = unsafe {
         GetExtendedTcpTable(
             buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -505,29 +660,62 @@ fn windows_tcp_pid_v4(
     };
     // 0 = ERROR_SUCCESS
     if ret != 0 && ret != ERROR_INSUFFICIENT_BUFFER {
-        return None;
-    }
-    if (buf.len() as u32) < size || buf.len() < 4 {
-        return None;
+        return None; // HeapBuffer::drop 自动释放堆内存
     }
 
-    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // ── Bounds check: validate that `dwNumEntries` does not exceed the buffer ──
+    // The MIB_TCPTABLE header is just `dwNumEntries` (u32 = 4 bytes).
+    // Each entry is `ROW_SIZE` bytes. Compute the maximum number of entries
+    // that fit in the allocated buffer and reject if the kernel reports more.
+    let header_size = std::mem::size_of::<u32>();
+    if buf.size() < header_size {
+        return None;
+    }
+    let max_entries = buf.size().saturating_sub(header_size) / ROW_SIZE;
+    // SAFETY: `buf.as_ptr()` points to a valid, zero-initialized heap buffer of
+    // at least `header_size` bytes. Reading the first 4 bytes as `u32` is safe
+    // because the buffer was allocated with at least `size` bytes (checked above).
+    let num_entries = unsafe {
+        let ptr = buf.as_ptr() as *const u32;
+        std::ptr::read_unaligned(ptr)
+    };
+    if num_entries as usize > max_entries {
+        return None; // 边界检查失败，防止越界读取
+    }
+
     let dst_v4 = match dst.ip() {
         std::net::IpAddr::V4(v4) => v4,
         _ => return None,
     };
 
-    for i in 0..num_entries {
-        let offset = 4 + i * ROW_SIZE;
-        if offset + ROW_SIZE > buf.len() {
-            break;
-        }
-        let row = &buf[offset..offset + ROW_SIZE];
-        let local_addr = win_ipv4(u32::from_ne_bytes([row[4], row[5], row[6], row[7]]));
-        let local_port = win_port(u32::from_ne_bytes([row[8], row[9], row[10], row[11]]));
-        let remote_addr = win_ipv4(u32::from_ne_bytes([row[12], row[13], row[14], row[15]]));
-        let remote_port = win_port(u32::from_ne_bytes([row[16], row[17], row[18], row[19]]));
-        let pid = u32::from_ne_bytes([row[20], row[21], row[22], row[23]]);
+    // SAFETY: `buf.as_ptr()` points to a valid heap buffer of `buf.size()` bytes.
+    // The iteration is bounded by `num_entries` which was validated against
+    // `max_entries` above, ensuring `offset + ROW_SIZE` never exceeds the buffer.
+    for i in 0..num_entries as usize {
+        let offset = header_size + i * ROW_SIZE;
+        // SAFETY: `offset + ROW_SIZE <= buf.size()` is guaranteed by the bounds check above.
+        let ptr = unsafe { (buf.as_ptr() as *const u8).add(offset) };
+        // SAFETY: Each field read uses `read_unaligned` because the heap buffer
+        // may not satisfy the alignment requirements of `u32`.
+        let local_addr = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(4) as *const u32);
+            win_ipv4(dw)
+        };
+        let local_port = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(8) as *const u32);
+            win_port(dw)
+        };
+        let remote_addr = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(12) as *const u32);
+            win_ipv4(dw)
+        };
+        let remote_port = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(16) as *const u32);
+            win_port(dw)
+        };
+        let pid = unsafe {
+            std::ptr::read_unaligned(ptr.add(20) as *const u32)
+        };
 
         if local_addr == src_ip
             && local_port == src_port
@@ -538,6 +726,7 @@ fn windows_tcp_pid_v4(
         }
     }
     None
+    // HeapBuffer::drop 自动释放堆内存
 }
 
 #[cfg(windows)]
@@ -549,6 +738,8 @@ fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> 
     const UDP_TABLE_OWNER_PID: u32 = 1;
 
     let mut size: u32 = 0;
+    // SAFETY: Same pattern as `GetExtendedTcpTable` — query buffer size with null pointer.
+    // `&mut size` is a valid pointer. No concurrent access to `size`.
     unsafe {
         GetExtendedUdpTable(
             std::ptr::null_mut(),
@@ -563,7 +754,13 @@ fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> 
         return None;
     }
 
-    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    // Allocate a heap buffer via the RAII wrapper. The buffer is automatically freed
+    // when `HeapBuffer` is dropped, eliminating manual `HeapFree` calls on all paths.
+    let mut buf = HeapBuffer::allocate(size as usize)?;
+
+    // SAFETY: `buf.as_mut_ptr()` points to a valid buffer of `size` bytes.
+    // `GetExtendedUdpTable` writes into this buffer; no concurrent reads.
+    // Return value is checked (0 = success) and buffer bounds are validated.
     let ret = unsafe {
         GetExtendedUdpTable(
             buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -574,27 +771,53 @@ fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> 
             0,
         )
     };
-    if ret != 0 || buf.len() < 4 {
-        return None;
+    if ret != 0 {
+        return None; // HeapBuffer::drop 自动释放堆内存
     }
 
-    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // ── Bounds check: validate that `dwNumEntries` does not exceed the buffer ──
+    let header_size = std::mem::size_of::<u32>();
+    if buf.size() < header_size {
+        return None;
+    }
+    let max_entries = buf.size().saturating_sub(header_size) / ROW_SIZE;
+    // SAFETY: `buf.as_ptr()` points to a valid, zero-initialized heap buffer of
+    // at least `header_size` bytes. Reading the first 4 bytes as `u32` is safe.
+    let num_entries = unsafe {
+        let ptr = buf.as_ptr() as *const u32;
+        std::ptr::read_unaligned(ptr)
+    };
+    if num_entries as usize > max_entries {
+        return None; // 边界检查失败，防止越界读取
+    }
 
-    for i in 0..num_entries {
-        let offset = 4 + i * ROW_SIZE;
-        if offset + ROW_SIZE > buf.len() {
-            break;
-        }
-        let row = &buf[offset..offset + ROW_SIZE];
-        let local_addr = win_ipv4(u32::from_ne_bytes([row[0], row[1], row[2], row[3]]));
-        let local_port = win_port(u32::from_ne_bytes([row[4], row[5], row[6], row[7]]));
-        let pid = u32::from_ne_bytes([row[8], row[9], row[10], row[11]]);
+    // SAFETY: `buf.as_ptr()` points to a valid heap buffer of `buf.size()` bytes.
+    // The iteration is bounded by `num_entries` which was validated against
+    // `max_entries` above, ensuring `offset + ROW_SIZE` never exceeds the buffer.
+    for i in 0..num_entries as usize {
+        let offset = header_size + i * ROW_SIZE;
+        // SAFETY: `offset + ROW_SIZE <= buf.size()` is guaranteed by the bounds check above.
+        let ptr = unsafe { (buf.as_ptr() as *const u8).add(offset) };
+        // SAFETY: Each field read uses `read_unaligned` because the heap buffer
+        // may not satisfy the alignment requirements of `u32`.
+        let local_addr = unsafe {
+            let dw = std::ptr::read_unaligned(ptr as *const u32);
+            win_ipv4(dw)
+        };
+        let local_port = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(4) as *const u32);
+            win_port(dw)
+        };
+        let pid = unsafe {
+            std::ptr::read_unaligned(ptr.add(8) as *const u32)
+        };
 
         if local_addr == src_ip && local_port == src_port {
             return Some(pid);
         }
     }
     None
+    // HeapBuffer::drop 自动释放堆内存
 }
 
 /// Look up the PID for a TCP/IPv6 flow using GetExtendedTcpTable with AF_INET6.
@@ -625,6 +848,8 @@ fn windows_tcp_pid_v6(
     };
 
     let mut size: u32 = 0;
+    // SAFETY: Same two-call pattern as v4 variant. First call with null pointer queries
+    // required buffer size. `&mut size` is a valid pointer. No concurrent access.
     unsafe {
         GetExtendedTcpTable(
             std::ptr::null_mut(),
@@ -639,7 +864,13 @@ fn windows_tcp_pid_v6(
         return None;
     }
 
-    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    // Allocate a heap buffer via the RAII wrapper. The buffer is automatically freed
+    // when `HeapBuffer` is dropped, eliminating manual `HeapFree` calls on all paths.
+    let mut buf = HeapBuffer::allocate(size as usize)?;
+
+    // SAFETY: `buf.as_mut_ptr()` points to a valid buffer of `size` bytes.
+    // `GetExtendedTcpTable` writes into this buffer; no concurrent reads.
+    // Return value is checked and buffer bounds are validated before iteration.
     let ret = unsafe {
         GetExtendedTcpTable(
             buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -651,30 +882,53 @@ fn windows_tcp_pid_v6(
         )
     };
     if ret != 0 && ret != ERROR_INSUFFICIENT_BUFFER {
-        return None;
-    }
-    if (buf.len() as u32) < size || buf.len() < 4 {
-        return None;
+        return None; // HeapBuffer::drop 自动释放堆内存
     }
 
-    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // ── Bounds check: validate that `dwNumEntries` does not exceed the buffer ──
+    let header_size = std::mem::size_of::<u32>();
+    if buf.size() < header_size {
+        return None;
+    }
+    let max_entries = buf.size().saturating_sub(header_size) / ROW_SIZE;
+    // SAFETY: `buf.as_ptr()` points to a valid, zero-initialized heap buffer of
+    // at least `header_size` bytes. Reading the first 4 bytes as `u32` is safe.
+    let num_entries = unsafe {
+        let ptr = buf.as_ptr() as *const u32;
+        std::ptr::read_unaligned(ptr)
+    };
+    if num_entries as usize > max_entries {
+        return None; // 边界检查失败，防止越界读取
+    }
+
     let src_octets: [u8; 16] = src_ip.octets();
     let dst_octets: [u8; 16] = dst_v6.octets();
 
-    for i in 0..num_entries {
-        let offset = 4 + i * ROW_SIZE;
-        if offset + ROW_SIZE > buf.len() {
-            break;
-        }
-        let row = &buf[offset..offset + ROW_SIZE];
+    // SAFETY: `buf.as_ptr()` points to a valid heap buffer of `buf.size()` bytes.
+    // The iteration is bounded by `num_entries` which was validated against
+    // `max_entries` above, ensuring `offset + ROW_SIZE` never exceeds the buffer.
+    for i in 0..num_entries as usize {
+        let offset = header_size + i * ROW_SIZE;
+        // SAFETY: `offset + ROW_SIZE <= buf.size()` is guaranteed by the bounds check above.
+        let ptr = unsafe { (buf.as_ptr() as *const u8).add(offset) };
         // offsets: local_addr[0..16], local_scope[16..20], local_port[20..24],
         //          remote_addr[24..40], remote_scope[40..44], remote_port[44..48],
         //          state[48..52], pid[52..56]
-        let local_addr = &row[0..16];
-        let local_port = win_port(u32::from_ne_bytes([row[20], row[21], row[22], row[23]]));
-        let remote_addr = &row[24..40];
-        let remote_port = win_port(u32::from_ne_bytes([row[44], row[45], row[46], row[47]]));
-        let pid = u32::from_ne_bytes([row[52], row[53], row[54], row[55]]);
+        // SAFETY: Each field read uses `read_unaligned` because the heap buffer
+        // may not satisfy the alignment requirements of `u32`.
+        let local_addr = unsafe { std::slice::from_raw_parts(ptr, 16) };
+        let local_port = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(20) as *const u32);
+            win_port(dw)
+        };
+        let remote_addr = unsafe { std::slice::from_raw_parts(ptr.add(24), 16) };
+        let remote_port = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(44) as *const u32);
+            win_port(dw)
+        };
+        let pid = unsafe {
+            std::ptr::read_unaligned(ptr.add(52) as *const u32)
+        };
 
         if local_addr == src_octets
             && local_port == src_port
@@ -685,6 +939,7 @@ fn windows_tcp_pid_v6(
         }
     }
     None
+    // HeapBuffer::drop 自动释放堆内存
 }
 
 /// Look up the PID for a UDP/IPv6 flow using GetExtendedUdpTable with AF_INET6.
@@ -701,6 +956,8 @@ fn windows_udp_pid_v6(src_ip: std::net::Ipv6Addr, src_port: u16) -> Option<u32> 
     const UDP_TABLE_OWNER_PID: u32 = 1;
 
     let mut size: u32 = 0;
+    // SAFETY: Same two-call pattern. First call queries buffer size with null pointer.
+    // `&mut size` is a valid pointer; no concurrent access.
     unsafe {
         GetExtendedUdpTable(
             std::ptr::null_mut(),
@@ -715,7 +972,13 @@ fn windows_udp_pid_v6(src_ip: std::net::Ipv6Addr, src_port: u16) -> Option<u32> 
         return None;
     }
 
-    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    // Allocate a heap buffer via the RAII wrapper. The buffer is automatically freed
+    // when `HeapBuffer` is dropped, eliminating manual `HeapFree` calls on all paths.
+    let mut buf = HeapBuffer::allocate(size as usize)?;
+
+    // SAFETY: `buf.as_mut_ptr()` points to a valid buffer of `size` bytes.
+    // `GetExtendedUdpTable` writes into this buffer; no concurrent reads.
+    // Return value is checked and buffer bounds are validated before iteration.
     let ret = unsafe {
         GetExtendedUdpTable(
             buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -726,34 +989,59 @@ fn windows_udp_pid_v6(src_ip: std::net::Ipv6Addr, src_port: u16) -> Option<u32> 
             0,
         )
     };
-    if ret != 0 || buf.len() < 4 {
-        return None;
+    if ret != 0 {
+        return None; // HeapBuffer::drop 自动释放堆内存
     }
 
-    let num_entries = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // ── Bounds check: validate that `dwNumEntries` does not exceed the buffer ──
+    let header_size = std::mem::size_of::<u32>();
+    if buf.size() < header_size {
+        return None;
+    }
+    let max_entries = buf.size().saturating_sub(header_size) / ROW_SIZE;
+    // SAFETY: `buf.as_ptr()` points to a valid, zero-initialized heap buffer of
+    // at least `header_size` bytes. Reading the first 4 bytes as `u32` is safe.
+    let num_entries = unsafe {
+        let ptr = buf.as_ptr() as *const u32;
+        std::ptr::read_unaligned(ptr)
+    };
+    if num_entries as usize > max_entries {
+        return None; // 边界检查失败，防止越界读取
+    }
+
     let src_octets: [u8; 16] = src_ip.octets();
 
-    for i in 0..num_entries {
-        let offset = 4 + i * ROW_SIZE;
-        if offset + ROW_SIZE > buf.len() {
-            break;
-        }
-        let row = &buf[offset..offset + ROW_SIZE];
+    // SAFETY: `buf.as_ptr()` points to a valid heap buffer of `buf.size()` bytes.
+    // The iteration is bounded by `num_entries` which was validated against
+    // `max_entries` above, ensuring `offset + ROW_SIZE` never exceeds the buffer.
+    for i in 0..num_entries as usize {
+        let offset = header_size + i * ROW_SIZE;
+        // SAFETY: `offset + ROW_SIZE <= buf.size()` is guaranteed by the bounds check above.
+        let ptr = unsafe { (buf.as_ptr() as *const u8).add(offset) };
         // offsets: local_addr[0..16], local_scope[16..20], local_port[20..24], pid[24..28]
-        let local_addr = &row[0..16];
-        let local_port = win_port(u32::from_ne_bytes([row[20], row[21], row[22], row[23]]));
-        let pid = u32::from_ne_bytes([row[24], row[25], row[26], row[27]]);
+        // SAFETY: Each field read uses `read_unaligned` because the heap buffer
+        // may not satisfy the alignment requirements of `u32`.
+        let local_addr = unsafe { std::slice::from_raw_parts(ptr, 16) };
+        let local_port = unsafe {
+            let dw = std::ptr::read_unaligned(ptr.add(20) as *const u32);
+            win_port(dw)
+        };
+        let pid = unsafe {
+            std::ptr::read_unaligned(ptr.add(24) as *const u32)
+        };
 
         if local_addr == src_octets && local_port == src_port {
             return Some(pid);
         }
     }
     None
+    // HeapBuffer::drop 自动释放堆内存
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Process name lookup
 // On FreeBSD: sysctl(KERN_PROC_PID) via libc (no libkvm/libprocstat needed)
+// On Windows: OpenProcess + QueryFullProcessImageNameW via the windows crate
 // Everywhere else: sysinfo
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -765,6 +1053,12 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     use libc::{c_int, kinfo_proc, sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PID};
     use std::{ffi::CStr, mem};
 
+    // SAFETY: `sysctl` is a FFI call. `mib` is a properly initialized array of 4 `c_int` values.
+    // `&mut info` is a valid, properly aligned pointer to a zero-initialized `kinfo_proc` struct.
+    // `len` is set to the correct size of the struct. `sysctl` writes into `info`; no concurrent
+    // access occurs. Return value is checked (0 = success) before using the data.
+    // `info.ki_comm` is a fixed-size C char array; `CStr::from_ptr` is safe because the array
+    // is guaranteed to be NUL-terminated by the kernel.
     let name = unsafe {
         let mut mib: [c_int; 4] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid as c_int];
         let mut info: kinfo_proc = mem::zeroed();
@@ -792,8 +1086,61 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// All other platforms: resolve process name from PID via sysinfo.
-#[cfg(not(target_os = "freebsd"))]
+/// Windows: resolve process name from PID using `OpenProcess` +
+/// `QueryFullProcessImageNameW`. The process handle is managed by the
+/// `ProcessHandle` RAII wrapper, ensuring `CloseHandle` is always called.
+#[cfg(windows)]
+fn process_name_from_pid(pid: u32) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: `OpenProcess` is a FFI call with valid parameters.
+    // `PROCESS_QUERY_LIMITED_INFORMATION` is the minimal access right needed for
+    // `QueryFullProcessImageNameW`. The returned handle is wrapped in `ProcessHandle`
+    // to ensure it is closed on all paths. A null handle (failure) is handled by
+    // `ProcessHandle::drop` which checks `is_invalid()`.
+    let handle = unsafe {
+        ProcessHandle::new(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        ))
+    };
+    if handle.as_raw().is_invalid() {
+        return None;
+    }
+
+    // SAFETY: `handle` is a valid process handle (checked above).
+    // `QueryFullProcessImageNameW` writes the process image path into `buf`.
+    // The buffer size is passed as `&mut size` and updated by the function.
+    // The return value is checked (nonzero = success) before using the data.
+    let name = unsafe {
+        let mut buf: [u16; 260] = [0u16; 260]; // MAX_PATH
+        let mut size: u32 = buf.len() as u32;
+        let ret = windows::Win32::System::ProcessStatus::QueryFullProcessImageNameW(
+            *handle.as_raw(),
+            windows::Win32::System::ProcessStatus::PROCESS_NAME_WIN32,
+            &mut buf,
+            &mut size,
+        );
+        if ret.as_bool() {
+            let slice = &buf[..size as usize];
+            OsString::from_wide(slice).to_string_lossy().into_owned()
+        } else {
+            return None;
+        }
+    };
+
+    let name = name.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+    // ProcessHandle::drop 自动调用 CloseHandle
+}
+
+/// All other platforms (Linux, macOS): resolve process name from PID via sysinfo.
+#[cfg(not(any(target_os = "freebsd", windows)))]
 fn process_name_from_pid(pid: u32) -> Option<String> {
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),

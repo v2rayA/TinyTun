@@ -4,6 +4,7 @@ mod tun_device;
 mod socks5_client;
 mod dns_router;
 mod geosite;
+mod packet;
 mod packet_processor;
 mod route_manager;
 mod process_lookup;
@@ -504,8 +505,7 @@ async fn run_proxy(config: Config) -> Result<()> {
 
                                 let apply_result = if apply_result.is_ok() {
                                     let dynamic_targets: Vec<std::net::IpAddr> = {
-                                        let guard = dynamic_bypass_ips_handle.lock().await;
-                                        guard.keys().copied().collect()
+                                        dynamic_bypass_ips_handle.iter().map(|entry| *entry.key()).collect()
                                     };
 
                                     if dynamic_targets.is_empty() {
@@ -645,8 +645,7 @@ async fn run_proxy(config: Config) -> Result<()> {
 
     if config.tun.auto_route {
         let dynamic_targets: Vec<std::net::IpAddr> = {
-            let guard = dynamic_bypass_ips_handle.lock().await;
-            guard.keys().copied().collect()
+            dynamic_bypass_ips_handle.iter().map(|entry| *entry.key()).collect()
         };
         if !dynamic_targets.is_empty() {
             if let Err(err) = route_manager::cleanup_skip_ip_routes(&dynamic_targets) {

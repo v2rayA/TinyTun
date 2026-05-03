@@ -43,6 +43,9 @@ quinn = { version = "0.11", features = ["ring", "runtime-tokio"] }
 lru = "0.12"
 regex = "1"
 
+# Concurrent hashmap/set (lock-free sharded)
+dashmap = "6"
+
 # Configuration and utilities
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -65,6 +68,9 @@ ipconfig = "0.3"
 windows = { version = "0.61", features = [
 	"Win32_Foundation",
 	"Win32_System_Com",
+	"Win32_System_Memory",
+	"Win32_System_Threading",
+	"Win32_System_ProcessStatus",
 	"Win32_NetworkManagement_WindowsFirewall",
 ] }
 

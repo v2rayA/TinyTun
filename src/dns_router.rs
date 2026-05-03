@@ -14,7 +14,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use log::{debug, warn};
 use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,9 +21,12 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use crate::common::error::TinyTunError;
 use crate::config::{Config, DnsConfig, DnsGroup, DnsMatcher, DnsProtocol, DnsQueryStrategy, DnsUpstream};
 use crate::geosite::{DomainType, GeositeDb};
 use crate::socks5_client::Socks5Client;
+
+type Result<T> = std::result::Result<T, TinyTunError>;
 
 // ---------------------------------------------------------------------------
 // Cache types
@@ -257,7 +259,7 @@ impl DnsRouter {
             .use_rustls_tls()
             .https_only(true)
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build DoH HTTP client: {e}"))?;
+            .map_err(|e| TinyTunError::Dns(format!("Failed to build DoH HTTP client: {e}")))?;
 
         // Build named SOCKS5 clients for every configured proxy.
         let proxy_clients: HashMap<String, Socks5Client> = app_config
@@ -278,13 +280,13 @@ impl DnsRouter {
                 let client = if let Some(sc) = proxy_clients.get(pname) {
                     let proxy_url = sc.proxy_socks5h_url();
                     let proxy = reqwest::Proxy::all(&proxy_url)
-                        .map_err(|e| anyhow::anyhow!("Invalid SOCKS5 proxy URL '{proxy_url}' for proxy '{pname}': {e}"))?;
+                        .map_err(|e| TinyTunError::Dns(format!("Invalid SOCKS5 proxy URL '{proxy_url}' for proxy '{pname}': {e}")))?;
                     reqwest::Client::builder()
                         .use_rustls_tls()
                         .https_only(true)
                         .proxy(proxy)
                         .build()
-                        .map_err(|e| anyhow::anyhow!("Failed to build DoH HTTP client for proxy '{pname}': {e}"))?
+                        .map_err(|e| TinyTunError::Dns(format!("Failed to build DoH HTTP client for proxy '{pname}': {e}")))?
                 } else {
                     warn!("DNS group '{}' references unknown proxy '{}' for DoH; will use direct", group.name, pname);
                     continue;
@@ -389,16 +391,16 @@ impl DnsRouter {
                 );
                 match self.config.groups.first() {
                     Some(g) => g,
-                    None => return Err(anyhow::anyhow!("No DNS groups configured")),
+                    None => return Err(TinyTunError::Dns("No DNS groups configured".to_string())),
                 }
             }
         };
 
         if group.servers.is_empty() {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Dns(format!(
                 "DNS group '{}' has no servers configured",
                 group.name
-            ));
+            )));
         }
 
         // --- Upstream query -------------------------------------------------
@@ -551,7 +553,7 @@ impl DnsRouter {
         group: &DnsGroup,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>> {
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<TinyTunError> = None;
 
         for server in &group.servers {
             match self.dispatch(payload, server, group, timeout_duration).await {
@@ -563,7 +565,7 @@ impl DnsRouter {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All servers in DNS group '{}' failed", group.name)))
+        Err(last_err.unwrap_or_else(|| TinyTunError::Dns(format!("All servers in DNS group '{}' failed", group.name))))
     }
 
     // -----------------------------------------------------------------------
@@ -634,7 +636,7 @@ impl DnsRouter {
         timeout_duration: Duration,
     ) -> Result<Vec<u8>> {
         let indices = Self::shuffled_indices(group.servers.len());
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<TinyTunError> = None;
 
         for idx in indices {
             let server = &group.servers[idx];
@@ -647,7 +649,7 @@ impl DnsRouter {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All servers in DNS group '{}' failed", group.name)))
+        Err(last_err.unwrap_or_else(|| TinyTunError::Dns(format!("All servers in DNS group '{}' failed", group.name))))
     }
 
     /// Produce a randomly-shuffled index list of length `len`.
@@ -728,7 +730,7 @@ impl DnsRouter {
             DnsProtocol::Udp => {
                 let addr = parse_socket_addr(server)?;
                 if upstream.is_proxy() {
-                    let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
+                    let sc = proxy_client.ok_or_else(|| TinyTunError::Dns(format!("No SOCKS5 proxy configured for upstream '{}'", server)))?;
                     Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
                 } else {
                     Self::query_udp_direct(payload, addr, timeout_duration, outbound_interface).await
@@ -737,7 +739,7 @@ impl DnsRouter {
             DnsProtocol::Tcp => {
                 let addr = parse_socket_addr(server)?;
                 if upstream.is_proxy() {
-                    let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
+                    let sc = proxy_client.ok_or_else(|| TinyTunError::Dns(format!("No SOCKS5 proxy configured for upstream '{}'", server)))?;
                     Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
                 } else {
                     Self::query_tcp_direct(payload, addr, timeout_duration, outbound_interface).await
@@ -747,7 +749,7 @@ impl DnsRouter {
                 let addr = parse_socket_addr(server)?;
                 let sni  = resolve_sni(server, group_sni);
                 if upstream.is_proxy() {
-                    let sc = proxy_client.ok_or_else(|| anyhow::anyhow!("No SOCKS5 proxy configured for upstream '{}'", server))?;
+                    let sc = proxy_client.ok_or_else(|| TinyTunError::Dns(format!("No SOCKS5 proxy configured for upstream '{}'", server)))?;
                     Self::query_dot_via_socks(
                         sc.clone(), payload, addr, &sni, tls_config, timeout_duration,
                     ).await
@@ -798,7 +800,12 @@ impl DnsRouter {
         #[cfg(target_os = "linux")]
         if let Some(iface) = outbound_interface {
             use std::os::unix::io::AsRawFd;
-            let iface_cstr = std::ffi::CString::new(iface.as_bytes())?;
+            let iface_cstr = std::ffi::CString::new(iface.as_bytes())
+                .map_err(|e| TinyTunError::Internal(format!("CString::new failed for iface '{}': {}", iface, e)))?;
+            // SAFETY: `socket.as_raw_fd()` returns a valid file descriptor.
+            // `iface_cstr.as_ptr()` is a valid NUL-terminated C string.
+            // `setsockopt` with `SO_BINDTODEVICE` only reads from the buffer;
+            // no data races as the socket is not yet connected. Return value is checked.
             let ret = unsafe {
                 libc::setsockopt(
                     socket.as_raw_fd(),
@@ -809,21 +816,32 @@ impl DnsRouter {
                 )
             };
             if ret != 0 {
-                return Err(anyhow::anyhow!(
+                return Err(TinyTunError::Dns(format!(
                     "SO_BINDTODEVICE failed for iface '{}': {}",
                     iface,
                     std::io::Error::last_os_error()
-                ));
+                )));
             }
         }
 
         #[cfg(target_os = "macos")]
         if let Some(iface) = outbound_interface {
             use std::os::unix::io::AsRawFd;
-            let idx = unsafe { libc::if_nametoindex(std::ffi::CString::new(iface.as_bytes())?.as_ptr()) };
+            // SAFETY: `CString::new(...)?.as_ptr()` is a valid NUL-terminated C string.
+            // `if_nametoindex` only reads from the pointer; return value 0 indicates error.
+            let idx = unsafe {
+                libc::if_nametoindex(
+                    std::ffi::CString::new(iface.as_bytes())
+                        .map_err(|e| TinyTunError::Internal(format!("CString::new failed for iface '{}': {}", iface, e)))?
+                        .as_ptr()
+                )
+            };
             if idx != 0 {
                 let opt = if upstream.is_ipv6() { libc::IPV6_BOUND_IF } else { libc::IP_BOUND_IF };
                 let level = if upstream.is_ipv6() { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP };
+                // SAFETY: `socket.as_raw_fd()` is a valid fd. `&idx` is a valid pointer to a `c_uint`.
+                // `setsockopt` only reads from the buffer; no data races. Return value is not checked
+                // here because this is best-effort (the socket will still work without binding).
                 unsafe {
                     libc::setsockopt(socket.as_raw_fd(), level, opt,
                         &idx as *const _ as *const libc::c_void,
@@ -908,7 +926,7 @@ impl DnsRouter {
 
         let tcp_stream = timeout(handshake_timeout, socks5_client.connect(upstream))
             .await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out for DoT upstream {}", upstream))??;
+            .map_err(|_| TinyTunError::Timeout(format!("SOCKS5 handshake timed out for DoT upstream {}", upstream)))??;
 
         let mut tls_stream = timeout(
             timeout_duration,
@@ -939,18 +957,20 @@ impl DnsRouter {
                 .send(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("DoH request to '{}' timed out", url))??;
+        .map_err(|_| TinyTunError::Timeout(format!("DoH request to '{}' timed out", url)))?
+        .map_err(|e| TinyTunError::Dns(format!("DoH request to '{}' failed: {}", url, e)))?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Dns(format!(
                 "DoH server '{}' returned HTTP {}", url, status
-            ));
+            )));
         }
 
         let bytes = tokio::time::timeout(timeout_duration, response.bytes())
             .await
-            .map_err(|_| anyhow::anyhow!("DoH response body read timed out for '{}'", url))??;
+            .map_err(|_| TinyTunError::Timeout(format!("DoH response body read timed out for '{}'", url)))?
+            .map_err(|e| TinyTunError::Dns(format!("DoH response body read failed for '{}': {}", url, e)))?;
 
         Ok(bytes.to_vec())
     }
@@ -970,7 +990,7 @@ impl DnsRouter {
 
         let quic_config = quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(doq_tls_config.as_ref().clone())
-                .map_err(|e| anyhow::anyhow!("DoQ TLS config error: {e}"))?,
+                .map_err(|e| TinyTunError::Dns(format!("DoQ TLS config error: {e}")))?,
         ));
 
         let bind_addr: SocketAddr = if upstream.is_ipv6() {
@@ -985,16 +1005,17 @@ impl DnsRouter {
         // Connect and wait for the QUIC handshake.
         let connecting = endpoint
             .connect(upstream, sni)
-            .map_err(|e| anyhow::anyhow!("DoQ connect failed: {e}"))?;
+            .map_err(|e| TinyTunError::Dns(format!("DoQ connect failed: {e}")))?;
         let connection: quinn::Connection = timeout(timeout_duration, connecting)
             .await
-            .map_err(|_| anyhow::anyhow!("DoQ connection to {} timed out", upstream))??;
+            .map_err(|_| TinyTunError::Timeout(format!("DoQ connection to {} timed out", upstream)))?
+            .map_err(|e| TinyTunError::Dns(format!("DoQ connection to {} failed: {}", upstream, e)))?;
 
         let (mut send, mut recv): (quinn::SendStream, quinn::RecvStream) =
             timeout(timeout_duration, connection.open_bi())
                 .await
-                .map_err(|_| anyhow::anyhow!("DoQ stream open timed out"))?
-                .map_err(|e| anyhow::anyhow!("DoQ stream error: {e}"))?;
+                .map_err(|_| TinyTunError::Timeout("DoQ stream open timed out".to_string()))?
+                .map_err(|e| TinyTunError::Dns(format!("DoQ stream error: {e}")))?;
 
         // RFC 9250 §4.2: 2-byte big-endian length prefix + DNS message.
         let mut framed = Vec::with_capacity(payload.len() + 2);
@@ -1003,12 +1024,12 @@ impl DnsRouter {
 
         timeout(timeout_duration, async {
             send.write_all(&framed).await
-                .map_err(|e| anyhow::anyhow!("DoQ write error: {e}"))?;
+                .map_err(|e| TinyTunError::Dns(format!("DoQ write error: {e}")))?;
             let _ = send.finish();
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, TinyTunError>(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DoQ send timed out"))??;
+        .map_err(|_| TinyTunError::Timeout("DoQ send timed out".to_string()))??;
 
         // Read the full response (length-prefixed).
         let raw: Vec<u8> = timeout(
@@ -1016,15 +1037,15 @@ impl DnsRouter {
             recv.read_to_end(u16::MAX as usize + 2),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("DoQ response read timed out"))?
-        .map_err(|e| anyhow::anyhow!("DoQ read error: {e}"))?;
+        .map_err(|_| TinyTunError::Timeout("DoQ response read timed out".to_string()))?
+        .map_err(|e| TinyTunError::Dns(format!("DoQ read error: {e}")))?;
 
         if raw.len() < 2 {
-            return Err(anyhow::anyhow!("DoQ response too short ({} bytes)", raw.len()));
+            return Err(TinyTunError::Dns(format!("DoQ response too short ({} bytes)", raw.len())));
         }
         let resp_len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
         if raw.len() < 2 + resp_len {
-            return Err(anyhow::anyhow!("DoQ response truncated"));
+            return Err(TinyTunError::Dns("DoQ response truncated".to_string()));
         }
         Ok(raw[2..2 + resp_len].to_vec())
     }
@@ -1044,7 +1065,10 @@ impl DnsRouter {
             use tokio::net::TcpSocket;
 
             let socket = if dst.is_ipv6() { TcpSocket::new_v6()? } else { TcpSocket::new_v4()? };
-            let iface_cstr = std::ffi::CString::new(iface.as_bytes())?;
+            let iface_cstr = std::ffi::CString::new(iface.as_bytes())
+                .map_err(|e| TinyTunError::Internal(format!("CString::new failed for iface '{}': {}", iface, e)))?;
+            // SAFETY: Same pattern as UDP direct query — valid fd, valid C string.
+            // `setsockopt` only reads from the buffer. Return value is checked.
             let ret = unsafe {
                 libc::setsockopt(
                     socket.as_raw_fd(),
@@ -1055,11 +1079,11 @@ impl DnsRouter {
                 )
             };
             if ret != 0 {
-                return Err(anyhow::anyhow!(
+                return Err(TinyTunError::Dns(format!(
                     "SO_BINDTODEVICE({}) failed: {}",
                     iface,
                     std::io::Error::last_os_error()
-                ));
+                )));
             }
             return Ok(socket.connect(dst).await?);
         }
@@ -1070,8 +1094,14 @@ impl DnsRouter {
             use tokio::net::TcpSocket;
 
             let socket = if dst.is_ipv6() { TcpSocket::new_v6()? } else { TcpSocket::new_v4()? };
+            // SAFETY: `CString::new(...)?.as_ptr()` is a valid NUL-terminated C string.
+            // `if_nametoindex` only reads from the pointer; return value 0 indicates error.
             let idx = unsafe {
-                libc::if_nametoindex(std::ffi::CString::new(iface.as_bytes())?.as_ptr())
+                libc::if_nametoindex(
+                    std::ffi::CString::new(iface.as_bytes())
+                        .map_err(|e| TinyTunError::Internal(format!("CString::new failed for iface '{}': {}", iface, e)))?
+                        .as_ptr()
+                )
             };
             if idx != 0 {
                 let (level, opt) = if dst.is_ipv6() {
@@ -1111,10 +1141,10 @@ impl DnsRouter {
         let mut stream = timeout(handshake_timeout, socks5_client.connect(upstream))
             .await
             .map_err(|_| {
-                anyhow::anyhow!(
+                TinyTunError::Timeout(format!(
                     "SOCKS5 handshake timed out for DNS upstream {}",
                     upstream
-                )
+                ))
             })??;
 
         // DNS-over-TCP framing: two-byte big-endian length prefix.
@@ -1265,7 +1295,7 @@ impl DnsRouter {
 /// Parse a `"host:port"` string into a [`SocketAddr`].
 fn parse_socket_addr(s: &str) -> Result<SocketAddr> {
     s.parse::<SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("Invalid server address '{}': {}", s, e))
+        .map_err(|e| TinyTunError::Config(format!("Invalid server address '{}': {}", s, e)))
 }
 
 /// Determine the TLS SNI value for a server address string.
@@ -1287,7 +1317,7 @@ fn resolve_sni(server: &str, group_sni: Option<&str>) -> String {
 /// or an IP address literal.
 fn make_server_name(s: &str) -> Result<rustls::pki_types::ServerName<'static>> {
     rustls::pki_types::ServerName::try_from(s.to_owned())
-        .map_err(|e| anyhow::anyhow!("Invalid TLS server name '{}': {}", s, e))
+        .map_err(|e| TinyTunError::Config(format!("Invalid TLS server name '{}': {}", s, e)))
 }
 
 /// Write a DNS message to any `AsyncWrite` sink using the DNS-over-TCP
@@ -1316,4 +1346,218 @@ async fn recv_dns_tcp_framed<R: AsyncReadExt + Unpin>(
     let mut response = vec![0u8; response_len];
     timeout(timeout_duration, reader.read_exact(&mut response)).await??;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── domain_matches ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_domain_matches_full_exact() {
+        let matcher = CompiledMatcher::DomainFull("example.com".to_string());
+        assert!(DnsRouter::domain_matches(&matcher, "example.com"));
+        assert!(!DnsRouter::domain_matches(&matcher, "www.example.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix() {
+        let matcher = CompiledMatcher::DomainSuffix("example.com".to_string());
+        assert!(DnsRouter::domain_matches(&matcher, "example.com"));
+        assert!(DnsRouter::domain_matches(&matcher, "www.example.com"));
+        assert!(!DnsRouter::domain_matches(&matcher, "example.org"));
+    }
+
+    #[test]
+    fn test_domain_matches_keyword() {
+        let matcher = CompiledMatcher::DomainKeyword("google".to_string());
+        assert!(DnsRouter::domain_matches(&matcher, "google.com"));
+        assert!(DnsRouter::domain_matches(&matcher, "www.google.co.uk"));
+        assert!(!DnsRouter::domain_matches(&matcher, "example.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_regex() {
+        let re = regex::Regex::new(r"\.cn$").unwrap();
+        let matcher = CompiledMatcher::DomainRegex(re);
+        assert!(DnsRouter::domain_matches(&matcher, "example.cn"));
+        assert!(!DnsRouter::domain_matches(&matcher, "example.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_wildcard() {
+        let matcher = CompiledMatcher::Wildcard;
+        assert!(DnsRouter::domain_matches(&matcher, "anything.here"));
+    }
+
+    // ── build_nxdomain_response ─────────────────────────────────────────────
+
+    #[test]
+    fn test_build_nxdomain_response() {
+        let query = vec![
+            0x12, 0x34, // TXID
+            0x01, 0x00, // flags: standard query
+            0x00, 0x01, // 1 question
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let resp = DnsRouter::build_nxdomain_response(&query);
+        // TXID preserved
+        assert_eq!(resp[0], 0x12);
+        assert_eq!(resp[1], 0x34);
+        // QR=1, RCODE=3 (NXDOMAIN)
+        assert_eq!(resp[2] & 0x80, 0x80);
+        assert_eq!(resp[3] & 0x0F, 0x03);
+        // QDCOUNT preserved
+        assert_eq!(resp[4], 0x00);
+        assert_eq!(resp[5], 0x01);
+        // ANCOUNT, NSCOUNT, ARCOUNT = 0
+        assert_eq!(&resp[6..12], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_build_nxdomain_response_short_query() {
+        let resp = DnsRouter::build_nxdomain_response(&[0xab, 0xcd]);
+        // TXID from short query
+        assert_eq!(resp[0], 0xab);
+        assert_eq!(resp[1], 0xcd);
+        // QDCOUNT defaults to 0
+        assert_eq!(resp[4], 0x00);
+        assert_eq!(resp[5], 0x00);
+    }
+
+    // ── parse_query_info ────────────────────────────────────────────────────
+
+    fn make_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Header: TXID=0x1234, flags=0x0100 (standard query), 1 question
+        buf.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // QNAME: split by dots, each label prefixed with length byte
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0x00); // root label
+        buf.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
+        buf.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+        buf
+    }
+
+    #[test]
+    fn test_parse_query_info_basic() {
+        let payload = make_dns_query("www.example.com", 1); // A record
+        let info = DnsRouter::parse_query_info(&payload);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.domain, "www.example.com");
+        assert_eq!(info.qtype, 1);
+    }
+
+    #[test]
+    fn test_parse_query_info_ipv6() {
+        let payload = make_dns_query("example.com", 28); // AAAA record
+        let info = DnsRouter::parse_query_info(&payload);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.domain, "example.com");
+        assert_eq!(info.qtype, 28);
+    }
+
+    #[test]
+    fn test_parse_query_info_too_short() {
+        assert!(DnsRouter::parse_query_info(&[0; 10]).is_none());
+    }
+
+    #[test]
+    fn test_parse_query_info_zero_questions() {
+        let payload = vec![0u8; 12]; // header only, qdcount=0
+        assert!(DnsRouter::parse_query_info(&payload).is_none());
+    }
+
+    // ── try_extract_min_ttl ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_try_extract_min_ttl_single_answer() {
+        // Build a minimal response with one A record answer (TTL=300)
+        let mut resp = vec![
+            0x00, 0x00, // TXID
+            0x81, 0x80, // flags: response, no error
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x01, // ANCOUNT=1
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ];
+        // Question section (minimal)
+        resp.extend_from_slice(&[0x00]); // root QNAME
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
+        // Answer: name pointer 0xc00c, TYPE=A, CLASS=IN, TTL=300, RDLENGTH=4, RDATA=8.8.8.8
+        resp.extend_from_slice(&[0xc0, 0x0c]);
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        resp.extend_from_slice(&0x00000012cu32.to_be_bytes()); // TTL=300
+        resp.extend_from_slice(&[0x00, 0x04]);
+        resp.extend_from_slice(&[0x08, 0x08, 0x08, 0x08]);
+        let min_ttl = DnsRouter::try_extract_min_ttl(&resp);
+        assert_eq!(min_ttl, Some(300));
+    }
+
+    #[test]
+    fn test_try_extract_min_ttl_multiple_answers() {
+        // Two answers with TTL=600 and TTL=120 → min should be 120
+        let mut resp = vec![
+            0x00, 0x00, 0x81, 0x80,
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x02, // ANCOUNT=2
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        // Question
+        resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        // Answer 1: TTL=600
+        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01]);
+        resp.extend_from_slice(&600u32.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x04, 0x08, 0x08, 0x08, 0x08]);
+        // Answer 2: TTL=120
+        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01]);
+        resp.extend_from_slice(&120u32.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x04, 0x08, 0x08, 0x04, 0x04]);
+        let min_ttl = DnsRouter::try_extract_min_ttl(&resp);
+        assert_eq!(min_ttl, Some(120));
+    }
+
+    #[test]
+    fn test_try_extract_min_ttl_no_answers() {
+        let resp = vec![
+            0x00, 0x00, 0x81, 0x80,
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        // When there are no answer/authority records, the function returns
+        // Some(0) because min_ttl stays at u32::MAX and is mapped to 0.
+        assert_eq!(DnsRouter::try_extract_min_ttl(&resp), Some(0));
+    }
+
+    // ── skip_name ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_skip_name_plain() {
+        let data = b"\x03www\x07example\x03com\x00";
+        let pos = DnsRouter::skip_name(data, 0);
+        assert_eq!(pos, Some(data.len()));
+    }
+
+    #[test]
+    fn test_skip_name_pointer() {
+        // Pointer at offset 0: 0xc0, 0x0c → jump to offset 12
+        let data = b"\xc0\x0c";
+        let pos = DnsRouter::skip_name(data, 0);
+        assert_eq!(pos, Some(2));
+    }
+
+    #[test]
+    fn test_skip_name_truncated() {
+        // Label length says 5 but only 3 bytes remain
+        let data = b"\x05hel";
+        let pos = DnsRouter::skip_name(data, 0);
+        assert_eq!(pos, None);
+    }
 }

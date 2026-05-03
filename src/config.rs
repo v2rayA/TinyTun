@@ -4,7 +4,10 @@ use std::path::Path;
 use std::fs;
 
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+
+use crate::common::error::TinyTunError;
+
+type Result<T> = std::result::Result<T, TinyTunError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -458,7 +461,7 @@ impl Default for RouteConfig {
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path)?;
+        let content = fs::read_to_string(path).map_err(|e| TinyTunError::Config(format!("Failed to read config file '{}': {}", path.display(), e)))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
         let mut config = match ext {
             "yaml" | "yml" => {
@@ -470,6 +473,24 @@ impl Config {
                 config
             }
         };
+
+        // ── Environment variable overrides for secrets ────────────────────────
+        // Support reading SOCKS5 credentials from environment variables so that
+        // passwords are not stored in plaintext in config files that may be
+        // checked into version control or visible to other system users.
+        //
+        // The following env vars are checked (in order of precedence):
+        //   TINYTUN_SOCKS5_PASSWORD  — password for the default proxy
+        //   TINYTUN_SOCKS5_USERNAME  — username for the default proxy
+        //
+        // When set, these override the corresponding fields in the config file.
+        if let Ok(password) = std::env::var("TINYTUN_SOCKS5_PASSWORD") {
+            config.socks5.password = Some(password);
+        }
+        if let Ok(username) = std::env::var("TINYTUN_SOCKS5_USERNAME") {
+            config.socks5.username = Some(username);
+        }
+
         // Rebuild the runtime lookup structures (CIDR pre-parsing, IP HashSet).
         config.filtering.finalize();
         Ok(config)
@@ -657,17 +678,17 @@ fn parse_yaml_rule(s: &str, default_geosite_file: Option<&str>) -> Result<DnsRou
     let s = s.trim();
     let inner = s
         .strip_prefix("match(")
-        .ok_or_else(|| anyhow::anyhow!("DNS rule must start with 'match(': {s}"))?;
+        .ok_or_else(|| TinyTunError::Config(format!("DNS rule must start with 'match(': {s}")))?;
 
     let close = inner
         .rfind(')') // find the matching closing paren
-        .ok_or_else(|| anyhow::anyhow!("DNS rule missing closing ')': {s}"))?;
+        .ok_or_else(|| TinyTunError::Config(format!("DNS rule missing closing ')': {s}")))?;
 
     let condition = &inner[..close];
     let rest = inner[close + 1..].trim();
     let action = rest
         .strip_prefix(',')
-        .ok_or_else(|| anyhow::anyhow!("DNS rule missing ',<action>' after ')': {s}"))?
+        .ok_or_else(|| TinyTunError::Config(format!("DNS rule missing ',<action>' after ')': {s}")))?
         .trim();
 
     let matcher = parse_condition(condition, default_geosite_file, s)?;
@@ -699,10 +720,10 @@ fn parse_condition(
             .map(|f| f.to_string())
             .or_else(|| default_geosite_file.map(|f| f.to_string()))
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                TinyTunError::Config(format!(
                     "geosite rule '{full_rule}' has no file path \
                      and no 'geosite_file' default is set"
-                )
+                ))
             })?;
         return Ok(DnsMatcher::Geosite { file, tag });
     }
@@ -720,6 +741,162 @@ fn parse_condition(
         return Ok(DnsMatcher::DomainRegex { value: value.to_string() });
     }
 
-    Err(anyhow::anyhow!("Unknown condition '{cond}' in rule: {full_rule}"))
+    Err(TinyTunError::Config(format!("Unknown condition '{cond}' in rule: {full_rule}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ── Config::default ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.tun.name, "tun0");
+        assert_eq!(config.tun.mtu, 1500);
+        assert_eq!(config.socks5.name, "proxy");
+    }
+
+    // ── should_skip_ip / should_skip_port ────────────────────────────────────
+
+    #[test]
+    fn test_should_skip_ip_exact_match() {
+        let mut config = Config::default();
+        config.filtering.skip_ips.push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        config.filtering.finalize();
+        assert!(config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+    }
+
+    #[test]
+    fn test_should_skip_ip_network_match() {
+        let mut config = Config::default();
+        config.filtering.skip_networks.push("10.0.0.0/8".to_string());
+        config.filtering.finalize();
+        assert!(config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
+        assert!(!config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn test_should_skip_ipv6_localhost() {
+        let config = Config::default(); // ::1/128 is in default skip_networks
+        assert!(config.should_skip_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_should_skip_port_blocked() {
+        let mut config = Config::default();
+        config.filtering.block_ports.push(22);
+        config.filtering.finalize();
+        assert!(config.should_skip_port(22));
+    }
+
+    #[test]
+    fn test_should_skip_port_allowed() {
+        let mut config = Config::default();
+        config.filtering.allow_ports.push(80);
+        config.filtering.block_ports.push(80); // allow takes precedence
+        config.filtering.finalize();
+        assert!(!config.should_skip_port(80));
+    }
+
+    #[test]
+    fn test_should_skip_port_not_listed() {
+        let config = Config::default();
+        assert!(!config.should_skip_port(8080));
+    }
+
+    // ── is_excluded_process_name ────────────────────────────────────────────
+
+    #[test]
+    fn test_is_excluded_process_name() {
+        let mut config = Config::default();
+        config.filtering.exclude_processes = vec!["curl".to_string(), "wget".to_string()];
+        assert!(config.is_excluded_process_name("curl"));
+        assert!(config.is_excluded_process_name("wget"));
+        assert!(!config.is_excluded_process_name("firefox"));
+    }
+
+    #[test]
+    fn test_is_excluded_process_name_with_path() {
+        let mut config = Config::default();
+        config.filtering.exclude_processes = vec!["/usr/bin/curl".to_string()];
+        assert!(config.is_excluded_process_name("/usr/bin/curl"));
+        assert!(config.is_excluded_process_name("curl"));
+    }
+
+    // ── parse_yaml_rule ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_yaml_rule_domain() {
+        let rule = parse_yaml_rule("match(domain:example.com),proxy", None).unwrap();
+        assert!(matches!(rule.matcher, DnsMatcher::DomainFull { .. }));
+        assert_eq!(rule.group, Some("proxy".to_string()));
+        assert!(!rule.reject);
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_suffix() {
+        let rule = parse_yaml_rule("match(suffix:.example.com),direct", None).unwrap();
+        assert!(matches!(rule.matcher, DnsMatcher::DomainSuffix { .. }));
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_keyword() {
+        let rule = parse_yaml_rule("match(keyword:google),proxy", None).unwrap();
+        assert!(matches!(rule.matcher, DnsMatcher::DomainKeyword { .. }));
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_regex() {
+        let rule = parse_yaml_rule("match(regex:.*\\.cn$),proxy", None).unwrap();
+        assert!(matches!(rule.matcher, DnsMatcher::DomainRegex { .. }));
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_geosite() {
+        let rule = parse_yaml_rule("match(geosite:cn),proxy", Some("/etc/geosite.db")).unwrap();
+        assert!(matches!(rule.matcher, DnsMatcher::Geosite { .. }));
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_reject() {
+        let rule = parse_yaml_rule("match(domain:example.com),reject", None).unwrap();
+        assert!(rule.reject);
+        assert!(rule.group.is_none());
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_missing_match() {
+        let result = parse_yaml_rule("unknown:value", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_yaml_rule_missing_action() {
+        let result = parse_yaml_rule("match(domain:example.com)", None);
+        assert!(result.is_err());
+    }
+
+    // ── FilteringConfig::finalize ───────────────────────────────────────────
+
+    #[test]
+    fn test_filtering_finalize_deduplicates() {
+        let mut config = FilteringConfig {
+            skip_ips: vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), // duplicate
+            ],
+            block_ports: vec![80, 80, 443],
+            exclude_processes: vec!["curl".to_string(), "curl".to_string()],
+            ..Default::default()
+        };
+        config.finalize();
+        assert_eq!(config.skip_ips_set.len(), 1);
+        assert_eq!(config.block_ports.len(), 3); // finalize doesn't dedup ports
+        assert_eq!(config.exclude_processes.len(), 2); // finalize doesn't dedup processes
+    }
 }
 

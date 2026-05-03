@@ -1,11 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use anyhow::Result;
 use log::debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
+use crate::common::error::TinyTunError;
 use crate::config::ProxyConfig;
+
+type Result<T> = std::result::Result<T, TinyTunError>;
 
 pub struct Socks5UdpSession {
     // Keep the TCP control channel alive for this UDP ASSOCIATE session.
@@ -78,7 +80,13 @@ impl Socks5Client {
             };
             let fd = socket.as_raw_fd();
             let iface_c = std::ffi::CString::new(iface.as_str())
-                .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
+                .map_err(|_| TinyTunError::Socks5("outbound interface name contains null byte".to_string()))?;
+            // SAFETY: `fd` is a valid raw file descriptor obtained from `socket.as_raw_fd()`.
+            // `iface_c.as_ptr()` is a valid, NUL-terminated C string pointer.
+            // `to_bytes_with_nul().len()` gives the correct buffer size including the NUL terminator.
+            // `setsockopt` with `SO_BINDTODEVICE` only reads from the provided buffer; no data races
+            // occur because the socket is not yet connected and no other thread accesses it concurrently.
+            // Return value is checked immediately after the call to detect errors.
             let ret = unsafe {
                 libc::setsockopt(
                     fd,
@@ -152,37 +160,37 @@ impl Socks5Client {
 
         let mut method_resp = [0u8; 2];
         stream.read_exact(&mut method_resp).await
-            .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 method selection: {}", e))?;
+            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 method selection: {}", e)))?;
 
         if method_resp[0] != 0x05 {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 server sent unexpected version byte 0x{:02x} (expected 0x05)",
                 method_resp[0]
-            ));
+            )));
         }
 
         match method_resp[1] {
-            0xFF => Err(anyhow::anyhow!(
-                "SOCKS5 server rejected all offered authentication methods"
+            0xFF => Err(TinyTunError::Socks5(
+                "SOCKS5 server rejected all offered authentication methods".to_string()
             )),
             0x02 => self.authenticate(stream).await,
             0x00 => Ok(()),
-            other => Err(anyhow::anyhow!(
+            other => Err(TinyTunError::Socks5(format!(
                 "SOCKS5 server chose unsupported auth method 0x{:02x}",
                 other
-            )),
+            ))),
         }
     }
 
     /// Perform SOCKS5 username/password sub-negotiation (RFC 1929).
     async fn authenticate(&self, stream: &mut TcpStream) -> Result<()> {
         let username = self.config.username.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Proxy selected username/password auth but no username configured"))?;
+            .ok_or_else(|| TinyTunError::Socks5("Proxy selected username/password auth but no username configured".to_string()))?;
         let password = self.config.password.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Proxy selected username/password auth but no password configured"))?;
+            .ok_or_else(|| TinyTunError::Socks5("Proxy selected username/password auth but no password configured".to_string()))?;
 
         if username.len() > 255 || password.len() > 255 {
-            return Err(anyhow::anyhow!("SOCKS5 username or password exceeds 255 bytes"));
+            return Err(TinyTunError::Socks5("SOCKS5 username or password exceeds 255 bytes".to_string()));
         }
 
         // Build auth sub-negotiation request in one buffer.
@@ -197,13 +205,13 @@ impl Socks5Client {
 
         let mut resp = [0u8; 2];
         stream.read_exact(&mut resp).await
-            .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 auth response: {}", e))?;
+            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 auth response: {}", e)))?;
 
         if resp[1] != 0x00 {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 authentication failed (status=0x{:02x})",
                 resp[1]
-            ));
+            )));
         }
 
         Ok(())
@@ -235,13 +243,13 @@ impl Socks5Client {
         // Read the fixed 4-byte reply header.
         let mut head = [0u8; 4];
         stream.read_exact(&mut head).await
-            .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 CONNECT reply header: {}", e))?;
+            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 CONNECT reply header: {}", e)))?;
 
         if head[0] != 0x05 {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 CONNECT reply has unexpected version byte 0x{:02x}",
                 head[0]
-            ));
+            )));
         }
 
         if head[1] != 0x00 {
@@ -249,12 +257,12 @@ impl Socks5Client {
             // otherwise the connection state machine is left in an inconsistent
             // state if the caller reuses the stream.
             let _ = Self::drain_bound_addr(stream, head[3]).await;
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 CONNECT to {} rejected (REP=0x{:02x}: {})",
                 target_addr,
                 head[1],
                 socks5_rep_name(head[1])
-            ));
+            )));
         }
 
         // Drain the bound-address/port echo from the server reply.
@@ -272,26 +280,26 @@ impl Socks5Client {
             0x01 => {
                 let mut buf = [0u8; 6]; // 4-byte IPv4 + 2-byte port
                 stream.read_exact(&mut buf).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 bound IPv4 address: {}", e))?;
+                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound IPv4 address: {}", e)))?;
             }
             0x04 => {
                 let mut buf = [0u8; 18]; // 16-byte IPv6 + 2-byte port
                 stream.read_exact(&mut buf).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 bound IPv6 address: {}", e))?;
+                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound IPv6 address: {}", e)))?;
             }
             0x03 => {
                 let mut len = [0u8; 1];
                 stream.read_exact(&mut len).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 bound domain length: {}", e))?;
+                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound domain length: {}", e)))?;
                 let mut buf = vec![0u8; len[0] as usize + 2]; // domain + 2-byte port
                 stream.read_exact(&mut buf).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 bound domain: {}", e))?;
+                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound domain: {}", e)))?;
             }
             other => {
-                return Err(anyhow::anyhow!(
+                return Err(TinyTunError::Socks5(format!(
                     "SOCKS5 reply contains unknown ATYP 0x{:02x}",
                     other
-                ));
+                )));
             }
         }
         Ok(())
@@ -309,21 +317,21 @@ impl Socks5Client {
 
         let mut head = [0u8; 4];
         stream.read_exact(&mut head).await
-            .map_err(|e| anyhow::anyhow!("Failed to read SOCKS5 UDP ASSOCIATE reply header: {}", e))?;
+            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 UDP ASSOCIATE reply header: {}", e)))?;
 
         if head[0] != 0x05 {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 UDP ASSOCIATE reply has unexpected version byte 0x{:02x}",
                 head[0]
-            ));
+            )));
         }
         if head[1] != 0x00 {
             let _ = Self::drain_bound_addr(stream, head[3]).await;
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 UDP ASSOCIATE failed (REP=0x{:02x}: {})",
                 head[1],
                 socks5_rep_name(head[1])
-            ));
+            )));
         }
 
         let bound = Self::read_relay_addr(stream, head[3]).await?;
@@ -355,19 +363,19 @@ impl Socks5Client {
                 let mut domain = vec![0u8; len[0] as usize];
                 stream.read_exact(&mut domain).await?;
                 let text = String::from_utf8(domain)
-                    .map_err(|_| anyhow::anyhow!("SOCKS5 relay address contained invalid UTF-8"))?;
+                    .map_err(|_| TinyTunError::Socks5("SOCKS5 relay address contained invalid UTF-8".to_string()))?;
                 let resolved = tokio::net::lookup_host((text.as_str(), 0))
                     .await?
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to resolve SOCKS5 relay domain '{}'", text))?
+                    .ok_or_else(|| TinyTunError::Socks5(format!("Failed to resolve SOCKS5 relay domain '{}'", text)))?
                     .ip();
                 resolved
             }
             other => {
-                return Err(anyhow::anyhow!(
+                return Err(TinyTunError::Socks5(format!(
                     "SOCKS5 relay address has unknown ATYP 0x{:02x}",
                     other
-                ));
+                )));
             }
         };
 
@@ -396,17 +404,17 @@ impl Socks5Client {
 
     fn parse_udp_response(packet: &[u8]) -> Result<(SocketAddr, Vec<u8>)> {
         if packet.len() < 4 {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 UDP response too short ({} bytes, need at least 4)",
                 packet.len()
-            ));
+            )));
         }
 
         if packet[2] != 0x00 {
-            return Err(anyhow::anyhow!(
+            return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 UDP fragmentation not supported (FRAG={})",
                 packet[2]
-            ));
+            )));
         }
 
         let atyp = packet[3];
@@ -414,7 +422,7 @@ impl Socks5Client {
         let addr = match atyp {
             0x01 => {
                 if packet.len() < pos + 4 {
-                    return Err(anyhow::anyhow!("SOCKS5 UDP datagram truncated in IPv4 address field"));
+                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in IPv4 address field".to_string()));
                 }
                 let ip = Ipv4Addr::new(packet[pos], packet[pos + 1], packet[pos + 2], packet[pos + 3]);
                 pos += 4;
@@ -422,7 +430,7 @@ impl Socks5Client {
             }
             0x04 => {
                 if packet.len() < pos + 16 {
-                    return Err(anyhow::anyhow!("SOCKS5 UDP datagram truncated in IPv6 address field"));
+                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in IPv6 address field".to_string()));
                 }
                 let mut raw = [0u8; 16];
                 raw.copy_from_slice(&packet[pos..pos + 16]);
@@ -431,31 +439,31 @@ impl Socks5Client {
             }
             0x03 => {
                 if packet.len() < pos + 1 {
-                    return Err(anyhow::anyhow!("SOCKS5 UDP datagram truncated in domain length field"));
+                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in domain length field".to_string()));
                 }
                 let len = packet[pos] as usize;
                 pos += 1;
                 if packet.len() < pos + len {
-                    return Err(anyhow::anyhow!("SOCKS5 UDP datagram truncated in domain field"));
+                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in domain field".to_string()));
                 }
                 let domain = String::from_utf8(packet[pos..pos + len].to_vec())
-                    .map_err(|_| anyhow::anyhow!("SOCKS5 UDP datagram domain contained invalid UTF-8"))?;
+                    .map_err(|_| TinyTunError::Socks5("SOCKS5 UDP datagram domain contained invalid UTF-8".to_string()))?;
                 pos += len;
                 std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), 0))?
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to resolve SOCKS5 UDP domain '{}'", domain))?
+                    .ok_or_else(|| TinyTunError::Socks5(format!("Failed to resolve SOCKS5 UDP domain '{}'", domain)))?
                     .ip()
             }
             other => {
-                return Err(anyhow::anyhow!(
+                return Err(TinyTunError::Socks5(format!(
                     "SOCKS5 UDP datagram has unknown ATYP 0x{:02x}",
                     other
-                ));
+                )));
             }
         };
 
         if packet.len() < pos + 2 {
-            return Err(anyhow::anyhow!("SOCKS5 UDP datagram truncated in port field"));
+            return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in port field".to_string()));
         }
         let port = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
         pos += 2;
