@@ -479,9 +479,12 @@ impl HeapBuffer {
         // SAFETY: `GetProcessHeap()` returns the default process heap, which is always
         // available. `HeapAlloc` with `HEAP_ZERO_MEMORY` zero-initializes the buffer.
         // The returned pointer is checked for null to detect allocation failure.
+        let heap = unsafe {
+            windows::Win32::System::Memory::GetProcessHeap().unwrap()
+        };
         let ptr = unsafe {
             windows::Win32::System::Memory::HeapAlloc(
-                windows::Win32::System::Memory::GetProcessHeap(),
+                heap,
                 windows::Win32::System::Memory::HEAP_ZERO_MEMORY,
                 size,
             )
@@ -517,9 +520,12 @@ impl Drop for HeapBuffer {
         // because no other thread is concurrently freeing this same pointer (each
         // `HeapBuffer` owns a unique allocation). The process heap remains valid for
         // the entire lifetime of the process.
+        let heap = unsafe {
+            windows::Win32::System::Memory::GetProcessHeap().unwrap()
+        };
         unsafe {
             windows::Win32::System::Memory::HeapFree(
-                windows::Win32::System::Memory::GetProcessHeap(),
+                heap,
                 windows::Win32::System::Memory::HEAP_NO_SERIALIZE,
                 self.ptr,
             );
@@ -1094,7 +1100,8 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
 
     // SAFETY: `OpenProcess` is a FFI call with valid parameters.
@@ -1120,13 +1127,13 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     let name = unsafe {
         let mut buf: [u16; 260] = [0u16; 260]; // MAX_PATH
         let mut size: u32 = buf.len() as u32;
-        let ret = windows::Win32::System::ProcessStatus::QueryFullProcessImageNameW(
+        let ret = QueryFullProcessImageNameW(
             *handle.as_raw(),
-            windows::Win32::System::ProcessStatus::PROCESS_NAME_WIN32,
+            PROCESS_NAME_WIN32,
             &mut buf,
             &mut size,
         );
-        if ret.as_bool() {
+        if ret.is_ok() {
             let slice = &buf[..size as usize];
             OsString::from_wide(slice).to_string_lossy().into_owned()
         } else {
