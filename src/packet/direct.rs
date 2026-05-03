@@ -5,6 +5,7 @@ use tokio::net::TcpStream;
 /// the TUN device. Uses `SO_BINDTODEVICE` (Linux) or `IP_BOUND_IF`/
 /// `IPV6_BOUND_IF` (macOS) so the socket is pinned to the physical
 /// NIC and never re-enters the TUN routing path.
+#[allow(unused_variables)]
 pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str) -> Result<TcpStream> {
     #[cfg(target_os = "linux")]
     {

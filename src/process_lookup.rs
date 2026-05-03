@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "freebsd"))]
+#[cfg(all(not(target_os = "freebsd"), not(windows)))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -527,7 +527,7 @@ impl Drop for HeapBuffer {
             windows::Win32::System::Memory::HeapFree(
                 heap,
                 windows::Win32::System::Memory::HEAP_NO_SERIALIZE,
-                self.ptr,
+                Some(self.ptr as *const std::ffi::c_void),
             );
         }
     }
@@ -1110,11 +1110,9 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     // to ensure it is closed on all paths. A null handle (failure) is handled by
     // `ProcessHandle::drop` which checks `is_invalid()`.
     let handle = unsafe {
-        ProcessHandle::new(OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
-            pid,
-        ))
+        ProcessHandle::new(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap(),
+        )
     };
     if handle.as_raw().is_invalid() {
         return None;
@@ -1125,16 +1123,16 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     // The buffer size is passed as `&mut size` and updated by the function.
     // The return value is checked (nonzero = success) before using the data.
     let name = unsafe {
-        let mut buf: [u16; 260] = [0u16; 260]; // MAX_PATH
+        let mut buf: Vec<u16> = vec![0u16; 260]; // MAX_PATH
         let mut size: u32 = buf.len() as u32;
         let ret = QueryFullProcessImageNameW(
             *handle.as_raw(),
             PROCESS_NAME_WIN32,
-            &mut buf,
+            windows::core::PWSTR(buf.as_mut_ptr()),
             &mut size,
         );
         if ret.is_ok() {
-            let slice = &buf[..size as usize];
+            let slice = std::slice::from_raw_parts(buf.as_ptr(), size as usize);
             OsString::from_wide(slice).to_string_lossy().into_owned()
         } else {
             return None;

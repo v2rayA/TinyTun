@@ -784,6 +784,7 @@ impl DnsRouter {
     // Direct UDP upstream
     // -----------------------------------------------------------------------
 
+    #[allow(unused_variables)]
     async fn query_udp_direct(
         payload: &[u8],
         upstream: SocketAddr,
@@ -1058,6 +1059,7 @@ impl DnsRouter {
     /// `SO_BINDTODEVICE` (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS).
     /// This prevents direct-mode DNS sockets from re-entering TUN routing
     /// when `auto_route` is active.
+    #[allow(unused_variables)]
     async fn open_direct_tcp_stream(dst: SocketAddr, iface: &str) -> Result<TcpStream> {
         #[cfg(target_os = "linux")]
         {
