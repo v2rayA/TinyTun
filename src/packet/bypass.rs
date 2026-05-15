@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Mutex;
+use dashmap::DashMap;
 
 use crate::config::Config;
 use crate::packet::shared::{ProcessLookupEntry, ProcessLookupKey};
@@ -23,7 +22,7 @@ const PROCESS_LOOKUP_CACHE_TTL: std::time::Duration = std::time::Duration::from_
 ///   established to the SOCKS5 proxy.
 pub async fn should_exclude_process_flow(
     config: &Config,
-    process_name_cache: &Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
+    process_name_cache: &Arc<DashMap<ProcessLookupKey, ProcessLookupEntry>>,
     process_lookup_options: &ProcessLookupOptions,
     protocol: TransportProtocol,
     src: std::net::SocketAddr,
@@ -36,21 +35,19 @@ pub async fn should_exclude_process_flow(
     let key = ProcessLookupKey { protocol, src, dst };
 
     // ── Fast path: valid cache entry ─────────────────────────────────────
-    {
-        let cache = process_name_cache.lock().await;
-        if let Some(entry) = cache.get(&key) {
-            if entry.recorded_at.elapsed() <= PROCESS_LOOKUP_CACHE_TTL {
-                if let Some(ref name) = entry.process_name {
-                    if config.is_excluded_process_name(name) {
-                        log::debug!(
-                            "Excluded process matched (cached): process={} protocol={:?} flow={} -> {}",
-                            name, protocol, src, dst
-                        );
-                        return true;
-                    }
+    if let Some(entry) = process_name_cache.get(&key) {
+        let entry = entry.value();
+        if entry.recorded_at.elapsed() <= PROCESS_LOOKUP_CACHE_TTL {
+            if let Some(ref name) = entry.process_name {
+                if config.is_excluded_process_name(name) {
+                    log::debug!(
+                        "Excluded process matched (cached): process={} protocol={:?} flow={} -> {}",
+                        name, protocol, src, dst
+                    );
+                    return true;
                 }
-                return false;
             }
+            return false;
         }
     }
 
@@ -73,16 +70,13 @@ pub async fn should_exclude_process_flow(
     .flatten();
 
     // Write result into cache so subsequent packets for the same flow are fast.
-    {
-        let mut cache = process_name_cache.lock().await;
-        cache.insert(
-            key,
-            ProcessLookupEntry {
-                process_name: lookup.clone(),
-                recorded_at: Instant::now(),
-            },
-        );
-    }
+    process_name_cache.insert(
+        key,
+        ProcessLookupEntry {
+            process_name: lookup.clone(),
+            recorded_at: Instant::now(),
+        },
+    );
 
     if let Some(ref name) = lookup {
         if config.is_excluded_process_name(name) {
@@ -102,27 +96,27 @@ pub async fn should_exclude_process_flow(
 
 /// Clean up expired entries from the process lookup cache.
 pub async fn cleanup_process_lookup_cache(
-    process_name_cache: &Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
+    process_name_cache: &Arc<DashMap<ProcessLookupKey, ProcessLookupEntry>>,
     max_entries: usize,
 ) {
     let now = Instant::now();
 
-    {
-        let mut cache = process_name_cache.lock().await;
-        cache.retain(|_, entry| now.duration_since(entry.recorded_at) <= PROCESS_LOOKUP_CACHE_TTL);
+    process_name_cache.retain(|_, entry| {
+        now.duration_since(entry.recorded_at) <= PROCESS_LOOKUP_CACHE_TTL
+    });
 
-        if cache.len() > max_entries {
-            let overflow = cache.len() - max_entries;
-            let mut entries = cache
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.recorded_at))
-                .collect::<Vec<_>>();
+    let cache_len = process_name_cache.len();
+    if cache_len > max_entries {
+        let overflow = cache_len - max_entries;
+        let mut entries = process_name_cache
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().recorded_at))
+            .collect::<Vec<_>>();
 
-            entries.sort_by_key(|(_, recorded_at)| *recorded_at);
+        entries.sort_by_key(|(_, recorded_at)| *recorded_at);
 
-            for (key, _) in entries.into_iter().take(overflow) {
-                cache.remove(&key);
-            }
+        for (key, _) in entries.into_iter().take(overflow) {
+            process_name_cache.remove(&key);
         }
     }
 }

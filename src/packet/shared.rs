@@ -74,6 +74,8 @@ pub struct TcpSession {
     /// Channel used to pass forward payloads to the per-session writer task,
     /// keeping the main packet loop non-blocking.
     pub forward_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Notify reverse-path senders when ACK/window/lifecycle state changes.
+    pub window_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Key for identifying a UDP flow.

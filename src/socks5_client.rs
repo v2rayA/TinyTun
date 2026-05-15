@@ -21,6 +21,7 @@ pub struct Socks5Client {
     config: ProxyConfig,
     /// On Linux with auto_route enabled, bind SOCKS5 sockets to this physical
     /// interface via SO_BINDTODEVICE so they never traverse the TUN device.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     outbound_interface: Option<String>,
 }
 

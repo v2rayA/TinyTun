@@ -19,7 +19,7 @@ const DYNAMIC_BYPASS_ROUTE_TTL: std::time::Duration = std::time::Duration::from_
 pub async fn ensure_dynamic_bypass_for_ip(
     dynamic_bypass_ips: &Arc<DashMap<IpAddr, Instant>>,
     config: &Config,
-    outbound_interface: &Option<String>,
+    outbound_interface: &Option<Arc<str>>,
     ip: IpAddr,
 ) -> Result<()> {
     if !config.tun.auto_route || config.should_skip_ip(ip) {

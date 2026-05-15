@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::fs;
@@ -291,18 +291,73 @@ pub struct FilteringConfig {
     /// Pre-parsed CIDR networks; mirrors `skip_networks` (no per-packet re-parsing).
     #[serde(skip)]
     pub(crate) skip_networks_parsed: Vec<ipnetwork::IpNetwork>,
+    /// Prefix-indexed IPv4 CIDRs for fast skip checks.
+    #[serde(skip)]
+    pub(crate) skip_networks_v4_by_prefix: HashMap<u8, HashSet<u32>>,
+    /// Prefix-indexed IPv6 CIDRs for fast skip checks.
+    #[serde(skip)]
+    pub(crate) skip_networks_v6_by_prefix: HashMap<u8, HashSet<u128>>,
+    /// Fast O(1) lookup set for blocked ports.
+    #[serde(skip)]
+    pub(crate) block_ports_set: HashSet<u16>,
+    /// Fast O(1) lookup set for allow-listed ports.
+    #[serde(skip)]
+    pub(crate) allow_ports_set: HashSet<u16>,
 }
 
 impl FilteringConfig {
+    #[inline]
+    fn mask_ipv4(ip: u32, prefix: u8) -> u32 {
+        if prefix == 0 {
+            0
+        } else {
+            ip & (u32::MAX << (32 - prefix))
+        }
+    }
+
+    #[inline]
+    fn mask_ipv6(ip: u128, prefix: u8) -> u128 {
+        if prefix == 0 {
+            0
+        } else {
+            ip & (u128::MAX << (128 - prefix))
+        }
+    }
+
     /// Rebuild the runtime lookup structures from `skip_ips` and `skip_networks`.
     /// Call this once after construction and again after any `push` to those vecs.
     pub fn finalize(&mut self) {
         self.skip_ips_set = self.skip_ips.iter().copied().collect();
+        self.block_ports_set = self.block_ports.iter().copied().collect();
+        self.allow_ports_set = self.allow_ports.iter().copied().collect();
         self.skip_networks_parsed = self
             .skip_networks
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect();
+
+        self.skip_networks_v4_by_prefix.clear();
+        self.skip_networks_v6_by_prefix.clear();
+        for network in &self.skip_networks_parsed {
+            match network {
+                ipnetwork::IpNetwork::V4(v4) => {
+                    let prefix = v4.prefix();
+                    let masked = Self::mask_ipv4(u32::from(v4.ip()), prefix);
+                    self.skip_networks_v4_by_prefix
+                        .entry(prefix)
+                        .or_default()
+                        .insert(masked);
+                }
+                ipnetwork::IpNetwork::V6(v6) => {
+                    let prefix = v6.prefix();
+                    let masked = Self::mask_ipv6(u128::from(v6.ip()), prefix);
+                    self.skip_networks_v6_by_prefix
+                        .entry(prefix)
+                        .or_default()
+                        .insert(masked);
+                }
+            }
+        }
     }
 }
 
@@ -443,6 +498,10 @@ impl Default for FilteringConfig {
             exclude_processes: Vec::new(),
             skip_ips_set: HashSet::new(),
             skip_networks_parsed: Vec::new(),
+            skip_networks_v4_by_prefix: HashMap::new(),
+            skip_networks_v6_by_prefix: HashMap::new(),
+            block_ports_set: HashSet::new(),
+            allow_ports_set: HashSet::new(),
         };
         cfg.finalize();
         cfg
@@ -504,22 +563,32 @@ impl Config {
         if self.filtering.skip_ips_set.contains(&ip) {
             return true;
         }
-        self.filtering.skip_networks_parsed.iter().any(|n| n.contains(ip))
+
+        match ip {
+            IpAddr::V4(v4) => {
+                let ip_u32 = u32::from(v4);
+                self.filtering.skip_networks_v4_by_prefix.iter().any(|(prefix, nets)| {
+                    nets.contains(&FilteringConfig::mask_ipv4(ip_u32, *prefix))
+                })
+            }
+            IpAddr::V6(v6) => {
+                let ip_u128 = u128::from(v6);
+                self.filtering.skip_networks_v6_by_prefix.iter().any(|(prefix, nets)| {
+                    nets.contains(&FilteringConfig::mask_ipv6(ip_u128, *prefix))
+                })
+            }
+        }
     }
     
     /// Check if a port should be skipped
     pub fn should_skip_port(&self, port: u16) -> bool {
         // Always allow explicit allow ports
-        if self.filtering.allow_ports.contains(&port) {
+        if self.filtering.allow_ports_set.contains(&port) {
             return false;
         }
-        
+
         // Block if in block list
-        if self.filtering.block_ports.contains(&port) {
-            return true;
-        }
-        
-        false
+        self.filtering.block_ports_set.contains(&port)
     }
     
     pub fn is_excluded_process_name(&self, process_name: &str) -> bool {

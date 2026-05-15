@@ -5,6 +5,7 @@ use tokio::net::TcpStream;
 /// the TUN device. Uses `SO_BINDTODEVICE` (Linux) or `IP_BOUND_IF`/
 /// `IPV6_BOUND_IF` (macOS) so the socket is pinned to the physical
 /// NIC and never re-enters the TUN routing path.
+#[allow(dead_code)]
 #[allow(unused_variables)]
 pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str) -> Result<TcpStream> {
     #[cfg(target_os = "linux")]
@@ -120,10 +121,11 @@ pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str
 /// interface and return the first response datagram. Uses `SO_BINDTODEVICE`
 /// (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS) to prevent
 /// the socket from re-entering the TUN device.
+#[allow(dead_code)]
 pub async fn direct_udp_exchange(
     dst: std::net::SocketAddr,
     payload: Vec<u8>,
-    outbound_interface: String,
+    outbound_interface: &str,
 ) -> Result<Vec<u8>> {
     use tokio::net::UdpSocket;
 
@@ -139,7 +141,7 @@ pub async fn direct_udp_exchange(
     {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        let iface_c = std::ffi::CString::new(outbound_interface.as_str())
+        let iface_c = std::ffi::CString::new(outbound_interface)
             .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
         // SAFETY: Same pattern as `open_direct_tcp` — `fd` is a valid UDP socket fd,
         // `iface_c` is a valid NUL-terminated C string. `setsockopt` only reads from
@@ -170,7 +172,7 @@ pub async fn direct_udp_exchange(
         // `iface_c.as_ptr()` is a valid NUL-terminated C string.
         // Return value 0 indicates error, checked below.
         let if_index = unsafe {
-            let iface_c = std::ffi::CString::new(outbound_interface.as_str())
+            let iface_c = std::ffi::CString::new(outbound_interface)
                 .map_err(|_| anyhow::anyhow!("outbound interface name contains null byte"))?;
             libc::if_nametoindex(iface_c.as_ptr())
         };
@@ -214,7 +216,7 @@ pub async fn direct_udp_exchange(
     // connect that may re-enter the TUN device.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (&dst, &payload, &outbound_interface);
+        let _ = (&dst, &payload, &outbound_interface, &socket);
         return Err(anyhow::anyhow!(
             "direct UDP: socket-level interface binding is not supported on this platform"
         ));

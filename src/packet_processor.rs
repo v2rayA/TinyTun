@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
+use tokio::time::{interval, MissedTickBehavior};
 
 use etherparse::{Ipv4HeaderSlice, Ipv6HeaderSlice};
 
@@ -16,10 +17,7 @@ use crate::socks5_client::Socks5Client;
 
 pub struct PacketProcessor {
     pub config: Arc<Config>,
-    pub dns_router: Arc<DnsRouter>,
-    pub socks5_client: Arc<Socks5Client>,
-    pub outbound_interface: Option<String>,
-    pub tun_packet_tx: mpsc::Sender<Vec<u8>>,
+    pub outbound_interface: Option<Arc<str>>,
     pub tcp_handler: TcpHandler,
     pub udp_handler: UdpHandler,
 }
@@ -38,6 +36,9 @@ impl PacketProcessor {
         outbound_interface: Option<String>,
     ) -> Result<Self> {
         let config = Arc::new(config);
+        let outbound_interface_arc = outbound_interface
+            .as_deref()
+            .map(Arc::<str>::from);
         let socks5_client = Arc::new(Socks5Client::new(config.socks5.clone(), outbound_interface.clone()));
         let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), &config, outbound_interface.clone())?);
         let (tun_packet_tx, mut tun_packet_rx) = mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
@@ -53,8 +54,7 @@ impl PacketProcessor {
         let tcp_handler = TcpHandler::new(
             config.clone(),
             socks5_client.clone(),
-            dns_router.clone(),
-            outbound_interface.clone(),
+            outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
         );
 
@@ -62,16 +62,13 @@ impl PacketProcessor {
             config.clone(),
             socks5_client.clone(),
             dns_router.clone(),
-            outbound_interface.clone(),
+            outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
         );
 
         Ok(Self {
             config,
-            socks5_client,
-            dns_router,
-            outbound_interface,
-            tun_packet_tx,
+            outbound_interface: outbound_interface_arc,
             tcp_handler,
             udp_handler,
         })
@@ -89,47 +86,61 @@ impl PacketProcessor {
         info!("Starting packet processing");
 
         let mut buffer = vec![0; self.config.tun.mtu as usize];
-        let mut last_cleanup_at = std::time::Instant::now();
-        let mut last_dynamic_cleanup_at = std::time::Instant::now();
-        let mut last_udp_session_cleanup_at = std::time::Instant::now();
-        let mut last_process_cache_cleanup_at = std::time::Instant::now();
+
+        // Drive periodic maintenance with dedicated timers instead of
+        // checking elapsed() on every packet in the hot path.
+        let mut tcp_cleanup_tick = interval(Self::TCP_SESSION_CLEANUP_INTERVAL);
+        let mut dynamic_cleanup_tick = interval(Self::DYNAMIC_BYPASS_CLEANUP_INTERVAL);
+        let mut udp_cleanup_tick = interval(Self::UDP_SESSION_CLEANUP_INTERVAL);
+        let mut process_cache_cleanup_tick = interval(Self::PROCESS_CACHE_CLEANUP_INTERVAL);
+
+        tcp_cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        dynamic_cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        udp_cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        process_cache_cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // Consume the first immediate tick so intervals match previous behavior
+        // (first cleanup happens after the configured delay).
+        tcp_cleanup_tick.tick().await;
+        dynamic_cleanup_tick.tick().await;
+        udp_cleanup_tick.tick().await;
+        process_cache_cleanup_tick.tick().await;
 
         loop {
-            if last_cleanup_at.elapsed() >= Self::TCP_SESSION_CLEANUP_INTERVAL {
-                self.tcp_handler.cleanup_expired_tcp_sessions().await;
-                last_cleanup_at = std::time::Instant::now();
-            }
-            if last_dynamic_cleanup_at.elapsed() >= Self::DYNAMIC_BYPASS_CLEANUP_INTERVAL {
-                packet::route::cleanup_expired_dynamic_bypass_routes(
-                    &self.tcp_handler.dynamic_bypass_ips,
-                    &self.config,
-                )
-                .await;
-                last_dynamic_cleanup_at = std::time::Instant::now();
-            }
-            if last_udp_session_cleanup_at.elapsed() >= Self::UDP_SESSION_CLEANUP_INTERVAL {
-                self.udp_handler.cleanup_expired_udp_sessions().await;
-                last_udp_session_cleanup_at = std::time::Instant::now();
-            }
-            if last_process_cache_cleanup_at.elapsed() >= Self::PROCESS_CACHE_CLEANUP_INTERVAL {
-                packet::bypass::cleanup_process_lookup_cache(
-                    &self.tcp_handler.process_name_cache,
-                    Self::PROCESS_CACHE_MAX_ENTRIES,
-                )
-                .await;
-                last_process_cache_cleanup_at = std::time::Instant::now();
-            }
+            tokio::select! {
+                _ = tcp_cleanup_tick.tick() => {
+                    self.tcp_handler.cleanup_expired_tcp_sessions().await;
+                }
+                _ = dynamic_cleanup_tick.tick() => {
+                    packet::route::cleanup_expired_dynamic_bypass_routes(
+                        &self.tcp_handler.dynamic_bypass_ips,
+                        &self.config,
+                    )
+                    .await;
+                }
+                _ = udp_cleanup_tick.tick() => {
+                    self.udp_handler.cleanup_expired_udp_sessions().await;
+                }
+                _ = process_cache_cleanup_tick.tick() => {
+                    packet::bypass::cleanup_process_lookup_cache(
+                        &self.tcp_handler.process_name_cache,
+                        Self::PROCESS_CACHE_MAX_ENTRIES,
+                    )
+                    .await;
+                }
+                read_result = tun_reader.recv(&mut buffer) => {
+                    let bytes_read = read_result?;
 
-            let bytes_read = tun_reader.recv(&mut buffer).await?;
+                    if bytes_read == 0 {
+                        continue;
+                    }
 
-            if bytes_read == 0 {
-                continue;
-            }
+                    let packet = &buffer[..bytes_read];
 
-            let packet = &buffer[..bytes_read];
-
-            if let Err(e) = self.process_packet(packet).await {
-                error!("Error processing packet: {}", e);
+                    if let Err(e) = self.process_packet(packet).await {
+                        error!("Error processing packet: {}", e);
+                    }
+                }
             }
         }
     }
@@ -169,14 +180,15 @@ impl PacketProcessor {
 
         // Check if we should skip this IP
         let dest_ip = parsed.dst;
-        if self.config.should_skip_ip(dest_ip) {
+        let is_transport = parsed.protocol == 6 || parsed.protocol == 17;
+        let is_static_bypass = self.config.should_skip_ip(dest_ip);
+        if is_static_bypass {
             // When an outbound interface is configured, TCP/UDP packets for
             // statically-bypassed IPs are forwarded transparently through the
             // physical NIC inside the protocol handlers rather than silently
             // dropped.  Non-TCP/UDP traffic and the no-interface case still
             // drop immediately (rely on routing to have excluded those flows).
-            let can_direct = self.outbound_interface.is_some()
-                && (parsed.protocol == 6 || parsed.protocol == 17);
+            let can_direct = self.outbound_interface.is_some() && is_transport;
             if !can_direct {
                 debug!("Skipping packet to {}", dest_ip);
                 return Ok(());
@@ -185,8 +197,14 @@ impl PacketProcessor {
 
         // Handle different protocols
         match parsed.protocol {
-            6 => self.tcp_handler.handle_tcp_packet(packet, &parsed).await,
-            17 => self.udp_handler.handle_udp_packet(packet, &parsed).await,
+            6 => self
+                .tcp_handler
+                .handle_tcp_packet(packet, &parsed, is_static_bypass)
+                .await,
+            17 => self
+                .udp_handler
+                .handle_udp_packet(packet, &parsed, is_static_bypass)
+                .await,
             _ => {
                 debug!("Unsupported protocol number: {}", parsed.protocol);
                 Ok(())

@@ -3,3 +3,6 @@ target
 *.dll
 *.exe
 *.logplans
+cargo_check_output.jsonl
+Test-01.log
+output.txt

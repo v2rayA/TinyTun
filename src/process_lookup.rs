@@ -523,13 +523,13 @@ impl Drop for HeapBuffer {
         let heap = unsafe {
             windows::Win32::System::Memory::GetProcessHeap().unwrap()
         };
-        unsafe {
+        let _ = unsafe {
             windows::Win32::System::Memory::HeapFree(
                 heap,
                 windows::Win32::System::Memory::HEAP_NO_SERIALIZE,
                 Some(self.ptr as *const std::ffi::c_void),
-            );
-        }
+            )
+        };
     }
 }
 
@@ -572,9 +572,7 @@ impl Drop for ProcessHandle {
         // function to close it. Each `ProcessHandle` owns exactly one handle,
         // so no double-close can occur.
         if !self.0.is_invalid() {
-            unsafe {
-                windows::Win32::Foundation::CloseHandle(self.0);
-            }
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
         }
     }
 }

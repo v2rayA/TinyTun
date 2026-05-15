@@ -1,11 +1,40 @@
 use anyhow::Result;
 use etherparse::PacketBuilder;
+use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::packet::shared::{
     FlowKey, DEFAULT_TCP_WINDOW, DEFAULT_TTL, TUN_WRITE_ENQUEUE_TIMEOUT,
 };
+
+/// Build a UDP/IP packet from source to destination with payload.
+///
+/// Returns `None` when source and destination address families differ or the
+/// packet serialization fails.
+pub fn build_udp_packet(
+    source: SocketAddr,
+    destination: SocketAddr,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let builder = match (source.ip(), destination.ip()) {
+        (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
+            PacketBuilder::ipv4(src.octets(), dst.octets(), DEFAULT_TTL)
+                .udp(source.port(), destination.port())
+        }
+        (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => {
+            PacketBuilder::ipv6(src.octets(), dst.octets(), DEFAULT_TTL)
+                .udp(source.port(), destination.port())
+        }
+        _ => return None,
+    };
+
+    let mut packet = Vec::with_capacity(builder.size(payload.len()));
+    if builder.write(&mut packet, payload).is_err() {
+        return None;
+    }
+    Some(packet)
+}
 
 /// Build a TCP/IP packet with the given parameters.
 ///

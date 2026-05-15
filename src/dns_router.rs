@@ -10,15 +10,13 @@
 
 use std::net::SocketAddr;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use log::{debug, warn};
-use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::common::error::TinyTunError;
@@ -39,6 +37,7 @@ struct CacheKey {
     qclass: u16,
 }
 
+#[derive(Clone)]
 struct CacheEntry {
     /// Raw DNS response bytes (TxID is *not* patched — callers must normalise).
     response: Vec<u8>,
@@ -119,7 +118,8 @@ pub struct DnsRouter {
     /// DNS sockets so that their traffic bypasses the TUN routing table and
     /// avoids a routing loop when auto_route is active.
     outbound_interface: Option<String>,
-    cache: Arc<Mutex<LruCache<CacheKey, CacheEntry>>>,
+    cache: Arc<DashMap<CacheKey, CacheEntry>>,
+    cache_capacity: usize,
     /// Shared TLS client config for DoT (DNS over TLS).
     tls_config: Arc<rustls::ClientConfig>,
     /// QUIC-specific TLS client config for DoQ (ALPN = "doq").
@@ -137,8 +137,8 @@ impl DnsRouter {
     /// Returns an error if any `geosite` rule references a file that cannot
     /// be read or parsed.
     pub fn new(config: DnsConfig, app_config: &Config, outbound_interface: Option<String>) -> Result<Self> {
-        let capacity = NonZeroUsize::new(config.routing.cache_capacity.max(1)).unwrap();
-        let cache = LruCache::new(capacity);
+        let cache_capacity = config.routing.cache_capacity.max(1);
+        let cache = DashMap::new();
 
         let groups: HashMap<String, DnsGroup> = config
             .groups
@@ -300,7 +300,8 @@ impl DnsRouter {
             proxy_clients,
             rules,
             groups,
-            cache: Arc::new(Mutex::new(cache)),
+            cache: Arc::new(cache),
+            cache_capacity,
             tls_config,
             doq_tls_config,
             http_client,
@@ -336,7 +337,7 @@ impl DnsRouter {
                     qtype: info.qtype,
                     qclass: info.qclass,
                 };
-                if let Some(entry) = self.cache.lock().await.get(&key) {
+                if let Some(entry) = self.cache.get(&key) {
                     if entry.expires_at > Instant::now() {
                         debug!(
                             "DNS cache hit for {} (qtype={})",
@@ -344,6 +345,8 @@ impl DnsRouter {
                         );
                         return Ok(entry.response.clone());
                     }
+                    drop(entry);
+                    self.cache.remove(&key);
                 }
             }
         }
@@ -370,10 +373,13 @@ impl DnsRouter {
                             qtype: info.qtype,
                             qclass: info.qclass,
                         };
-                        self.cache.lock().await.put(key, CacheEntry {
-                            response: nxdomain.clone(),
-                            expires_at: Instant::now() + Duration::from_secs(3600),
-                        });
+                        self.insert_cache_entry(
+                            key,
+                            CacheEntry {
+                                response: nxdomain.clone(),
+                                expires_at: Instant::now() + Duration::from_secs(3600),
+                            },
+                        );
                     }
                 }
                 return Ok(nxdomain);
@@ -432,12 +438,43 @@ impl DnsRouter {
                         response: response.clone(),
                         expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_secs)),
                     };
-                    self.cache.lock().await.put(key, entry);
+                    self.insert_cache_entry(key, entry);
                 }
             }
         }
 
         Ok(response)
+    }
+
+    fn insert_cache_entry(&self, key: CacheKey, entry: CacheEntry) {
+        self.cache.insert(key, entry);
+        self.prune_cache_if_needed();
+    }
+
+    fn prune_cache_if_needed(&self) {
+        if self.cache.len() <= self.cache_capacity {
+            return;
+        }
+
+        let now = Instant::now();
+        self.cache.retain(|_, entry| entry.expires_at > now);
+
+        let current_len = self.cache.len();
+        if current_len <= self.cache_capacity {
+            return;
+        }
+
+        let overflow = current_len - self.cache_capacity;
+        let mut victims = self
+            .cache
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().expires_at))
+            .collect::<Vec<_>>();
+        victims.sort_by_key(|(_, expires_at)| *expires_at);
+
+        for (key, _) in victims.into_iter().take(overflow) {
+            self.cache.remove(&key);
+        }
     }
 
     // -----------------------------------------------------------------------

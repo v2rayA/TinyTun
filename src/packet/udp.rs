@@ -1,15 +1,14 @@
-use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use log::{debug, warn};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
-use etherparse::{PacketBuilder, UdpHeader, UdpHeaderSlice};
+use etherparse::{UdpHeader, UdpHeaderSlice};
 
 use crate::config::Config;
 use crate::dns_router::DnsRouter;
@@ -34,14 +33,14 @@ pub struct UdpHandler {
     pub config: Arc<Config>,
     pub socks5_client: Arc<Socks5Client>,
     pub dns_router: Arc<DnsRouter>,
-    pub outbound_interface: Option<String>,
+    pub outbound_interface: Option<Arc<str>>,
     pub tun_packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
-    pub pending_udp_sessions: Arc<Mutex<HashSet<UdpFlowKey>>>,
+    pub pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
     pub udp_timeout_backoff: Arc<DashMap<UdpFlowKey, Instant>>,
     pub udp_task_limiter: Arc<Semaphore>,
     pub dns_task_limiter: Arc<Semaphore>,
-    pub process_name_cache: Arc<Mutex<HashMap<ProcessLookupKey, ProcessLookupEntry>>>,
+    pub process_name_cache: Arc<DashMap<ProcessLookupKey, ProcessLookupEntry>>,
     pub process_lookup_options: ProcessLookupOptions,
     pub dynamic_bypass_ips: Arc<DashMap<IpAddr, Instant>>,
 }
@@ -51,7 +50,7 @@ impl UdpHandler {
         config: Arc<Config>,
         socks5_client: Arc<Socks5Client>,
         dns_router: Arc<DnsRouter>,
-        outbound_interface: Option<String>,
+        outbound_interface: Option<Arc<str>>,
         tun_packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Self {
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
@@ -62,17 +61,22 @@ impl UdpHandler {
             outbound_interface,
             tun_packet_tx,
             udp_sessions: Arc::new(DashMap::new()),
-            pending_udp_sessions: Arc::new(Mutex::new(HashSet::new())),
+            pending_udp_sessions: Arc::new(DashSet::new()),
             udp_timeout_backoff: Arc::new(DashMap::new()),
             udp_task_limiter: Arc::new(Semaphore::new(UDP_TASK_CONCURRENCY_LIMIT)),
             dns_task_limiter: Arc::new(Semaphore::new(DNS_TASK_CONCURRENCY_LIMIT)),
-            process_name_cache: Arc::new(Mutex::new(HashMap::new())),
+            process_name_cache: Arc::new(DashMap::new()),
             process_lookup_options,
             dynamic_bypass_ips: Arc::new(DashMap::new()),
         }
     }
 
-    pub async fn handle_udp_packet(&self, packet: &[u8], ip_packet: &ParsedIpPacket) -> Result<()> {
+    pub async fn handle_udp_packet(
+        &self,
+        packet: &[u8],
+        ip_packet: &ParsedIpPacket,
+        is_static_bypass: bool,
+    ) -> Result<()> {
         if packet.len() < ip_packet.header_len {
             return Err(anyhow::anyhow!("IP header length exceeds packet size"));
         }
@@ -107,7 +111,6 @@ impl UdpHandler {
             return Ok(());
         }
 
-        let is_static_bypass = self.config.should_skip_ip(target_addr.ip());
         let is_direct_flow = if is_static_bypass {
             true
         } else {
@@ -150,30 +153,19 @@ impl UdpHandler {
 
                     match timeout(
                         UDP_PROXY_TIMEOUT,
-                        packet::direct::direct_udp_exchange(target_addr, udp_payload, iface),
+                        packet::direct::direct_udp_exchange(target_addr, udp_payload, &iface),
                     )
                     .await
                     {
                         Ok(Ok(response_payload)) => {
-                            let response_builder = match (dst_ip, src_ip) {
-                                (IpAddr::V4(dst), IpAddr::V4(src)) => {
-                                    PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
-                                        .udp(dest_port, source_port)
-                                }
-                                (IpAddr::V6(dst), IpAddr::V6(src)) => {
-                                    PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
-                                        .udp(dest_port, source_port)
-                                }
-                                _ => return,
+                            let response_packet = match packet::packet_build::build_udp_packet(
+                                std::net::SocketAddr::new(dst_ip, dest_port),
+                                std::net::SocketAddr::new(src_ip, source_port),
+                                &response_payload,
+                            ) {
+                                Some(packet) => packet,
+                                None => return,
                             };
-                            let mut response_packet =
-                                Vec::with_capacity(response_builder.size(response_payload.len()));
-                            if response_builder
-                                .write(&mut response_packet, &response_payload)
-                                .is_err()
-                            {
-                                return;
-                            }
                             let _ = packet::packet_build::write_tun_packet_with(
                                 tun_packet_tx,
                                 response_packet,
@@ -285,20 +277,14 @@ impl UdpHandler {
                     }
                 };
 
-                let response_builder = match (dst_ip, src_ip) {
-                    (IpAddr::V4(dst), IpAddr::V4(src)) => {
-                        PacketBuilder::ipv4(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
-                    }
-                    (IpAddr::V6(dst), IpAddr::V6(src)) => {
-                        PacketBuilder::ipv6(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
-                    }
-                    _ => return,
+                let response_packet = match packet::packet_build::build_udp_packet(
+                    std::net::SocketAddr::new(dst_ip, dest_port),
+                    std::net::SocketAddr::new(src_ip, source_port),
+                    &response_payload,
+                ) {
+                    Some(packet) => packet,
+                    None => return,
                 };
-
-                let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
-                if response_builder.write(&mut response_packet, &response_payload).is_err() {
-                    return;
-                }
                 let response_len = response_packet.len();
                 if packet::packet_build::write_tun_packet_with(tun_packet_tx, response_packet)
                     .await
@@ -403,7 +389,7 @@ impl UdpHandler {
                 Err(_) => {
                     // The future was dropped by timeout; it may not have had a
                     // chance to remove the flow key from pending_udp_sessions.
-                    pending_for_cleanup.lock().await.remove(&udp_flow_key);
+                    pending_for_cleanup.remove(&udp_flow_key);
                     Self::mark_udp_flow_backoff_shared(
                         udp_timeout_backoff.clone(),
                         udp_flow_key.clone(),
@@ -420,20 +406,14 @@ impl UdpHandler {
                 }
             };
 
-            let response_builder = match (dst_ip, src_ip) {
-                (IpAddr::V4(dst), IpAddr::V4(src)) => {
-                    PacketBuilder::ipv4(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
-                }
-                (IpAddr::V6(dst), IpAddr::V6(src)) => {
-                    PacketBuilder::ipv6(dst.octets(), src.octets(), 64).udp(dest_port, source_port)
-                }
-                _ => return,
+            let response_packet = match packet::packet_build::build_udp_packet(
+                std::net::SocketAddr::new(dst_ip, dest_port),
+                std::net::SocketAddr::new(src_ip, source_port),
+                &response_payload,
+            ) {
+                Some(packet) => packet,
+                None => return,
             };
-
-            let mut response_packet = Vec::with_capacity(response_builder.size(response_payload.len()));
-            if response_builder.write(&mut response_packet, &response_payload).is_err() {
-                return;
-            }
             let response_len = response_packet.len();
             if packet::packet_build::write_tun_packet_with(tun_packet_tx, response_packet)
                 .await
@@ -458,7 +438,7 @@ impl UdpHandler {
     async fn proxy_udp_with_reused_session_shared(
         socks5_client: Arc<Socks5Client>,
         udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
-        pending_udp_sessions: Arc<Mutex<HashSet<UdpFlowKey>>>,
+        pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
         flow_key: UdpFlowKey,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
@@ -481,15 +461,7 @@ impl UdpHandler {
         // open_udp_session simultaneously. Each call opens a TCP control socket + UDP
         // socket to the SOCKS5 proxy; on Windows every abandoned socket pair enters
         // TIME_WAIT and consumes ephemeral ports, exhausting the ~16 k port pool fast.
-        let is_already_pending = {
-            let mut pending = pending_udp_sessions.lock().await;
-            if pending.contains(&flow_key) {
-                true
-            } else {
-                pending.insert(flow_key.clone());
-                false
-            }
-        };
+        let is_already_pending = !pending_udp_sessions.insert(flow_key.clone());
 
         if is_already_pending {
             return Err(anyhow::anyhow!(
@@ -501,10 +473,7 @@ impl UdpHandler {
 
         let open_result = socks5_client.open_udp_session(flow_key.dst).await;
 
-        {
-            let mut pending = pending_udp_sessions.lock().await;
-            pending.remove(&flow_key);
-        }
+        pending_udp_sessions.remove(&flow_key);
 
         let session = open_result.map(|s| Arc::new(Mutex::new(s)))?;
 

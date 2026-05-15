@@ -4,6 +4,7 @@ use thiserror::Error;
 ///
 /// Each variant carries a human-readable description.  Use the `From`
 /// impls to convert from library-specific errors without manual mapping.
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum TinyTunError {
     #[error("IO error: {0}")]
