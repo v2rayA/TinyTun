@@ -13,12 +13,12 @@
 //!     key  : u64  (socket cookie)
 //!     value: [u8; 16]  (process name, NUL-padded)
 //!
-//! ## TC egress hook  →  per-packet routing
+//! ## TC ingress/egress hooks  →  per-packet routing
 //!
-//! A TC classifier attached to the WAN interface reads the socket cookie of
-//! each outbound skb, looks up the pname in cookie_pid_map, then consults a
-//! second map that the user-space loader populates with the list of excluded
-//! process names:
+//! TC classifiers attached to WAN ingress and egress read the socket cookie
+//! of each skb, look up the pname in cookie_pid_map, then consult a second
+//! map that the user-space loader populates with the list of excluded process
+//! names:
 //!
 //!   exclude_procs_map : BPF_MAP_TYPE_HASH
 //!     key  : [u8; 16]  (process name, NUL-padded)
@@ -26,12 +26,12 @@
 //!
 //! If the pname is in exclude_procs_map the packet is returned with
 //! TC_ACT_OK (pass through without TUN redirect).  Otherwise it falls through
-//! to the normal TUN redirect path.
+//! to the normal TUN redirect path via TC_ACT_PIPE.
 //!
 //! The user-space loader in `src/ebpf_loader.rs` is responsible for:
 //!   1. Loading this object file (embedded via `include_bytes!`).
 //!   2. Attaching cgroup programs to the cgroupv2 root.
-//!   3. Attaching the TC classifier to the WAN interface egress.
+//!   3. Attaching TC classifiers to WAN egress and ingress.
 //!   4. Keeping exclude_procs_map in sync with config changes.
 
 #![no_std]
@@ -81,6 +81,17 @@ unsafe fn update_cookie_pname(cookie: u64) {
         return; // could not determine process name, skip
     }
     let _ = COOKIE_PNAME_MAP.insert(&cookie, &pname, 0);
+}
+
+/// Return true when the skb cookie belongs to an excluded process.
+#[inline(always)]
+unsafe fn is_excluded_cookie(cookie: u64) -> bool {
+    let pname = match COOKIE_PNAME_MAP.get(&cookie) {
+        Some(p) => *p,
+        None => return false,
+    };
+
+    EXCLUDE_PROCS_MAP.get(&pname).is_some()
 }
 
 // ── cgroup/sock_create ────────────────────────────────────────────────────────
@@ -163,17 +174,28 @@ pub fn tc_egress(ctx: TcContext) -> i32 {
         return TC_ACT_PIPE as i32;
     }
 
-    // Look up the process name for this socket.
-    let pname = match unsafe { COOKIE_PNAME_MAP.get(&cookie) } {
-        Some(p) => *p,
-        None => return TC_ACT_PIPE as i32, // no mapping → proxy as normal
-    };
-
-    // Check whether this process is excluded.
-    if unsafe { EXCLUDE_PROCS_MAP.get(&pname) }.is_some() {
+    if unsafe { is_excluded_cookie(cookie) } {
         // Excluded: let the packet pass directly on the physical interface.
         // The kernel will route it via the normal routing table, bypassing
         // the TUN redirect rule.
+        return TC_ACT_OK as i32;
+    }
+
+    TC_ACT_PIPE as i32
+}
+
+/// Attached to the WAN interface's ingress TC queue.
+///
+/// Mirrors egress behavior for return traffic in environments where tc ingress
+/// redirection is also configured.
+#[classifier]
+pub fn tc_ingress(ctx: TcContext) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr() as *mut _) };
+    if cookie == 0 {
+        return TC_ACT_PIPE as i32;
+    }
+
+    if unsafe { is_excluded_cookie(cookie) } {
         return TC_ACT_OK as i32;
     }
 

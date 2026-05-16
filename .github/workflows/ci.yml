@@ -9,8 +9,35 @@ env:
   BIN_NAME: tinytun
 
 jobs:
+  ebpf:
+    name: build-ebpf
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Build eBPF kernel object
+        uses: ./.github/actions/build-ebpf
+        with:
+          install_bpf_linker: 'true'
+
+      - name: Upload eBPF artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tinytun-ebpf
+          path: ebpf/target/bpfel-unknown-none/release/tinytun-ebpf
+          if-no-files-found: error
+          compression-level: 0
+
   build:
     name: build-${{ matrix.target }}
+    needs: ebpf
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -133,11 +160,25 @@ jobs:
             mingw-w64-clang-aarch64-llvm
             mingw-w64-clang-aarch64-rust 
 
-      - name: Build eBPF kernel object
+      - name: Download eBPF artifact
         if: matrix.has_ebpf == true
-        uses: ./.github/actions/build-ebpf
+        uses: actions/download-artifact@v4
         with:
-          install_bpf_linker: 'true'
+          name: tinytun-ebpf
+          path: .artifacts/ebpf
+
+      - name: Stage eBPF bytecode
+        if: matrix.has_ebpf == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ebpf/target/bpfel-unknown-none/release
+          ebpf_file="$(find .artifacts/ebpf -type f | head -n 1)"
+          if [[ -z "$ebpf_file" ]]; then
+            echo "eBPF artifact was not downloaded" >&2
+            exit 1
+          fi
+          cp "$ebpf_file" ebpf/target/bpfel-unknown-none/release/tinytun-ebpf
 
       - name: Build (cargo)
         if: matrix.build_tool == 'cargo'
@@ -189,10 +230,6 @@ jobs:
           else
             artifact_bin="${BIN_NAME}-${{ matrix.target }}"
             cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$out_dir/$artifact_bin"
-          fi
-
-          if [[ "${{ matrix.has_ebpf }}" == "true" ]]; then
-            cp "ebpf/target/bpfel-unknown-none/release/tinytun-ebpf" "$out_dir/tinytun-ebpf.o"
           fi
 
       - name: Upload artifact
