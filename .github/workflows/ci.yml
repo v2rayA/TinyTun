@@ -55,6 +55,14 @@ jobs:
             runner: ubuntu-latest
             build_tool: cargo-zigbuild
             has_ebpf: true
+          - target: riscv64gc-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
+            has_ebpf: true
+          - target: riscv64gc-unknown-linux-musl
+            runner: ubuntu-latest
+            build_tool: cargo-zigbuild
+            has_ebpf: true
           - target: x86_64-unknown-freebsd
             runner: ubuntu-latest
             build_tool: actions-rust-cross
