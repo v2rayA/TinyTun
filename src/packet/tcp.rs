@@ -40,6 +40,7 @@ pub struct TcpHandler {
     pub config: Arc<Config>,
     pub socks5_client: Arc<Socks5Client>,
     pub outbound_interface: Option<Arc<str>>,
+    pub enable_user_space_process_exclusion: bool,
     pub tun_packet_tx: mpsc::Sender<Vec<u8>>,
     pub tcp_sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
     pub pending_connections: Arc<DashSet<FlowKey>>,
@@ -54,12 +55,14 @@ impl TcpHandler {
         socks5_client: Arc<Socks5Client>,
         outbound_interface: Option<Arc<str>>,
         tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        enable_user_space_process_exclusion: bool,
     ) -> Self {
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
         Self {
             config,
             socks5_client,
             outbound_interface,
+            enable_user_space_process_exclusion,
             tun_packet_tx,
             tcp_sessions: Arc::new(DashMap::new()),
             pending_connections: Arc::new(DashSet::new()),
@@ -287,6 +290,8 @@ impl TcpHandler {
         // excluded processes only do so after the async name lookup confirms it.
         let is_direct_flow = if is_static_bypass {
             true // skip the async process-name lookup for static bypass IPs
+        } else if !self.enable_user_space_process_exclusion {
+            false
         } else {
             packet::bypass::should_exclude_process_flow(
                 &self.config,

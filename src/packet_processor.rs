@@ -34,6 +34,7 @@ impl PacketProcessor {
         config: Config,
         tun_writer: Arc<tun_rs::AsyncDevice>,
         outbound_interface: Option<String>,
+        enable_user_space_process_exclusion: bool,
     ) -> Result<Self> {
         let config = Arc::new(config);
         let outbound_interface_arc = outbound_interface
@@ -56,6 +57,7 @@ impl PacketProcessor {
             socks5_client.clone(),
             outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
+            enable_user_space_process_exclusion,
         );
 
         let udp_handler = UdpHandler::new(
@@ -64,6 +66,7 @@ impl PacketProcessor {
             dns_router.clone(),
             outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
+            enable_user_space_process_exclusion,
         );
 
         Ok(Self {

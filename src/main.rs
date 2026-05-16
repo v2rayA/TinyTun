@@ -25,8 +25,10 @@ use tokio::time::{sleep, timeout, Duration};
 
 use crate::config::{Config, DnsGroup, DnsQueryStrategy, DnsUpstream, Ipv6Mode, LogLevel};
 use crate::dns_hijack::DnsHijackState;
-use crate::tun_device::TunDevice;
 use crate::packet_processor::PacketProcessor;
+use crate::tun_device::TunDevice;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use crate::ebpf_loader::ProcessExclusionEbpf;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum CliIpv6Mode {
@@ -216,6 +218,9 @@ async fn main() -> Result<()> {
             auto_detect_interface,
             default_interface,
         } => {
+            let config_path_for_runtime = config.clone();
+            let exclude_process_cli_overridden = !exclude_process.is_empty();
+
             let config = load_config(
                 config,
                 loglevel.map(Into::into),
@@ -250,13 +255,20 @@ async fn main() -> Result<()> {
             )?;
             init_logging(config.log.loglevel.clone(), config.log.hide_timestamp);
             install_rustls_crypto_provider();
-            run_proxy(config).await
+            run_proxy(
+                config,
+                config_path_for_runtime,
+                exclude_process_cli_overridden,
+            )
+            .await
         }
     }
 }
 
 enum RuntimeEvent {
     PhysicalNetworkDown(String),
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    ExcludedProcessesUpdated(Vec<String>),
 }
 
 struct RuntimeSession {
@@ -269,6 +281,10 @@ struct RuntimeSession {
         std::sync::Arc<dashmap::DashMap<std::net::IpAddr, std::time::Instant>>,
     processor_handle: tokio::task::JoinHandle<()>,
     interface_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    process_exclusion_ebpf: Option<ProcessExclusionEbpf>,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    config_reload_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeSession {
@@ -279,6 +295,12 @@ impl RuntimeSession {
         let _ = self.processor_handle.await;
 
         if let Some(handle) = self.interface_monitor_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(handle) = self.config_reload_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -323,9 +345,24 @@ impl RuntimeSession {
 
         self.tun_device.cleanup().await
     }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    fn update_excluded_processes(&mut self, new_names: &[String]) -> Result<()> {
+        if let Some(ebpf) = self.process_exclusion_ebpf.as_mut() {
+            ebpf.update_excluded_processes(new_names)?;
+        }
+        Ok(())
+    }
 }
 
-async fn run_proxy(config: Config) -> Result<()> {
+async fn run_proxy(
+    config: Config,
+    config_path: Option<String>,
+    exclude_process_cli_overridden: bool,
+) -> Result<()> {
+    #[allow(unused_mut)]
+    let mut config = config;
+
     info!("Starting TinyTun with configuration: {:?}", config);
 
     preflight_checks(&config).await?;
@@ -339,7 +376,16 @@ async fn run_proxy(config: Config) -> Result<()> {
 
     loop {
         let (runtime_tx, mut runtime_rx) = mpsc::channel::<RuntimeEvent>(4);
-        let session = match start_runtime_session(&config, ipv6_enabled, runtime_tx.clone()).await {
+        #[allow(unused_mut)]
+        let mut session = match start_runtime_session(
+            &config,
+            ipv6_enabled,
+            runtime_tx.clone(),
+            config_path.as_deref(),
+            exclude_process_cli_overridden,
+        )
+        .await
+        {
             Ok(session) => session,
             Err(err) => {
                 if config.tun.auto_route && is_waitable_network_error(&err) {
@@ -361,18 +407,35 @@ async fn run_proxy(config: Config) -> Result<()> {
         let mut shutdown_error: Option<String> = None;
         let mut restart_reason: Option<String> = None;
 
-        tokio::select! {
-            _ = wait_for_shutdown_signal() => {
-                info!("Received shutdown signal");
-                info!("Shutting down...");
-            }
-            event = runtime_rx.recv() => {
-                match event {
-                    Some(RuntimeEvent::PhysicalNetworkDown(reason)) => {
-                        restart_reason = Some(reason);
-                    }
-                    None => {
-                        shutdown_error = Some("runtime monitor channel closed unexpectedly".to_string());
+        loop {
+            tokio::select! {
+                _ = wait_for_shutdown_signal() => {
+                    info!("Received shutdown signal");
+                    info!("Shutting down...");
+                    break;
+                }
+                event = runtime_rx.recv() => {
+                    match event {
+                        Some(RuntimeEvent::PhysicalNetworkDown(reason)) => {
+                            restart_reason = Some(reason);
+                            break;
+                        }
+                        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+                        Some(RuntimeEvent::ExcludedProcessesUpdated(new_names)) => {
+                            match session.update_excluded_processes(&new_names) {
+                                Ok(()) => {
+                                    config.filtering.exclude_processes = new_names;
+                                    info!("Synchronized excluded process list to eBPF map after config reload");
+                                }
+                                Err(err) => {
+                                    warn!("Failed to synchronize excluded process list to eBPF map: {}", err);
+                                }
+                            }
+                        }
+                        None => {
+                            shutdown_error = Some("runtime monitor channel closed unexpectedly".to_string());
+                            break;
+                        }
                     }
                 }
             }
@@ -452,6 +515,8 @@ async fn start_runtime_session(
     config: &Config,
     ipv6_enabled: bool,
     runtime_tx: mpsc::Sender<RuntimeEvent>,
+    _config_path: Option<&str>,
+    _exclude_process_cli_overridden: bool,
 ) -> Result<RuntimeSession> {
     // Apply skip routes BEFORE creating TUN device to ensure specific IPs are
     // routed to physical port.
@@ -522,29 +587,6 @@ async fn start_runtime_session(
 
     info!("TUN device created: {}", tun_device.name());
 
-    // Create packet processor.
-    let tun_writer = tun_device.get_writer();
-    let processor = match PacketProcessor::new(
-        config.clone(),
-        tun_writer,
-        selected_outbound_interface.clone(),
-    ) {
-        Ok(p) => p,
-        Err(err) => {
-            cleanup_startup_failure(
-                config,
-                &mut tun_device,
-                ipv6_enabled,
-                auto_route_applied,
-                skip_ip_routes_applied,
-                skip_network_routes_applied,
-            )
-            .await?;
-            return Err(err);
-        }
-    };
-    let dynamic_bypass_ips_handle = processor.dynamic_bypass_ips_handle();
-
     // Apply automatic routes after TUN device is created.
     if config.tun.auto_route {
         match route_manager::apply_auto_routes(tun_device.name(), ipv6_enabled) {
@@ -569,6 +611,41 @@ async fn start_runtime_session(
             }
         }
     }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let (process_exclusion_ebpf, enable_user_space_process_exclusion) =
+        maybe_attach_process_exclusion_ebpf(
+            config,
+            selected_outbound_interface.as_deref(),
+            auto_route_applied,
+        );
+
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    let enable_user_space_process_exclusion = true;
+
+    // Create packet processor.
+    let tun_writer = tun_device.get_writer();
+    let processor = match PacketProcessor::new(
+        config.clone(),
+        tun_writer,
+        selected_outbound_interface.clone(),
+        enable_user_space_process_exclusion,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            cleanup_startup_failure(
+                config,
+                &mut tun_device,
+                ipv6_enabled,
+                auto_route_applied,
+                skip_ip_routes_applied,
+                skip_network_routes_applied,
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+    let dynamic_bypass_ips_handle = processor.dynamic_bypass_ips_handle();
 
     let mut dns_hijack_state: Option<DnsHijackState> = None;
     if config.dns.hijack.enabled {
@@ -596,6 +673,26 @@ async fn start_runtime_session(
         }
     }
 
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let config_reload_handle = if process_exclusion_ebpf.is_some() {
+        if _exclude_process_cli_overridden {
+            info!(
+                "Excluded-process hot reload is disabled because --exclude-process CLI override is active"
+            );
+            None
+        } else if let Some(path) = _config_path {
+            Some(spawn_excluded_processes_reload_monitor(
+                path.to_string(),
+                config.filtering.exclude_processes.clone(),
+                runtime_tx.clone(),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let interface_monitor_handle = if config.tun.auto_route {
         selected_outbound_interface
             .clone()
@@ -621,6 +718,124 @@ async fn start_runtime_session(
         dynamic_bypass_ips_handle,
         processor_handle,
         interface_monitor_handle,
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        process_exclusion_ebpf,
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        config_reload_handle,
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn maybe_attach_process_exclusion_ebpf(
+    config: &Config,
+    outbound_interface: Option<&str>,
+    auto_route_applied: bool,
+) -> (Option<ProcessExclusionEbpf>, bool) {
+    if config.filtering.exclude_processes.is_empty() {
+        return (None, true);
+    }
+
+    if !config.tun.auto_route || !auto_route_applied {
+        warn!(
+            "eBPF process exclusion requires active TUN auto-route rules; falling back to user-space lookup"
+        );
+        return (None, true);
+    }
+
+    let Some(interface) = outbound_interface else {
+        warn!(
+            "eBPF process exclusion requires a resolved outbound interface; falling back to user-space lookup"
+        );
+        return (None, true);
+    };
+
+    match ProcessExclusionEbpf::attach("/sys/fs/cgroup", interface, &config.filtering.exclude_processes)
+    {
+        Ok(handle) => {
+            info!(
+                "eBPF process exclusion enabled on interface {}; user-space process exclusion checks are disabled",
+                interface
+            );
+            (Some(handle), false)
+        }
+        Err(err) => {
+            warn!(
+                "Failed to enable eBPF process exclusion ({}); falling back to user-space process lookup",
+                err
+            );
+            (None, true)
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn spawn_excluded_processes_reload_monitor(
+    config_path: String,
+    mut last_excluded_processes: Vec<String>,
+    runtime_tx: mpsc::Sender<RuntimeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_modified = std::fs::metadata(&config_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+
+        loop {
+            sleep(Duration::from_secs(2)).await;
+
+            let metadata = match std::fs::metadata(&config_path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    warn!(
+                        "Excluded-process hot reload: failed to stat config {}: {}",
+                        config_path,
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            let modified = metadata.modified().ok();
+            if let (Some(prev), Some(now)) = (last_modified, modified) {
+                if now <= prev {
+                    continue;
+                }
+            }
+            last_modified = modified;
+
+            let loaded = match Config::from_file(&config_path) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    warn!(
+                        "Excluded-process hot reload: failed to parse config {}: {}",
+                        config_path,
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            let new_excluded_processes = loaded.filtering.exclude_processes;
+            if new_excluded_processes == last_excluded_processes {
+                continue;
+            }
+
+            let changed_count = new_excluded_processes.len();
+            if runtime_tx
+                .send(RuntimeEvent::ExcludedProcessesUpdated(
+                    new_excluded_processes.clone(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            info!(
+                "Detected config reload with updated excluded process list ({} entries)",
+                changed_count
+            );
+            last_excluded_processes = new_excluded_processes;
+        }
     })
 }
 

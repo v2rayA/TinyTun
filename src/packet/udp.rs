@@ -34,6 +34,7 @@ pub struct UdpHandler {
     pub socks5_client: Arc<Socks5Client>,
     pub dns_router: Arc<DnsRouter>,
     pub outbound_interface: Option<Arc<str>>,
+    pub enable_user_space_process_exclusion: bool,
     pub tun_packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
     pub pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
@@ -52,6 +53,7 @@ impl UdpHandler {
         dns_router: Arc<DnsRouter>,
         outbound_interface: Option<Arc<str>>,
         tun_packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        enable_user_space_process_exclusion: bool,
     ) -> Self {
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
         Self {
@@ -59,6 +61,7 @@ impl UdpHandler {
             socks5_client,
             dns_router,
             outbound_interface,
+            enable_user_space_process_exclusion,
             tun_packet_tx,
             udp_sessions: Arc::new(DashMap::new()),
             pending_udp_sessions: Arc::new(DashSet::new()),
@@ -113,6 +116,8 @@ impl UdpHandler {
 
         let is_direct_flow = if is_static_bypass {
             true
+        } else if !self.enable_user_space_process_exclusion {
+            false
         } else {
             packet::bypass::should_exclude_process_flow(
                 &self.config,
