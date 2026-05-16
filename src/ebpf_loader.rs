@@ -76,8 +76,12 @@ static EMBEDDED_EBPF_OBJECT: &[u8] = include_bytes!(concat!(
 fn load_ebpf_bytes() -> Result<Vec<u8>> {
     // 1. Runtime override for development / testing.
     if let Ok(path) = std::env::var("TINYTUN_EBPF_OBJECT") {
-        return fs::read(&path)
-            .with_context(|| format!("failed to read eBPF object from TINYTUN_EBPF_OBJECT={}", path));
+        return fs::read(&path).with_context(|| {
+            format!(
+                "failed to read eBPF object from TINYTUN_EBPF_OBJECT={}",
+                path
+            )
+        });
     }
 
     // 2. Compile-time embedded bytes (built by build.rs).
@@ -110,12 +114,15 @@ impl ProcessExclusionEbpf {
 
         let requested_cgroup_path = cgroup_path.as_ref();
         let resolved_cgroup_path = resolve_cgroup_v2_path(requested_cgroup_path)?;
-        let cgroup_file = std::fs::File::open(&resolved_cgroup_path)
-            .with_context(|| format!("failed to open cgroup path {}", resolved_cgroup_path.display()))?;
+        let cgroup_file = std::fs::File::open(&resolved_cgroup_path).with_context(|| {
+            format!(
+                "failed to open cgroup path {}",
+                resolved_cgroup_path.display()
+            )
+        })?;
 
         let bytes = load_ebpf_bytes()?;
-        let mut bpf = Ebpf::load(&bytes)
-            .context("failed to load eBPF object")?;
+        let mut bpf = Ebpf::load(&bytes).context("failed to load eBPF object")?;
 
         // ── Attach cgroup/sock_create ─────────────────────────────────────
         {
@@ -207,8 +214,10 @@ impl ProcessExclusionEbpf {
 
         // ── Populate excluded process names ───────────────────────────────
         {
-            let mut map: HashMap<_, [u8; 16], u8> =
-                HashMap::try_from(bpf.map_mut("EXCLUDE_PROCS_MAP").context("EXCLUDE_PROCS_MAP not found")?)?;
+            let mut map: HashMap<_, [u8; 16], u8> = HashMap::try_from(
+                bpf.map_mut("EXCLUDE_PROCS_MAP")
+                    .context("EXCLUDE_PROCS_MAP not found")?,
+            )?;
             for name in excluded_processes {
                 let key = pname_to_key(name);
                 map.insert(key, 1u8, 0)?;
@@ -232,8 +241,11 @@ impl ProcessExclusionEbpf {
     ///
     /// This is O(n+m) where n = old entries and m = new entries.
     pub fn update_excluded_processes(&mut self, new_names: &[String]) -> Result<()> {
-        let map: HashMap<_, [u8; 16], u8> =
-            HashMap::try_from(self.bpf.map_mut("EXCLUDE_PROCS_MAP").context("EXCLUDE_PROCS_MAP not found")?)?;
+        let map: HashMap<_, [u8; 16], u8> = HashMap::try_from(
+            self.bpf
+                .map_mut("EXCLUDE_PROCS_MAP")
+                .context("EXCLUDE_PROCS_MAP not found")?,
+        )?;
 
         // Collect keys to remove (not in new_names).
         let new_keys: std::collections::HashSet<[u8; 16]> =
@@ -242,8 +254,11 @@ impl ProcessExclusionEbpf {
         let old_keys: Vec<[u8; 16]> = map.keys().filter_map(|r| r.ok()).collect();
         drop(map);
 
-        let mut map: HashMap<_, [u8; 16], u8> =
-            HashMap::try_from(self.bpf.map_mut("EXCLUDE_PROCS_MAP").context("EXCLUDE_PROCS_MAP not found")?)?;
+        let mut map: HashMap<_, [u8; 16], u8> = HashMap::try_from(
+            self.bpf
+                .map_mut("EXCLUDE_PROCS_MAP")
+                .context("EXCLUDE_PROCS_MAP not found")?,
+        )?;
 
         for key in &old_keys {
             if !new_keys.contains(key) {
@@ -258,7 +273,7 @@ impl ProcessExclusionEbpf {
     }
 
     fn best_effort_unload_cgroup_sock(&mut self, program_name: &str) {
-        if let Ok(program) = self.bpf.program_mut(program_name) {
+        if let Some(program) = self.bpf.program_mut(program_name) {
             if let Ok(prog) = <&mut CgroupSock>::try_from(program) {
                 if let Err(err) = prog.unload() {
                     warn!("Failed to unload {}: {}", program_name, err);
@@ -268,7 +283,7 @@ impl ProcessExclusionEbpf {
     }
 
     fn best_effort_unload_cgroup_sock_addr(&mut self, program_name: &str) {
-        if let Ok(program) = self.bpf.program_mut(program_name) {
+        if let Some(program) = self.bpf.program_mut(program_name) {
             if let Ok(prog) = <&mut CgroupSockAddr>::try_from(program) {
                 if let Err(err) = prog.unload() {
                     warn!("Failed to unload {}: {}", program_name, err);
@@ -278,7 +293,7 @@ impl ProcessExclusionEbpf {
     }
 
     fn best_effort_unload_sched_classifier(&mut self, program_name: &str) {
-        if let Ok(program) = self.bpf.program_mut(program_name) {
+        if let Some(program) = self.bpf.program_mut(program_name) {
             if let Ok(prog) = <&mut SchedClassifier>::try_from(program) {
                 if let Err(err) = prog.unload() {
                     warn!("Failed to unload {}: {}", program_name, err);
