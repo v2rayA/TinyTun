@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -118,7 +119,10 @@ impl TcpHandler {
         // eliminates async Mutex contention on the process cache for every
         // data packet on an established connection.
         if !tcp_header.syn() {
-            let session = self.tcp_sessions.get(&flow_key).map(|entry| entry.value().clone());
+            let session = self
+                .tcp_sessions
+                .get(&flow_key)
+                .map(|entry| entry.value().clone());
 
             if let Some(session) = session {
                 let is_ack_only_or_window_update =
@@ -134,14 +138,19 @@ impl TcpHandler {
                     let mut state = session.state.lock().await;
 
                     if tcp_header.fin() {
-                        if seq_at_or_after(tcp_header.sequence_number(), state.client_next_seq) {
-                            state.client_next_seq = state.client_next_seq.wrapping_add(1);
+                        let client_ns = state.client_next_seq.load(Ordering::Relaxed);
+                        if seq_at_or_after(tcp_header.sequence_number(), client_ns) {
+                            state
+                                .client_next_seq
+                                .store(client_ns.wrapping_add(1), Ordering::Relaxed);
                         }
-                        let seq = state.server_next_seq;
-                        state.server_next_seq = state.server_next_seq.wrapping_add(1);
+                        let seq = state.server_next_seq.load(Ordering::Relaxed);
+                        state
+                            .server_next_seq
+                            .store(seq.wrapping_add(1), Ordering::Relaxed);
                         state.lifecycle = TcpLifecycle::FinSent;
                         state.last_activity = Instant::now();
-                        send_fin = Some((seq, state.client_next_seq));
+                        send_fin = Some((seq, state.client_next_seq.load(Ordering::Relaxed)));
                         should_notify_reverse = true;
                     }
 
@@ -153,9 +162,10 @@ impl TcpHandler {
                     }
 
                     if tcp_header.ack() {
-                        let prev_window = state.client_window;
-                        state.client_window = tcp_header.window_size();
-                        if state.client_window != prev_window {
+                        let prev_window = state.client_window.load(Ordering::Relaxed);
+                        let new_window = tcp_header.window_size();
+                        state.client_window.store(new_window, Ordering::Relaxed);
+                        if new_window != prev_window {
                             should_notify_reverse = true;
                         }
 
@@ -164,16 +174,17 @@ impl TcpHandler {
                             state.lifecycle = TcpLifecycle::Established;
                         }
 
-                        if seq_at_or_after(
-                            tcp_header.acknowledgment_number(),
-                            state.server_acked_seq,
-                        ) {
-                            state.server_acked_seq = tcp_header.acknowledgment_number();
+                        let srv_acked = state.server_acked_seq.load(Ordering::Relaxed);
+                        if seq_at_or_after(tcp_header.acknowledgment_number(), srv_acked) {
+                            state
+                                .server_acked_seq
+                                .store(tcp_header.acknowledgment_number(), Ordering::Relaxed);
                             should_notify_reverse = true;
                         }
 
                         if state.lifecycle == TcpLifecycle::FinSent
-                            && tcp_header.acknowledgment_number() == state.server_next_seq
+                            && tcp_header.acknowledgment_number()
+                                == state.server_next_seq.load(Ordering::Relaxed)
                         {
                             state.lifecycle = TcpLifecycle::Closed;
                             remove_session = true;
@@ -189,7 +200,8 @@ impl TcpHandler {
                         should_return_early = true;
                     }
 
-                    if !should_return_early && !is_ack_only_or_window_update && !payload.is_empty() {
+                    if !should_return_early && !is_ack_only_or_window_update && !payload.is_empty()
+                    {
                         let merged = collect_in_order_payload(
                             &mut state,
                             tcp_header.sequence_number(),
@@ -244,7 +256,10 @@ impl TcpHandler {
                     if session.forward_tx.try_send(forward_payload).is_err() {
                         let (sequence_number, acknowledgment_number) = {
                             let state = session.state.lock().await;
-                            (state.server_next_seq, state.client_next_seq)
+                            (
+                                state.server_next_seq.load(Ordering::Relaxed),
+                                state.client_next_seq.load(Ordering::Relaxed),
+                            )
                         };
                         let _ = packet::packet_build::inject_tcp_control(
                             &self.tun_packet_tx,
@@ -317,7 +332,8 @@ impl TcpHandler {
                 }
 
                 let tun_packet_tx = self.tun_packet_tx.clone();
-                let tcp_sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>> = self.tcp_sessions.clone();
+                let tcp_sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>> =
+                    self.tcp_sessions.clone();
                 let pending_connections = self.pending_connections.clone();
                 let mtu = self.config.tun.mtu as usize;
                 let client_isn = tcp_header.sequence_number();
@@ -346,30 +362,30 @@ impl TcpHandler {
                             debug!("Direct TCP proxy established for excluded flow {:?}", fk);
                         }
                         Ok(Err(err)) => {
-                            warn!("Direct TCP connect failed for excluded flow {:?}: {}", fk, err);
-                            Self::send_connect_failure_rst(
-                                &tun_packet_tx,
-                                &fk,
-                                client_isn,
-                            )
-                            .await;
+                            warn!(
+                                "Direct TCP connect failed for excluded flow {:?}: {}",
+                                fk, err
+                            );
+                            Self::send_connect_failure_rst(&tun_packet_tx, &fk, client_isn).await;
                         }
                         Err(_) => {
                             warn!("Direct TCP connect timed out for excluded flow {:?}", fk);
-                            Self::send_connect_failure_rst(
-                                &tun_packet_tx,
-                                &fk,
-                                client_isn,
-                            )
-                            .await;
+                            Self::send_connect_failure_rst(&tun_packet_tx, &fk, client_isn).await;
                         }
                     }
                 });
 
                 debug!(
                     "{} TCP {}:{} -> {}:{}: direct-proxying via physical NIC",
-                    if is_static_bypass { "Static bypass" } else { "Excluded process" },
-                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                    if is_static_bypass {
+                        "Static bypass"
+                    } else {
+                        "Excluded process"
+                    },
+                    ip_packet.src,
+                    source_port,
+                    ip_packet.dst,
+                    dest_port
                 );
                 return Ok(());
             }
@@ -442,12 +458,22 @@ impl TcpHandler {
         }
 
         // SYN retransmit for an already-admitted connection?
-        if let Some(session) = self.tcp_sessions.get(&flow_key).map(|entry| entry.value().clone()) {
+        if let Some(session) = self
+            .tcp_sessions
+            .get(&flow_key)
+            .map(|entry| entry.value().clone())
+        {
             let resend_syn_ack = {
                 let mut state = session.state.lock().await;
                 state.last_activity = Instant::now();
                 if state.lifecycle == TcpLifecycle::SynReceived {
-                    Some((state.server_next_seq.wrapping_sub(1), state.client_next_seq))
+                    Some((
+                        state
+                            .server_next_seq
+                            .load(Ordering::Relaxed)
+                            .wrapping_sub(1),
+                        state.client_next_seq.load(Ordering::Relaxed),
+                    ))
                 } else {
                     None
                 }
@@ -481,11 +507,7 @@ impl TcpHandler {
         let fk = flow_key.clone();
 
         tokio::spawn(async move {
-            let connect_result = timeout(
-                TCP_CONNECT_TIMEOUT,
-                socks5_client.connect(fk.dst),
-            )
-            .await;
+            let connect_result = timeout(TCP_CONNECT_TIMEOUT, socks5_client.connect(fk.dst)).await;
 
             pending_connections.remove(&fk);
 
@@ -503,21 +525,11 @@ impl TcpHandler {
                 }
                 Ok(Err(err)) => {
                     warn!("SOCKS5 connect failed for {:?}: {}", fk, err);
-                    Self::send_connect_failure_rst(
-                        &tun_packet_tx,
-                        &fk,
-                        client_isn,
-                    )
-                    .await;
+                    Self::send_connect_failure_rst(&tun_packet_tx, &fk, client_isn).await;
                 }
                 Err(_) => {
                     warn!("SOCKS5 connect timed out for {:?}", fk);
-                    Self::send_connect_failure_rst(
-                        &tun_packet_tx,
-                        &fk,
-                        client_isn,
-                    )
-                    .await;
+                    Self::send_connect_failure_rst(&tun_packet_tx, &fk, client_isn).await;
                 }
             }
         });
@@ -560,10 +572,10 @@ impl TcpHandler {
 
         let session = Arc::new(TcpSession {
             state: Arc::new(Mutex::new(TcpFlowState {
-                client_next_seq: client_isn.wrapping_add(1),
-                server_next_seq: 1,
-                server_acked_seq: 1,
-                client_window: 65535,
+                client_next_seq: AtomicU32::new(client_isn.wrapping_add(1)),
+                server_next_seq: AtomicU32::new(1),
+                server_acked_seq: AtomicU32::new(1),
+                client_window: AtomicU16::new(65535),
                 reorder_buffer: BTreeMap::new(),
                 reorder_bytes: 0,
                 lifecycle: TcpLifecycle::SynReceived,
@@ -574,9 +586,11 @@ impl TcpHandler {
         });
 
         let syn_ack_seq = {
-            let mut state = session.state.lock().await;
-            let seq = state.server_next_seq;
-            state.server_next_seq = seq.wrapping_add(1);
+            let state = session.state.lock().await;
+            let seq = state.server_next_seq.load(Ordering::Relaxed);
+            state
+                .server_next_seq
+                .store(seq.wrapping_add(1), Ordering::Relaxed);
             seq
         };
 
@@ -676,7 +690,10 @@ impl TcpHandler {
                 if let Some(err) = write_result {
                     let (sequence_number, acknowledgment_number) = {
                         let s = state.lock().await;
-                        (s.server_next_seq, s.client_next_seq)
+                        (
+                            s.server_next_seq.load(Ordering::Relaxed),
+                            s.client_next_seq.load(Ordering::Relaxed),
+                        )
                     };
                     let _ = packet::packet_build::inject_tcp_control(
                         &tun_packet_tx,
@@ -700,7 +717,10 @@ impl TcpHandler {
                     if s.lifecycle == TcpLifecycle::SynReceived {
                         s.lifecycle = TcpLifecycle::Established;
                     }
-                    (s.server_next_seq, s.client_next_seq)
+                    (
+                        s.server_next_seq.load(Ordering::Relaxed),
+                        s.client_next_seq.load(Ordering::Relaxed),
+                    )
                 };
                 let _ = packet::packet_build::inject_tcp_control(
                     &tun_packet_tx,
@@ -759,11 +779,17 @@ impl TcpHandler {
                         let notified = session.window_notify.notified();
                         let (terminated, can_send) = {
                             let state = session.state.lock().await;
-                            if state.lifecycle == TcpLifecycle::Closed || state.lifecycle == TcpLifecycle::FinSent {
+                            if state.lifecycle == TcpLifecycle::Closed
+                                || state.lifecycle == TcpLifecycle::FinSent
+                            {
                                 (true, false)
                             } else {
-                                let in_flight = state.server_next_seq.wrapping_sub(state.server_acked_seq) as usize;
-                                let wnd = usize::from(state.client_window).max(1);
+                                let in_flight =
+                                    state.server_next_seq.load(Ordering::Relaxed).wrapping_sub(
+                                        state.server_acked_seq.load(Ordering::Relaxed),
+                                    ) as usize;
+                                let wnd =
+                                    usize::from(state.client_window.load(Ordering::Relaxed)).max(1);
                                 (false, in_flight + chunk.len() <= wnd)
                             }
                         };
@@ -789,35 +815,57 @@ impl TcpHandler {
                         if state.lifecycle == TcpLifecycle::SynReceived {
                             state.lifecycle = TcpLifecycle::Established;
                         }
-                        let seq = state.server_next_seq;
-                        let ack = state.client_next_seq;
-                        state.server_next_seq = state.server_next_seq.wrapping_add(chunk.len() as u32);
+                        let seq = state.server_next_seq.load(Ordering::Relaxed);
+                        let ack = state.client_next_seq.load(Ordering::Relaxed);
+                        state
+                            .server_next_seq
+                            .store(seq.wrapping_add(chunk.len() as u32), Ordering::Relaxed);
                         state.last_activity = Instant::now();
                         (seq, ack)
                     };
 
                     let builder = match (flow_key.dst.ip(), flow_key.src.ip()) {
-                        (IpAddr::V4(dst), IpAddr::V4(src)) => PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
-                            .tcp(flow_key.dst.port(), flow_key.src.port(), sequence_number, 65535)
-                            .ack(acknowledgment_number)
-                            .psh(),
-                        (IpAddr::V6(dst), IpAddr::V6(src)) => PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
-                            .tcp(flow_key.dst.port(), flow_key.src.port(), sequence_number, 65535)
-                            .ack(acknowledgment_number)
-                            .psh(),
+                        (IpAddr::V4(dst), IpAddr::V4(src)) => {
+                            PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
+                                .tcp(
+                                    flow_key.dst.port(),
+                                    flow_key.src.port(),
+                                    sequence_number,
+                                    65535,
+                                )
+                                .ack(acknowledgment_number)
+                                .psh()
+                        }
+                        (IpAddr::V6(dst), IpAddr::V6(src)) => {
+                            PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
+                                .tcp(
+                                    flow_key.dst.port(),
+                                    flow_key.src.port(),
+                                    sequence_number,
+                                    65535,
+                                )
+                                .ack(acknowledgment_number)
+                                .psh()
+                        }
                         _ => break,
                     };
 
                     let mut packet = Vec::with_capacity(builder.size(chunk.len()));
                     if let Err(err) = builder.write(&mut packet, chunk) {
-                        warn!("Failed to build reverse TCP packet for flow {:?}: {}", flow_key, err);
+                        warn!(
+                            "Failed to build reverse TCP packet for flow {:?}: {}",
+                            flow_key, err
+                        );
                         continue;
                     }
 
                     let write_result = tun_packet_tx.send(packet).await;
 
                     if let Err(err) = write_result {
-                        warn!("Failed to write reverse TCP packet to TUN for flow {:?}: {}", flow_key, err);
+                        warn!(
+                            "Failed to write reverse TCP packet to TUN for flow {:?}: {}",
+                            flow_key, err
+                        );
                         chunk_write_failed = true;
                         break;
                     }
@@ -831,11 +879,13 @@ impl TcpHandler {
             let (should_send_fin, sequence_number, acknowledgment_number) = {
                 let mut state = session.state.lock().await;
                 if state.lifecycle == TcpLifecycle::Established {
-                    let seq = state.server_next_seq;
-                    state.server_next_seq = state.server_next_seq.wrapping_add(1);
+                    let seq = state.server_next_seq.load(Ordering::Relaxed);
+                    state
+                        .server_next_seq
+                        .store(seq.wrapping_add(1), Ordering::Relaxed);
                     state.lifecycle = TcpLifecycle::FinSent;
                     state.last_activity = Instant::now();
-                    (true, seq, state.client_next_seq)
+                    (true, seq, state.client_next_seq.load(Ordering::Relaxed))
                 } else {
                     (false, 0, 0)
                 }
@@ -843,14 +893,28 @@ impl TcpHandler {
 
             if should_send_fin {
                 let builder = match (flow_key.dst.ip(), flow_key.src.ip()) {
-                    (IpAddr::V4(dst), IpAddr::V4(src)) => PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
-                        .tcp(flow_key.dst.port(), flow_key.src.port(), sequence_number, 65535)
-                        .ack(acknowledgment_number)
-                        .fin(),
-                    (IpAddr::V6(dst), IpAddr::V6(src)) => PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
-                        .tcp(flow_key.dst.port(), flow_key.src.port(), sequence_number, 65535)
-                        .ack(acknowledgment_number)
-                        .fin(),
+                    (IpAddr::V4(dst), IpAddr::V4(src)) => {
+                        PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
+                            .tcp(
+                                flow_key.dst.port(),
+                                flow_key.src.port(),
+                                sequence_number,
+                                65535,
+                            )
+                            .ack(acknowledgment_number)
+                            .fin()
+                    }
+                    (IpAddr::V6(dst), IpAddr::V6(src)) => {
+                        PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
+                            .tcp(
+                                flow_key.dst.port(),
+                                flow_key.src.port(),
+                                sequence_number,
+                                65535,
+                            )
+                            .ack(acknowledgment_number)
+                            .fin()
+                    }
                     _ => return,
                 };
 

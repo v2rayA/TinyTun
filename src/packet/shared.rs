@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -108,10 +109,10 @@ pub struct UdpSessionEntry {
 /// State of a TCP flow.
 #[derive(Debug)]
 pub struct TcpFlowState {
-    pub client_next_seq: u32,
-    pub server_next_seq: u32,
-    pub server_acked_seq: u32,
-    pub client_window: u16,
+    pub client_next_seq: AtomicU32,
+    pub server_next_seq: AtomicU32,
+    pub server_acked_seq: AtomicU32,
+    pub client_window: AtomicU16,
     pub reorder_buffer: BTreeMap<u32, Vec<u8>>,
     pub reorder_bytes: usize,
     pub lifecycle: TcpLifecycle,
@@ -161,7 +162,7 @@ pub fn collect_in_order_payload(
     seg_start: u32,
     payload: &[u8],
 ) -> Vec<u8> {
-    let expected = state.client_next_seq;
+    let expected = state.client_next_seq.load(Ordering::Relaxed);
     let seg_end = seg_start.wrapping_add(payload.len() as u32);
 
     if seq_at_or_after(expected, seg_end) {
@@ -189,7 +190,10 @@ pub fn collect_in_order_payload(
         };
 
         if keep_new {
-            if let Some(existing) = state.reorder_buffer.insert(normalized_seq, normalized.clone()) {
+            if let Some(existing) = state
+                .reorder_buffer
+                .insert(normalized_seq, normalized.clone())
+            {
                 state.reorder_bytes = state.reorder_bytes.saturating_sub(existing.len());
             }
             state.reorder_bytes = state.reorder_bytes.saturating_add(normalized.len());
@@ -205,11 +209,17 @@ pub fn collect_in_order_payload(
     }
 
     let mut out = normalized;
-    state.client_next_seq = state.client_next_seq.wrapping_add(out.len() as u32);
+    state
+        .client_next_seq
+        .store(expected.wrapping_add(out.len() as u32), Ordering::Relaxed);
+    let mut client_next_seq = state.client_next_seq.load(Ordering::Relaxed);
 
-    while let Some(next_chunk) = state.reorder_buffer.remove(&state.client_next_seq) {
+    while let Some(next_chunk) = state.reorder_buffer.remove(&client_next_seq) {
         state.reorder_bytes = state.reorder_bytes.saturating_sub(next_chunk.len());
-        state.client_next_seq = state.client_next_seq.wrapping_add(next_chunk.len() as u32);
+        client_next_seq = client_next_seq.wrapping_add(next_chunk.len() as u32);
+        state
+            .client_next_seq
+            .store(client_next_seq, Ordering::Relaxed);
         out.extend_from_slice(&next_chunk);
     }
 
@@ -287,10 +297,6 @@ pub fn is_proxyable_udp_destination(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4 == Ipv4Addr::new(255, 255, 255, 255))
         }
-        IpAddr::V6(v6) => {
-            !(v6.is_multicast()
-                || v6.is_unicast_link_local()
-                || v6.is_unspecified())
-        }
+        IpAddr::V6(v6) => !(v6.is_multicast() || v6.is_unicast_link_local() || v6.is_unspecified()),
     }
 }

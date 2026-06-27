@@ -4,9 +4,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::packet::shared::{
-    FlowKey, DEFAULT_TCP_WINDOW, DEFAULT_TTL, TUN_WRITE_ENQUEUE_TIMEOUT,
-};
+use crate::packet::shared::{FlowKey, DEFAULT_TCP_WINDOW, DEFAULT_TTL, TUN_WRITE_ENQUEUE_TIMEOUT};
 
 /// Build a UDP/IP packet from source to destination with payload.
 ///
@@ -54,12 +52,22 @@ pub fn build_tcp_packet(
     let mut builder = match (flow_key.dst.ip(), flow_key.src.ip()) {
         (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
             PacketBuilder::ipv4(dst.octets(), src.octets(), DEFAULT_TTL)
-                .tcp(flow_key.dst.port(), flow_key.src.port(), sequence_number, window)
+                .tcp(
+                    flow_key.dst.port(),
+                    flow_key.src.port(),
+                    sequence_number,
+                    window,
+                )
                 .ack(acknowledgment_number)
         }
         (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
             PacketBuilder::ipv6(dst.octets(), src.octets(), DEFAULT_TTL)
-                .tcp(flow_key.dst.port(), flow_key.src.port(), sequence_number, window)
+                .tcp(
+                    flow_key.dst.port(),
+                    flow_key.src.port(),
+                    sequence_number,
+                    window,
+                )
                 .ack(acknowledgment_number)
         }
         _ => return None,
@@ -113,7 +121,7 @@ pub async fn inject_tcp_control(
         )
     })?;
 
-    enqueue_tun_packet_with_timeout(tun_packet_tx.clone(), packet)
+    enqueue_tun_packet_with_timeout(tun_packet_tx, packet)
         .await
         .map_err(|err| {
             anyhow::anyhow!(
@@ -126,7 +134,7 @@ pub async fn inject_tcp_control(
 
 /// Write a packet to the TUN device via the channel.
 pub async fn write_tun_packet_with(
-    tun_packet_tx: mpsc::Sender<Vec<u8>>,
+    tun_packet_tx: &mpsc::Sender<Vec<u8>>,
     packet: Vec<u8>,
 ) -> Result<()> {
     enqueue_tun_packet_with_timeout(tun_packet_tx, packet).await
@@ -134,7 +142,7 @@ pub async fn write_tun_packet_with(
 
 /// Enqueue a packet for TUN write with a timeout.
 pub async fn enqueue_tun_packet_with_timeout(
-    tun_packet_tx: mpsc::Sender<Vec<u8>>,
+    tun_packet_tx: &mpsc::Sender<Vec<u8>>,
     packet: Vec<u8>,
 ) -> Result<()> {
     match timeout(TUN_WRITE_ENQUEUE_TIMEOUT, tun_packet_tx.send(packet)).await {
@@ -143,8 +151,6 @@ pub async fn enqueue_tun_packet_with_timeout(
             "failed to enqueue packet for TUN write: {}",
             err
         )),
-        Err(_) => Err(anyhow::anyhow!(
-            "timed out enqueuing packet for TUN write"
-        )),
+        Err(_) => Err(anyhow::anyhow!("timed out enqueuing packet for TUN write")),
     }
 }

@@ -1,16 +1,14 @@
 mod common;
 mod config;
-mod tun_device;
-mod socks5_client;
+mod dns_hijack;
 mod dns_router;
 mod geosite;
 mod packet;
 mod packet_processor;
-mod route_manager;
 mod process_lookup;
-mod dns_hijack;
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
-mod ebpf_loader;
+mod route_manager;
+mod socks5_client;
+mod tun_device;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -18,6 +16,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use env_logger::Builder;
 use log::{error, info, warn, LevelFilter};
+use mimalloc::MiMalloc;
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -27,8 +26,9 @@ use crate::config::{Config, DnsGroup, DnsQueryStrategy, DnsUpstream, Ipv6Mode, L
 use crate::dns_hijack::DnsHijackState;
 use crate::packet_processor::PacketProcessor;
 use crate::tun_device::TunDevice;
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
-use crate::ebpf_loader::ProcessExclusionEbpf;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum CliIpv6Mode {
@@ -70,7 +70,7 @@ enum Commands {
         /// Hide timestamps in log output
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         log_hide_timestamp: Option<bool>,
-        
+
         /// SOCKS5 proxy address
         #[arg(short, long)]
         socks5: Option<String>,
@@ -118,15 +118,15 @@ enum Commands {
         /// Capture TCP/53 in DNS hijack
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         dns_hijack_capture_tcp: Option<bool>,
-        
+
         /// TUN device name
         #[arg(short, long)]
         interface: Option<String>,
-        
+
         /// TUN device IP address
         #[arg(long)]
         ip: Option<Ipv4Addr>,
-        
+
         /// TUN device netmask
         #[arg(short, long)]
         netmask: Option<Ipv4Addr>,
@@ -184,7 +184,7 @@ enum Commands {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     match cli.command {
         Commands::Run {
             config,
@@ -218,12 +218,9 @@ async fn main() -> Result<()> {
             auto_detect_interface,
             default_interface,
         } => {
-            let config_path_for_runtime = config.clone();
-            let exclude_process_cli_overridden = !exclude_process.is_empty();
-
-            let config = load_config(
-                config,
-                loglevel.map(Into::into),
+            let overrides = ConfigOverrides {
+                config_path: config,
+                loglevel: loglevel.map(Into::into),
                 log_hide_timestamp,
                 socks5,
                 socks5_username,
@@ -240,7 +237,7 @@ async fn main() -> Result<()> {
                 interface,
                 ip,
                 netmask,
-                ipv6_mode.map(|m| m.into()),
+                ipv6_mode: ipv6_mode.map(|m| m.into()),
                 ipv6,
                 ipv6_prefix,
                 auto_route,
@@ -252,23 +249,17 @@ async fn main() -> Result<()> {
                 exclude_process,
                 auto_detect_interface,
                 default_interface,
-            )?;
+            };
+            let config = load_config(overrides.config_path.clone(), overrides)?;
             init_logging(config.log.loglevel.clone(), config.log.hide_timestamp);
             install_rustls_crypto_provider();
-            run_proxy(
-                config,
-                config_path_for_runtime,
-                exclude_process_cli_overridden,
-            )
-            .await
+            run_proxy(config).await
         }
     }
 }
 
 enum RuntimeEvent {
     PhysicalNetworkDown(String),
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    ExcludedProcessesUpdated(Vec<String>),
 }
 
 struct RuntimeSession {
@@ -281,10 +272,6 @@ struct RuntimeSession {
         std::sync::Arc<dashmap::DashMap<std::net::IpAddr, std::time::Instant>>,
     processor_handle: tokio::task::JoinHandle<()>,
     interface_monitor_handle: Option<tokio::task::JoinHandle<()>>,
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    process_exclusion_ebpf: Option<ProcessExclusionEbpf>,
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    config_reload_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeSession {
@@ -299,70 +286,76 @@ impl RuntimeSession {
             let _ = handle.await;
         }
 
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
-        if let Some(handle) = self.config_reload_handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        // Extract all values before closures to avoid borrow conflicts with self.tun_device.
+        let tun_name = self.tun_device.name().to_string();
+        let dns_state = self.dns_hijack_state.take();
+        let dyn_ips = self.dynamic_bypass_ips_handle.clone();
+        let auto_route_applied = self.auto_route_applied;
+        let skip_ip_routes_applied = self.skip_ip_routes_applied;
+        let skip_network_routes_applied = self.skip_network_routes_applied;
 
-        if self.auto_route_applied {
-            if let Err(err) = route_manager::cleanup_auto_routes(self.tun_device.name(), ipv6_enabled) {
-                warn!("Failed to cleanup automatic routes: {}", err);
-            }
-        }
-
-        if config.dns.hijack.enabled {
-            if let Err(err) = dns_hijack::cleanup_dns_hijack(self.dns_hijack_state.as_ref()) {
-                warn!("Failed to cleanup DNS hijack rules: {}", err);
-            }
-        }
-
-        if config.tun.auto_route {
-            let dynamic_targets: Vec<std::net::IpAddr> = {
-                self.dynamic_bypass_ips_handle
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect()
-            };
-            if !dynamic_targets.is_empty() {
-                if let Err(err) = route_manager::cleanup_skip_ip_routes(&dynamic_targets) {
-                    warn!("Failed to cleanup dynamic bypass routes: {}", err);
+        // Run independent cleanup tasks in parallel for lower shutdown latency.
+        let cleanup_auto = async {
+            if auto_route_applied {
+                if let Err(err) = route_manager::cleanup_auto_routes(&tun_name, ipv6_enabled) {
+                    warn!("Failed to cleanup automatic routes: {}", err);
                 }
             }
-        }
+        };
 
-        if self.skip_ip_routes_applied {
-            if let Err(err) = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips) {
-                warn!("Failed to cleanup skip_ip bypass routes: {}", err);
+        let cleanup_dns = async {
+            if config.dns.hijack.enabled {
+                if let Err(err) = dns_hijack::cleanup_dns_hijack(dns_state.as_ref()) {
+                    warn!("Failed to cleanup DNS hijack rules: {}", err);
+                }
             }
-        }
+        };
 
-        if self.skip_network_routes_applied {
-            if let Err(err) = route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks) {
-                warn!("Failed to cleanup skip_network bypass routes: {}", err);
+        let cleanup_dynamic = async {
+            if config.tun.auto_route {
+                let dynamic_targets: Vec<std::net::IpAddr> =
+                    { dyn_ips.iter().map(|entry| *entry.key()).collect() };
+                if !dynamic_targets.is_empty() {
+                    if let Err(err) = route_manager::cleanup_skip_ip_routes(&dynamic_targets) {
+                        warn!("Failed to cleanup dynamic bypass routes: {}", err);
+                    }
+                }
             }
-        }
+        };
 
+        let cleanup_skip_ip = async {
+            if skip_ip_routes_applied {
+                if let Err(err) = route_manager::cleanup_skip_ip_routes(&config.filtering.skip_ips)
+                {
+                    warn!("Failed to cleanup skip_ip bypass routes: {}", err);
+                }
+            }
+        };
+
+        let cleanup_skip_net = async {
+            if skip_network_routes_applied {
+                if let Err(err) =
+                    route_manager::cleanup_skip_network_routes(&config.filtering.skip_networks)
+                {
+                    warn!("Failed to cleanup skip_network bypass routes: {}", err);
+                }
+            }
+        };
+
+        tokio::join!(
+            cleanup_auto,
+            cleanup_dns,
+            cleanup_dynamic,
+            cleanup_skip_ip,
+            cleanup_skip_net,
+        );
+
+        // Run TUN device cleanup separately (needs &mut self).
         self.tun_device.cleanup().await
-    }
-
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    fn update_excluded_processes(&mut self, new_names: &[String]) -> Result<()> {
-        if let Some(ebpf) = self.process_exclusion_ebpf.as_mut() {
-            ebpf.update_excluded_processes(new_names)?;
-        }
-        Ok(())
     }
 }
 
-async fn run_proxy(
-    config: Config,
-    config_path: Option<String>,
-    exclude_process_cli_overridden: bool,
-) -> Result<()> {
-    #[allow(unused_mut)]
-    let mut config = config;
-
+async fn run_proxy(config: Config) -> Result<()> {
     info!("Starting TinyTun with configuration: {:?}", config);
 
     preflight_checks(&config).await?;
@@ -376,16 +369,7 @@ async fn run_proxy(
 
     loop {
         let (runtime_tx, mut runtime_rx) = mpsc::channel::<RuntimeEvent>(4);
-        #[allow(unused_mut)]
-        let mut session = match start_runtime_session(
-            &config,
-            ipv6_enabled,
-            runtime_tx.clone(),
-            config_path.as_deref(),
-            exclude_process_cli_overridden,
-        )
-        .await
-        {
+        let session = match start_runtime_session(&config, ipv6_enabled, runtime_tx.clone()).await {
             Ok(session) => session,
             Err(err) => {
                 if config.tun.auto_route && is_waitable_network_error(&err) {
@@ -419,18 +403,6 @@ async fn run_proxy(
                         Some(RuntimeEvent::PhysicalNetworkDown(reason)) => {
                             restart_reason = Some(reason);
                             break;
-                        }
-                        #[cfg(all(target_os = "linux", feature = "ebpf"))]
-                        Some(RuntimeEvent::ExcludedProcessesUpdated(new_names)) => {
-                            match session.update_excluded_processes(&new_names) {
-                                Ok(()) => {
-                                    config.filtering.exclude_processes = new_names;
-                                    info!("Synchronized excluded process list to eBPF map after config reload");
-                                }
-                                Err(err) => {
-                                    warn!("Failed to synchronize excluded process list to eBPF map: {}", err);
-                                }
-                            }
                         }
                         None => {
                             shutdown_error = Some("runtime monitor channel closed unexpectedly".to_string());
@@ -470,7 +442,8 @@ async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         tokio::select! {
             _ = signal::ctrl_c() => {},
             _ = sigterm.recv() => {},
@@ -515,8 +488,6 @@ async fn start_runtime_session(
     config: &Config,
     ipv6_enabled: bool,
     runtime_tx: mpsc::Sender<RuntimeEvent>,
-    _config_path: Option<&str>,
-    _exclude_process_cli_overridden: bool,
 ) -> Result<RuntimeSession> {
     // Apply skip routes BEFORE creating TUN device to ensure specific IPs are
     // routed to physical port.
@@ -571,7 +542,11 @@ async fn start_runtime_session(
         &config.tun.name,
         config.tun.ip,
         config.tun.netmask,
-        if ipv6_enabled { Some(config.tun.ipv6) } else { None },
+        if ipv6_enabled {
+            Some(config.tun.ipv6)
+        } else {
+            None
+        },
         config.tun.ipv6_prefix,
         config.tun.auto_route,
         config.tun.mtu,
@@ -580,7 +555,11 @@ async fn start_runtime_session(
     {
         Ok(device) => device,
         Err(err) => {
-            cleanup_startup_skip_routes(config, skip_ip_routes_applied, skip_network_routes_applied);
+            cleanup_startup_skip_routes(
+                config,
+                skip_ip_routes_applied,
+                skip_network_routes_applied,
+            );
             return Err(err);
         }
     };
@@ -592,7 +571,10 @@ async fn start_runtime_session(
         match route_manager::apply_auto_routes(tun_device.name(), ipv6_enabled) {
             Ok(()) => {
                 auto_route_applied = true;
-                info!("Automatic routing enabled for interface {}", tun_device.name());
+                info!(
+                    "Automatic routing enabled for interface {}",
+                    tun_device.name()
+                );
             }
             Err(err) => {
                 cleanup_startup_failure(
@@ -612,15 +594,6 @@ async fn start_runtime_session(
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    let (process_exclusion_ebpf, enable_user_space_process_exclusion) =
-        maybe_attach_process_exclusion_ebpf(
-            config,
-            selected_outbound_interface.as_deref(),
-            auto_route_applied,
-        );
-
-    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
     let enable_user_space_process_exclusion = true;
 
     // Create packet processor.
@@ -654,8 +627,7 @@ async fn start_runtime_session(
                 dns_hijack_state = state;
                 info!(
                     "DNS hijack enabled (mark=0x{:x}, table={})",
-                    config.dns.hijack.mark,
-                    config.dns.hijack.table_id
+                    config.dns.hijack.mark, config.dns.hijack.table_id
                 );
             }
             Err(err) => {
@@ -672,26 +644,6 @@ async fn start_runtime_session(
             }
         }
     }
-
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    let config_reload_handle = if process_exclusion_ebpf.is_some() {
-        if _exclude_process_cli_overridden {
-            info!(
-                "Excluded-process hot reload is disabled because --exclude-process CLI override is active"
-            );
-            None
-        } else if let Some(path) = _config_path {
-            Some(spawn_excluded_processes_reload_monitor(
-                path.to_string(),
-                config.filtering.exclude_processes.clone(),
-                runtime_tx.clone(),
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
 
     let interface_monitor_handle = if config.tun.auto_route {
         selected_outbound_interface
@@ -718,124 +670,6 @@ async fn start_runtime_session(
         dynamic_bypass_ips_handle,
         processor_handle,
         interface_monitor_handle,
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
-        process_exclusion_ebpf,
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
-        config_reload_handle,
-    })
-}
-
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn maybe_attach_process_exclusion_ebpf(
-    config: &Config,
-    outbound_interface: Option<&str>,
-    auto_route_applied: bool,
-) -> (Option<ProcessExclusionEbpf>, bool) {
-    if config.filtering.exclude_processes.is_empty() {
-        return (None, true);
-    }
-
-    if !config.tun.auto_route || !auto_route_applied {
-        warn!(
-            "eBPF process exclusion requires active TUN auto-route rules; falling back to user-space lookup"
-        );
-        return (None, true);
-    }
-
-    let Some(interface) = outbound_interface else {
-        warn!(
-            "eBPF process exclusion requires a resolved outbound interface; falling back to user-space lookup"
-        );
-        return (None, true);
-    };
-
-    match ProcessExclusionEbpf::attach("/sys/fs/cgroup", interface, &config.filtering.exclude_processes)
-    {
-        Ok(handle) => {
-            info!(
-                "eBPF process exclusion enabled on interface {}; user-space process exclusion checks are disabled",
-                interface
-            );
-            (Some(handle), false)
-        }
-        Err(err) => {
-            warn!(
-                "Failed to enable eBPF process exclusion ({}); falling back to user-space process lookup",
-                err
-            );
-            (None, true)
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn spawn_excluded_processes_reload_monitor(
-    config_path: String,
-    mut last_excluded_processes: Vec<String>,
-    runtime_tx: mpsc::Sender<RuntimeEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut last_modified = std::fs::metadata(&config_path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
-
-        loop {
-            sleep(Duration::from_secs(2)).await;
-
-            let metadata = match std::fs::metadata(&config_path) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    warn!(
-                        "Excluded-process hot reload: failed to stat config {}: {}",
-                        config_path,
-                        err
-                    );
-                    continue;
-                }
-            };
-
-            let modified = metadata.modified().ok();
-            if let (Some(prev), Some(now)) = (last_modified, modified) {
-                if now <= prev {
-                    continue;
-                }
-            }
-            last_modified = modified;
-
-            let loaded = match Config::from_file(&config_path) {
-                Ok(cfg) => cfg,
-                Err(err) => {
-                    warn!(
-                        "Excluded-process hot reload: failed to parse config {}: {}",
-                        config_path,
-                        err
-                    );
-                    continue;
-                }
-            };
-
-            let new_excluded_processes = loaded.filtering.exclude_processes;
-            if new_excluded_processes == last_excluded_processes {
-                continue;
-            }
-
-            let changed_count = new_excluded_processes.len();
-            if runtime_tx
-                .send(RuntimeEvent::ExcludedProcessesUpdated(
-                    new_excluded_processes.clone(),
-                ))
-                .await
-                .is_err()
-            {
-                break;
-            }
-
-            info!(
-                "Detected config reload with updated excluded process list ({} entries)",
-                changed_count
-            );
-            last_excluded_processes = new_excluded_processes;
-        }
     })
 }
 
@@ -919,7 +753,10 @@ async fn wait_for_network_recovery_or_shutdown(config: &Config) -> Result<bool> 
 
         match probe_result {
             Ok(Some(interface)) => {
-                info!("Physical network recovered, outbound interface: {}", interface);
+                info!(
+                    "Physical network recovered, outbound interface: {}",
+                    interface
+                );
                 return Ok(true);
             }
             Ok(None) => {
@@ -950,39 +787,42 @@ fn is_waitable_network_error(err: &anyhow::Error) -> bool {
     msg.contains("routable") || msg.contains("default route") || msg.contains("default interface")
 }
 
-fn load_config(
-    config_path: Option<String>,
-    loglevel: Option<LogLevel>,
-    log_hide_timestamp: Option<bool>,
-    socks5: Option<String>,
-    socks5_username: Option<String>,
-    socks5_password: Option<String>,
-    dns: Vec<String>,
-    dns_route: Vec<CliDnsRoute>,
-    dns_strategy: Option<CliDnsStrategy>,
-    dns_listen_port: Option<u16>,
-    dns_timeout_ms: Option<u64>,
-    dns_hijack_enabled: Option<bool>,
-    dns_hijack_mark: Option<u32>,
-    dns_hijack_table_id: Option<u32>,
-    dns_hijack_capture_tcp: Option<bool>,
-    interface: Option<String>,
-    ip: Option<Ipv4Addr>,
-    netmask: Option<Ipv4Addr>,
-    ipv6_mode: Option<Ipv6Mode>,
-    ipv6: Option<Ipv6Addr>,
-    ipv6_prefix: Option<u8>,
-    auto_route: Option<bool>,
-    mtu: Option<u32>,
-    skip_ip: Vec<IpAddr>,
-    skip_network: Vec<String>,
-    block_port: Vec<u16>,
-    allow_port: Vec<u16>,
-    linux_exclude_process: Vec<String>,
-    auto_detect_interface: Option<bool>,
-    default_interface: Option<String>,
-) -> Result<Config> {
-    let default_interface_cli_provided = default_interface.is_some();
+/// CLI overrides that are merged on top of the file-based configuration.
+pub struct ConfigOverrides {
+    pub config_path: Option<String>,
+    pub loglevel: Option<LogLevel>,
+    pub log_hide_timestamp: Option<bool>,
+    pub socks5: Option<String>,
+    pub socks5_username: Option<String>,
+    pub socks5_password: Option<String>,
+    pub dns: Vec<String>,
+    pub(crate) dns_route: Vec<CliDnsRoute>,
+    pub(crate) dns_strategy: Option<CliDnsStrategy>,
+    pub dns_listen_port: Option<u16>,
+    pub dns_timeout_ms: Option<u64>,
+    pub dns_hijack_enabled: Option<bool>,
+    pub dns_hijack_mark: Option<u32>,
+    pub dns_hijack_table_id: Option<u32>,
+    pub dns_hijack_capture_tcp: Option<bool>,
+    pub interface: Option<String>,
+    pub ip: Option<Ipv4Addr>,
+    pub netmask: Option<Ipv4Addr>,
+    pub ipv6_mode: Option<Ipv6Mode>,
+    pub ipv6: Option<Ipv6Addr>,
+    pub ipv6_prefix: Option<u8>,
+    pub auto_route: Option<bool>,
+    pub mtu: Option<u32>,
+    pub skip_ip: Vec<IpAddr>,
+    pub skip_network: Vec<String>,
+    pub block_port: Vec<u16>,
+    pub allow_port: Vec<u16>,
+    pub exclude_process: Vec<String>,
+    pub auto_detect_interface: Option<bool>,
+    pub default_interface: Option<String>,
+}
+
+fn load_config(config_path: Option<String>, overrides: ConfigOverrides) -> Result<Config> {
+    let default_interface_cli_provided = overrides.default_interface.is_some();
 
     let mut config = if let Some(path) = config_path {
         Config::from_file(&path)?
@@ -991,97 +831,100 @@ fn load_config(
     };
 
     // Override with CLI arguments if provided
-    if let Some(v) = loglevel {
+    if let Some(v) = overrides.loglevel {
         config.log.loglevel = v;
     }
-    if let Some(v) = log_hide_timestamp {
+    if let Some(v) = overrides.log_hide_timestamp {
         config.log.hide_timestamp = v;
     }
 
-    if let Some(socks5_addr) = socks5 {
+    if let Some(socks5_addr) = overrides.socks5 {
         config.socks5.address = socks5_addr.parse()?;
     }
-    if let Some(v) = socks5_username {
+    if let Some(v) = overrides.socks5_username {
         config.socks5.username = Some(v);
     }
-    if let Some(v) = socks5_password {
+    if let Some(v) = overrides.socks5_password {
         config.socks5.password = Some(v);
     }
 
-    if !dns.is_empty() {
-        let strategy = dns_strategy.map(Into::into).unwrap_or(DnsQueryStrategy::Sequential);
-        let groups = build_dns_groups_from_cli(&dns, &dns_route, strategy)?;
+    if !overrides.dns.is_empty() {
+        let strategy = overrides
+            .dns_strategy
+            .map(Into::into)
+            .unwrap_or(DnsQueryStrategy::Sequential);
+        let groups = build_dns_groups_from_cli(&overrides.dns, &overrides.dns_route, strategy)?;
         config.dns.groups = groups;
     }
 
-    if let Some(port) = dns_listen_port {
+    if let Some(port) = overrides.dns_listen_port {
         config.dns.listen_port = port;
     }
-    if let Some(v) = dns_timeout_ms {
+    if let Some(v) = overrides.dns_timeout_ms {
         config.dns.timeout_ms = v;
     }
-    if let Some(v) = dns_hijack_enabled {
+    if let Some(v) = overrides.dns_hijack_enabled {
         config.dns.hijack.enabled = v;
     }
-    if let Some(v) = dns_hijack_mark {
+    if let Some(v) = overrides.dns_hijack_mark {
         config.dns.hijack.mark = v;
     }
-    if let Some(v) = dns_hijack_table_id {
+    if let Some(v) = overrides.dns_hijack_table_id {
         config.dns.hijack.table_id = v;
     }
-    if let Some(v) = dns_hijack_capture_tcp {
+    if let Some(v) = overrides.dns_hijack_capture_tcp {
         config.dns.hijack.capture_tcp = v;
     }
 
-    if let Some(name) = interface {
+    if let Some(name) = overrides.interface {
         config.tun.name = name;
     }
-    if let Some(v) = ip {
+    if let Some(v) = overrides.ip {
         config.tun.ip = v;
     }
-    if let Some(v) = netmask {
+    if let Some(v) = overrides.netmask {
         config.tun.netmask = v;
     }
-    if let Some(v) = ipv6_mode {
+    if let Some(v) = overrides.ipv6_mode {
         config.tun.ipv6_mode = v;
     }
-    if let Some(v) = ipv6 {
+    if let Some(v) = overrides.ipv6 {
         config.tun.ipv6 = v;
     }
-    if let Some(v) = ipv6_prefix {
+    if let Some(v) = overrides.ipv6_prefix {
         config.tun.ipv6_prefix = v;
     }
-    if let Some(v) = auto_route {
+    if let Some(v) = overrides.auto_route {
         config.tun.auto_route = v;
     }
-    if let Some(v) = mtu {
+    if let Some(v) = overrides.mtu {
         config.tun.mtu = v;
     }
-    if !skip_ip.is_empty() {
-        config.filtering.skip_ips = skip_ip;
+    if !overrides.skip_ip.is_empty() {
+        config.filtering.skip_ips = overrides.skip_ip;
     }
-    if !skip_network.is_empty() {
-        config.filtering.skip_networks = skip_network;
+    if !overrides.skip_network.is_empty() {
+        config.filtering.skip_networks = overrides.skip_network;
     }
-    if !block_port.is_empty() {
-        config.filtering.block_ports = block_port;
+    if !overrides.block_port.is_empty() {
+        config.filtering.block_ports = overrides.block_port;
     }
-    if !allow_port.is_empty() {
-        config.filtering.allow_ports = allow_port;
+    if !overrides.allow_port.is_empty() {
+        config.filtering.allow_ports = overrides.allow_port;
     }
-    if !linux_exclude_process.is_empty() {
-        config.filtering.exclude_processes = linux_exclude_process;
+    if !overrides.exclude_process.is_empty() {
+        config.filtering.exclude_processes = overrides.exclude_process;
     }
-    if let Some(v) = auto_detect_interface {
+    if let Some(v) = overrides.auto_detect_interface {
         config.route.auto_detect_interface = v;
     }
-    if let Some(v) = default_interface {
+    if let Some(v) = overrides.default_interface {
         config.route.default_interface = Some(v);
     }
 
     // CLI ergonomics: if user manually sets --default-interface without explicitly
     // setting --auto-detect-interface, treat it as manual mode.
-    if default_interface_cli_provided && auto_detect_interface.is_none() {
+    if default_interface_cli_provided && overrides.auto_detect_interface.is_none() {
         config.route.auto_detect_interface = false;
     }
 
@@ -1106,7 +949,8 @@ fn load_config(
     }
 
     // Ensure all proxy IPs are never captured by the TUN device (prevents routing loops).
-    let proxy_ips: Vec<std::net::IpAddr> = config.all_proxies()
+    let proxy_ips: Vec<std::net::IpAddr> = config
+        .all_proxies()
         .map(|p| p.address.ip())
         .filter(|ip| !config.should_skip_ip(*ip))
         .collect();

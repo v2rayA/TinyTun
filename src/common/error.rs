@@ -37,9 +37,6 @@ pub enum TinyTunError {
     #[error("DNS hijack error: {0}")]
     DnsHijack(String),
 
-    #[error("eBPF loader error: {0}")]
-    Ebpf(String),
-
     #[error("Timeout: {0}")]
     Timeout(String),
 

@@ -106,10 +106,7 @@ impl UdpHandler {
         if !packet::shared::is_proxyable_udp_destination(target_addr.ip()) {
             debug!(
                 "Skipping local-scope UDP flow {}:{} -> {}:{}",
-                ip_packet.src,
-                source_port,
-                ip_packet.dst,
-                dest_port
+                ip_packet.src, source_port, ip_packet.dst, dest_port
             );
             return Ok(());
         }
@@ -172,7 +169,7 @@ impl UdpHandler {
                                 None => return,
                             };
                             let _ = packet::packet_build::write_tun_packet_with(
-                                tun_packet_tx,
+                                &tun_packet_tx,
                                 response_packet,
                             )
                             .await;
@@ -198,8 +195,15 @@ impl UdpHandler {
 
                 debug!(
                     "{} UDP {}:{} -> {}:{}: direct forwarding via physical NIC",
-                    if is_static_bypass { "Static bypass" } else { "Excluded process" },
-                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                    if is_static_bypass {
+                        "Static bypass"
+                    } else {
+                        "Excluded process"
+                    },
+                    ip_packet.src,
+                    source_port,
+                    ip_packet.dst,
+                    dest_port
                 );
                 return Ok(());
             }
@@ -236,10 +240,7 @@ impl UdpHandler {
 
             debug!(
                 "Excluded process flow (UDP) {}:{} -> {}:{}: route-based bypass",
-                ip_packet.src,
-                source_port,
-                ip_packet.dst,
-                dest_port
+                ip_packet.src, source_port, ip_packet.dst, dest_port
             );
             return Ok(());
         }
@@ -248,14 +249,28 @@ impl UdpHandler {
             let dns_permit = match self.dns_task_limiter.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    debug!(
-                        "Dropping DNS packet due to task concurrency limit {}:{} -> {}:{}",
-                        ip_packet.src,
-                        source_port,
-                        ip_packet.dst,
-                        dest_port
-                    );
-                    return Ok(());
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        self.dns_task_limiter.clone().acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => {
+                            debug!(
+                                "Dropping DNS packet (semaphore error) {}:{} -> {}:{}",
+                                ip_packet.src, source_port, ip_packet.dst, dest_port
+                            );
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            debug!(
+                                "Dropping DNS packet (rate limit, timed out waiting) {}:{} -> {}:{}",
+                                ip_packet.src, source_port, ip_packet.dst, dest_port
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
             };
 
@@ -270,13 +285,13 @@ impl UdpHandler {
 
                 let dns_txid = packet::shared::dns_txid(&udp_payload);
                 let response_payload = match dns_router.resolve(&udp_payload).await {
-                    Ok(resp) => packet::shared::normalize_dns_response_for_query(&udp_payload, resp),
+                    Ok(resp) => {
+                        packet::shared::normalize_dns_response_for_query(&udp_payload, resp)
+                    }
                     Err(err) => {
                         warn!(
                             "DNS forwarding failed for {}:{}: {}; returning spoofed SERVFAIL",
-                            dst_ip,
-                            dest_port,
-                            err
+                            dst_ip, dest_port, err
                         );
                         packet::shared::build_dns_servfail_response(&udp_payload)
                     }
@@ -291,7 +306,7 @@ impl UdpHandler {
                     None => return,
                 };
                 let response_len = response_packet.len();
-                if packet::packet_build::write_tun_packet_with(tun_packet_tx, response_packet)
+                if packet::packet_build::write_tun_packet_with(&tun_packet_tx, response_packet)
                     .await
                     .is_err()
                 {
@@ -321,10 +336,7 @@ impl UdpHandler {
         if self.is_udp_flow_in_backoff(&udp_flow_key).await {
             debug!(
                 "Skipping UDP proxy during backoff for {}:{} -> {}:{}",
-                ip_packet.src,
-                source_port,
-                ip_packet.dst,
-                dest_port
+                ip_packet.src, source_port, ip_packet.dst, dest_port
             );
             return Ok(());
         }
@@ -332,14 +344,28 @@ impl UdpHandler {
         let udp_permit = match self.udp_task_limiter.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                debug!(
-                    "Dropping UDP packet due to task concurrency limit {}:{} -> {}:{}",
-                    ip_packet.src,
-                    source_port,
-                    ip_packet.dst,
-                    dest_port
-                );
-                return Ok(());
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    self.udp_task_limiter.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        debug!(
+                            "Dropping UDP packet (semaphore error) {}:{} -> {}:{}",
+                            ip_packet.src, source_port, ip_packet.dst, dest_port
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        debug!(
+                            "Dropping UDP packet (rate limit, timed out waiting) {}:{} -> {}:{}",
+                            ip_packet.src, source_port, ip_packet.dst, dest_port
+                        );
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -383,11 +409,7 @@ impl UdpHandler {
                     .await;
                     warn!(
                         "UDP proxying failed for {}:{} -> {}:{}: {}",
-                        src_ip,
-                        source_port,
-                        dst_ip,
-                        dest_port,
-                        err
+                        src_ip, source_port, dst_ip, dest_port, err
                     );
                     return;
                 }
@@ -402,10 +424,7 @@ impl UdpHandler {
                     .await;
                     warn!(
                         "UDP proxy timeout for {}:{} -> {}:{}",
-                        src_ip,
-                        source_port,
-                        dst_ip,
-                        dest_port
+                        src_ip, source_port, dst_ip, dest_port
                     );
                     return;
                 }
@@ -420,7 +439,7 @@ impl UdpHandler {
                 None => return,
             };
             let response_len = response_packet.len();
-            if packet::packet_build::write_tun_packet_with(tun_packet_tx, response_packet)
+            if packet::packet_build::write_tun_packet_with(&tun_packet_tx, response_packet)
                 .await
                 .is_err()
             {
@@ -429,11 +448,7 @@ impl UdpHandler {
 
             debug!(
                 "Proxied UDP flow {}:{} -> {}:{} and injected {} bytes back to TUN",
-                src_ip,
-                source_port,
-                dst_ip,
-                dest_port,
-                response_len
+                src_ip, source_port, dst_ip, dest_port, response_len
             );
         });
 
@@ -447,15 +462,22 @@ impl UdpHandler {
         flow_key: UdpFlowKey,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        if let Some(session) = Self::get_cached_udp_session_shared(udp_sessions.clone(), &flow_key).await {
-            match Self::exchange_udp_on_session_shared(udp_sessions.clone(), session, &flow_key, &payload).await {
+        if let Some(session) =
+            Self::get_cached_udp_session_shared(udp_sessions.clone(), &flow_key).await
+        {
+            match Self::exchange_udp_on_session_shared(
+                udp_sessions.clone(),
+                session,
+                &flow_key,
+                &payload,
+            )
+            .await
+            {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
                     debug!(
                         "Existing UDP ASSOCIATE session failed for {} -> {}: {}; recreating",
-                        flow_key.src,
-                        flow_key.dst,
-                        err
+                        flow_key.src, flow_key.dst, err
                     );
                     Self::remove_udp_session_shared(udp_sessions.clone(), &flow_key).await;
                 }
@@ -542,7 +564,9 @@ impl UdpHandler {
         let removed = {
             let now = Instant::now();
             let before = self.udp_sessions.len();
-            self.udp_sessions.retain(|_, entry| now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT);
+            self.udp_sessions.retain(|_, entry| {
+                now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT
+            });
             before.saturating_sub(self.udp_sessions.len())
         };
 

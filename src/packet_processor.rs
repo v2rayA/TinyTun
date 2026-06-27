@@ -22,13 +22,30 @@ pub struct PacketProcessor {
     pub udp_handler: UdpHandler,
 }
 
+#[derive(Debug)]
+enum PacketProcessError {
+    TooShort,
+    ParseError(String),
+}
+
+impl std::fmt::Display for PacketProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketProcessError::TooShort => write!(f, "packet too short"),
+            PacketProcessError::ParseError(msg) => write!(f, "parse error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PacketProcessError {}
+
 impl PacketProcessor {
     const TCP_SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     const DYNAMIC_BYPASS_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const UDP_SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const PROCESS_CACHE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const PROCESS_CACHE_MAX_ENTRIES: usize = 1024;
-    const TUN_WRITE_QUEUE_CAPACITY: usize = 512;
+    const TUN_WRITE_QUEUE_CAPACITY: usize = 2048;
 
     pub fn new(
         config: Config,
@@ -37,12 +54,18 @@ impl PacketProcessor {
         enable_user_space_process_exclusion: bool,
     ) -> Result<Self> {
         let config = Arc::new(config);
-        let outbound_interface_arc = outbound_interface
-            .as_deref()
-            .map(Arc::<str>::from);
-        let socks5_client = Arc::new(Socks5Client::new(config.socks5.clone(), outbound_interface.clone()));
-        let dns_router = Arc::new(DnsRouter::new(config.dns.clone(), &config, outbound_interface.clone())?);
-        let (tun_packet_tx, mut tun_packet_rx) = mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
+        let outbound_interface_arc = outbound_interface.as_deref().map(Arc::<str>::from);
+        let socks5_client = Arc::new(Socks5Client::new(
+            config.socks5.clone(),
+            outbound_interface.clone(),
+        ));
+        let dns_router = Arc::new(DnsRouter::new(
+            config.dns.clone(),
+            &config,
+            outbound_interface.clone(),
+        )?);
+        let (tun_packet_tx, mut tun_packet_rx) =
+            mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
 
         tokio::spawn(async move {
             while let Some(packet) = tun_packet_rx.recv().await {
@@ -148,16 +171,17 @@ impl PacketProcessor {
         }
     }
 
-    async fn process_packet(&self, packet: &[u8]) -> Result<()> {
+    async fn process_packet(&self, packet: &[u8]) -> Result<(), PacketProcessError> {
         // Parse IP header
         if packet.len() < 20 {
-            return Err(anyhow::anyhow!("Packet too short"));
+            return Err(PacketProcessError::TooShort);
         }
 
         let ip_version = packet[0] >> 4;
         let parsed = match ip_version {
             4 => {
-                let ip_header = Ipv4HeaderSlice::from_slice(packet)?;
+                let ip_header = Ipv4HeaderSlice::from_slice(packet)
+                    .map_err(|e| PacketProcessError::ParseError(e.to_string()))?;
                 ParsedIpPacket {
                     src: ip_header.source_addr().into(),
                     dst: ip_header.destination_addr().into(),
@@ -167,10 +191,11 @@ impl PacketProcessor {
             }
             6 => {
                 if packet.len() < 40 {
-                    return Err(anyhow::anyhow!("IPv6 packet too short"));
+                    return Err(PacketProcessError::TooShort);
                 }
 
-                let ip_header = Ipv6HeaderSlice::from_slice(packet)?;
+                let ip_header = Ipv6HeaderSlice::from_slice(packet)
+                    .map_err(|e| PacketProcessError::ParseError(e.to_string()))?;
                 ParsedIpPacket {
                     src: ip_header.source_addr().into(),
                     dst: ip_header.destination_addr().into(),
@@ -200,14 +225,20 @@ impl PacketProcessor {
 
         // Handle different protocols
         match parsed.protocol {
-            6 => self
-                .tcp_handler
-                .handle_tcp_packet(packet, &parsed, is_static_bypass)
-                .await,
-            17 => self
-                .udp_handler
-                .handle_udp_packet(packet, &parsed, is_static_bypass)
-                .await,
+            6 => {
+                self.tcp_handler
+                    .handle_tcp_packet(packet, &parsed, is_static_bypass)
+                    .await
+                    .map_err(|e| PacketProcessError::ParseError(e.to_string()))?;
+                Ok(())
+            }
+            17 => {
+                self.udp_handler
+                    .handle_udp_packet(packet, &parsed, is_static_bypass)
+                    .await
+                    .map_err(|e| PacketProcessError::ParseError(e.to_string()))?;
+                Ok(())
+            }
             _ => {
                 debug!("Unsupported protocol number: {}", parsed.protocol);
                 Ok(())

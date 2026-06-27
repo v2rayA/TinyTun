@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::fs;
 
 use serde::{Deserialize, Serialize};
 
@@ -291,12 +291,13 @@ pub struct FilteringConfig {
     /// Pre-parsed CIDR networks; mirrors `skip_networks` (no per-packet re-parsing).
     #[serde(skip)]
     pub(crate) skip_networks_parsed: Vec<ipnetwork::IpNetwork>,
-    /// Prefix-indexed IPv4 CIDRs for fast skip checks.
+    /// Flat list of (prefix, masked_network) tuples for IPv4 CIDR skip checks.
+    /// Populated by `finalize()`. Linear scan – typical size is < 10 entries.
     #[serde(skip)]
-    pub(crate) skip_networks_v4_by_prefix: HashMap<u8, HashSet<u32>>,
-    /// Prefix-indexed IPv6 CIDRs for fast skip checks.
+    pub(crate) skip_networks_v4_flat: Vec<(u8, u32)>,
+    /// Flat list of (prefix, masked_network) tuples for IPv6 CIDR skip checks.
     #[serde(skip)]
-    pub(crate) skip_networks_v6_by_prefix: HashMap<u8, HashSet<u128>>,
+    pub(crate) skip_networks_v6_flat: Vec<(u8, u128)>,
     /// Fast O(1) lookup set for blocked ports.
     #[serde(skip)]
     pub(crate) block_ports_set: HashSet<u16>,
@@ -336,25 +337,19 @@ impl FilteringConfig {
             .filter_map(|s| s.parse().ok())
             .collect();
 
-        self.skip_networks_v4_by_prefix.clear();
-        self.skip_networks_v6_by_prefix.clear();
+        self.skip_networks_v4_flat.clear();
+        self.skip_networks_v6_flat.clear();
         for network in &self.skip_networks_parsed {
             match network {
                 ipnetwork::IpNetwork::V4(v4) => {
                     let prefix = v4.prefix();
                     let masked = Self::mask_ipv4(u32::from(v4.ip()), prefix);
-                    self.skip_networks_v4_by_prefix
-                        .entry(prefix)
-                        .or_default()
-                        .insert(masked);
+                    self.skip_networks_v4_flat.push((prefix, masked));
                 }
                 ipnetwork::IpNetwork::V6(v6) => {
                     let prefix = v6.prefix();
                     let masked = Self::mask_ipv6(u128::from(v6.ip()), prefix);
-                    self.skip_networks_v6_by_prefix
-                        .entry(prefix)
-                        .or_default()
-                        .insert(masked);
+                    self.skip_networks_v6_flat.push((prefix, masked));
                 }
             }
         }
@@ -427,10 +422,7 @@ impl Default for DnsConfig {
             groups: vec![
                 DnsGroup {
                     name: "direct".to_string(),
-                    servers: vec![
-                        "114.114.114.114:53".to_string(),
-                        "223.5.5.5:53".to_string(),
-                    ],
+                    servers: vec!["114.114.114.114:53".to_string(), "223.5.5.5:53".to_string()],
                     strategy: DnsQueryStrategy::Concurrent,
                     upstream: DnsUpstream::Direct,
                     protocol: DnsProtocol::Udp,
@@ -438,10 +430,7 @@ impl Default for DnsConfig {
                 },
                 DnsGroup {
                     name: "proxy".to_string(),
-                    servers: vec![
-                        "8.8.8.8:53".to_string(),
-                        "1.1.1.1:53".to_string(),
-                    ],
+                    servers: vec!["8.8.8.8:53".to_string(), "1.1.1.1:53".to_string()],
                     strategy: DnsQueryStrategy::Concurrent,
                     upstream: DnsUpstream::Named("proxy".to_string()),
                     protocol: DnsProtocol::Udp,
@@ -482,24 +471,24 @@ impl Default for FilteringConfig {
     fn default() -> Self {
         let mut cfg = Self {
             skip_ips: vec![
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // localhost
-                IpAddr::V6(Ipv6Addr::LOCALHOST), // localhost v6
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),  // localhost
+                IpAddr::V6(Ipv6Addr::LOCALHOST),          // localhost v6
                 IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), // TUN interface
             ],
             skip_networks: vec![
-                "127.0.0.0/8".to_string(),      // Localhost
-                "169.254.0.0/16".to_string(),   // Link-local
-                "::1/128".to_string(),          // Localhost v6
-                "fc00::/7".to_string(),         // Unique local addresses
-                "fe80::/10".to_string(),        // Link-local v6
+                "127.0.0.0/8".to_string(),    // Localhost
+                "169.254.0.0/16".to_string(), // Link-local
+                "::1/128".to_string(),        // Localhost v6
+                "fc00::/7".to_string(),       // Unique local addresses
+                "fe80::/10".to_string(),      // Link-local v6
             ],
             block_ports: vec![22, 23, 25, 110, 143], // Common blocked ports
-            allow_ports: vec![80, 443, 53],           // Always allow HTTP, HTTPS, DNS
+            allow_ports: vec![80, 443, 53],          // Always allow HTTP, HTTPS, DNS
             exclude_processes: Vec::new(),
             skip_ips_set: HashSet::new(),
             skip_networks_parsed: Vec::new(),
-            skip_networks_v4_by_prefix: HashMap::new(),
-            skip_networks_v6_by_prefix: HashMap::new(),
+            skip_networks_v4_flat: Vec::new(),
+            skip_networks_v6_flat: Vec::new(),
             block_ports_set: HashSet::new(),
             allow_ports_set: HashSet::new(),
         };
@@ -520,7 +509,13 @@ impl Default for RouteConfig {
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path).map_err(|e| TinyTunError::Config(format!("Failed to read config file '{}': {}", path.display(), e)))?;
+        let content = fs::read_to_string(path).map_err(|e| {
+            TinyTunError::Config(format!(
+                "Failed to read config file '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
         let mut config = match ext {
             "yaml" | "yml" => {
@@ -567,19 +562,25 @@ impl Config {
         match ip {
             IpAddr::V4(v4) => {
                 let ip_u32 = u32::from(v4);
-                self.filtering.skip_networks_v4_by_prefix.iter().any(|(prefix, nets)| {
-                    nets.contains(&FilteringConfig::mask_ipv4(ip_u32, *prefix))
-                })
+                self.filtering
+                    .skip_networks_v4_flat
+                    .iter()
+                    .any(|(prefix, masked_net)| {
+                        FilteringConfig::mask_ipv4(ip_u32, *prefix) == *masked_net
+                    })
             }
             IpAddr::V6(v6) => {
                 let ip_u128 = u128::from(v6);
-                self.filtering.skip_networks_v6_by_prefix.iter().any(|(prefix, nets)| {
-                    nets.contains(&FilteringConfig::mask_ipv6(ip_u128, *prefix))
-                })
+                self.filtering
+                    .skip_networks_v6_flat
+                    .iter()
+                    .any(|(prefix, masked_net)| {
+                        FilteringConfig::mask_ipv6(ip_u128, *prefix) == *masked_net
+                    })
             }
         }
     }
-    
+
     /// Check if a port should be skipped
     pub fn should_skip_port(&self, port: u16) -> bool {
         // Always allow explicit allow ports
@@ -590,9 +591,12 @@ impl Config {
         // Block if in block list
         self.filtering.block_ports_set.contains(&port)
     }
-    
+
     pub fn is_excluded_process_name(&self, process_name: &str) -> bool {
-        let candidate = process_name.rsplit(['/', '\\']).next().unwrap_or(process_name);
+        let candidate = process_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(process_name);
         self.filtering.exclude_processes.iter().any(|excluded| {
             let excluded_name = excluded.rsplit(['/', '\\']).next().unwrap_or(excluded);
             excluded_name.eq_ignore_ascii_case(candidate)
@@ -659,9 +663,15 @@ struct YamlDnsRoutingConfig {
     pub cache_capacity: usize,
 }
 
-fn default_fallback_group() -> String { "proxy".to_string() }
-fn default_true() -> bool { true }
-fn default_cache_capacity() -> usize { 4096 }
+fn default_fallback_group() -> String {
+    "proxy".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_cache_capacity() -> usize {
+    4096
+}
 
 impl Default for YamlDnsRoutingConfig {
     fn default() -> Self {
@@ -688,8 +698,12 @@ struct YamlDnsConfig {
     pub routing: YamlDnsRoutingConfig,
 }
 
-fn default_dns_listen_port() -> u16 { 53 }
-fn default_dns_timeout_ms() -> u64 { 5000 }
+fn default_dns_listen_port() -> u16 {
+    53
+}
+fn default_dns_timeout_ms() -> u64 {
+    5000
+}
 
 /// Top-level YAML config.  Identical to [`Config`] except DNS routing rules
 /// are in the compact string syntax.
@@ -757,7 +771,9 @@ fn parse_yaml_rule(s: &str, default_geosite_file: Option<&str>) -> Result<DnsRou
     let rest = inner[close + 1..].trim();
     let action = rest
         .strip_prefix(',')
-        .ok_or_else(|| TinyTunError::Config(format!("DNS rule missing ',<action>' after ')': {s}")))?
+        .ok_or_else(|| {
+            TinyTunError::Config(format!("DNS rule missing ',<action>' after ')': {s}"))
+        })?
         .trim();
 
     let matcher = parse_condition(condition, default_geosite_file, s)?;
@@ -768,7 +784,11 @@ fn parse_yaml_rule(s: &str, default_geosite_file: Option<&str>) -> Result<DnsRou
         (Some(action.to_string()), false)
     };
 
-    Ok(DnsRoutingRule { matcher, group, reject })
+    Ok(DnsRoutingRule {
+        matcher,
+        group,
+        reject,
+    })
 }
 
 fn parse_condition(
@@ -798,19 +818,29 @@ fn parse_condition(
     }
 
     if let Some(value) = cond.strip_prefix("domain:") {
-        return Ok(DnsMatcher::DomainFull { value: value.to_string() });
+        return Ok(DnsMatcher::DomainFull {
+            value: value.to_string(),
+        });
     }
     if let Some(value) = cond.strip_prefix("suffix:") {
-        return Ok(DnsMatcher::DomainSuffix { value: value.to_string() });
+        return Ok(DnsMatcher::DomainSuffix {
+            value: value.to_string(),
+        });
     }
     if let Some(value) = cond.strip_prefix("keyword:") {
-        return Ok(DnsMatcher::DomainKeyword { value: value.to_string() });
+        return Ok(DnsMatcher::DomainKeyword {
+            value: value.to_string(),
+        });
     }
     if let Some(value) = cond.strip_prefix("regex:") {
-        return Ok(DnsMatcher::DomainRegex { value: value.to_string() });
+        return Ok(DnsMatcher::DomainRegex {
+            value: value.to_string(),
+        });
     }
 
-    Err(TinyTunError::Config(format!("Unknown condition '{cond}' in rule: {full_rule}")))
+    Err(TinyTunError::Config(format!(
+        "Unknown condition '{cond}' in rule: {full_rule}"
+    )))
 }
 
 #[cfg(test)]
@@ -833,7 +863,10 @@ mod tests {
     #[test]
     fn test_should_skip_ip_exact_match() {
         let mut config = Config::default();
-        config.filtering.skip_ips.push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        config
+            .filtering
+            .skip_ips
+            .push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         config.filtering.finalize();
         assert!(config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(!config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
@@ -842,7 +875,10 @@ mod tests {
     #[test]
     fn test_should_skip_ip_network_match() {
         let mut config = Config::default();
-        config.filtering.skip_networks.push("10.0.0.0/8".to_string());
+        config
+            .filtering
+            .skip_networks
+            .push("10.0.0.0/8".to_string());
         config.filtering.finalize();
         assert!(config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
         assert!(!config.should_skip_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
@@ -968,4 +1004,3 @@ mod tests {
         assert_eq!(config.exclude_processes.len(), 2); // finalize doesn't dedup processes
     }
 }
-

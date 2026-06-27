@@ -7,7 +7,11 @@ use tokio::net::TcpStream;
 /// NIC and never re-enters the TUN routing path.
 #[allow(dead_code)]
 #[allow(unused_variables)]
-pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str) -> Result<TcpStream> {
+#[allow(unreachable_code)]
+pub async fn open_direct_tcp(
+    dst: std::net::SocketAddr,
+    outbound_interface: &str,
+) -> Result<TcpStream> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -40,7 +44,8 @@ pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str
             return Err(anyhow::anyhow!(
                 "SO_BINDTODEVICE to '{}' failed: {}. \
                  Ensure the process has CAP_NET_RAW capability or runs as root.",
-                outbound_interface, os_err
+                outbound_interface,
+                os_err
             ));
         }
         let stream = socket.connect(dst).await?;
@@ -92,7 +97,9 @@ pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str
                 let os_err = std::io::Error::last_os_error();
                 return Err(anyhow::anyhow!(
                     "IP_BOUND_IF/IPV6_BOUND_IF to '{}' (index={}) failed: {}",
-                    outbound_interface, if_index, os_err
+                    outbound_interface,
+                    if_index,
+                    os_err
                 ));
             }
             let stream = socket.connect(dst).await?;
@@ -122,6 +129,7 @@ pub async fn open_direct_tcp(dst: std::net::SocketAddr, outbound_interface: &str
 /// (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS) to prevent
 /// the socket from re-entering the TUN device.
 #[allow(dead_code)]
+#[allow(unreachable_code)]
 pub async fn direct_udp_exchange(
     dst: std::net::SocketAddr,
     payload: Vec<u8>,
@@ -160,7 +168,8 @@ pub async fn direct_udp_exchange(
             return Err(anyhow::anyhow!(
                 "SO_BINDTODEVICE to '{}' for direct UDP failed: {}. \
                  Ensure the process has CAP_NET_RAW capability or runs as root.",
-                outbound_interface, os_err
+                outbound_interface,
+                os_err
             ));
         }
     }
@@ -200,7 +209,8 @@ pub async fn direct_udp_exchange(
                 let os_err = std::io::Error::last_os_error();
                 return Err(anyhow::anyhow!(
                     "IP_BOUND_IF/IPV6_BOUND_IF to '{}' for direct UDP failed: {}",
-                    outbound_interface, os_err
+                    outbound_interface,
+                    os_err
                 ));
             }
         } else {
