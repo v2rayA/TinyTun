@@ -62,13 +62,25 @@ fn percent_encode(s: &str) -> String {
         .collect()
 }
 
+/// A loopback proxy is reached through the loopback device, so binding its
+/// socket to a physical interface would make the local listener unreachable.
+fn should_bind_proxy_socket_to_interface(address: SocketAddr) -> bool {
+    !address.ip().is_loopback()
+}
+
 impl Socks5Client {
     /// Open a TCP connection to the SOCKS5 proxy.
     ///
-    /// On Linux, if an outbound interface is configured the socket is bound to
-    /// that interface via `SO_BINDTODEVICE` so SOCKS5 traffic never traverses
-    /// the TUN device, preventing routing loops and EADDRNOTAVAIL errors.
+    /// On Linux, if an outbound interface is configured and the SOCKS5 proxy is
+    /// not on loopback, the socket is bound to that interface via
+    /// `SO_BINDTODEVICE` so SOCKS5 traffic never traverses the TUN device,
+    /// preventing routing loops and EADDRNOTAVAIL errors.
     async fn open_tcp_to_proxy(&self) -> Result<TcpStream> {
+        #[cfg(target_os = "linux")]
+        if !should_bind_proxy_socket_to_interface(self.config.address) {
+            return Ok(TcpStream::connect(&self.config.address).await?);
+        }
+
         #[cfg(target_os = "linux")]
         if let Some(ref iface) = self.outbound_interface {
             use std::os::unix::io::AsRawFd;
@@ -497,5 +509,30 @@ fn socks5_rep_name(rep: u8) -> &'static str {
         0x07 => "command not supported",
         0x08 => "address type not supported",
         _ => "unknown error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_bind_proxy_socket_to_interface;
+
+    #[test]
+    fn loopback_proxy_socket_is_not_bound_to_physical_interface() {
+        assert!(!should_bind_proxy_socket_to_interface(
+            "127.0.0.1:52345".parse().unwrap()
+        ));
+        assert!(!should_bind_proxy_socket_to_interface(
+            "[::1]:52345".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn remote_proxy_socket_is_bound_to_physical_interface() {
+        assert!(should_bind_proxy_socket_to_interface(
+            "192.0.2.1:1080".parse().unwrap()
+        ));
+        assert!(should_bind_proxy_socket_to_interface(
+            "[2001:db8::1]:1080".parse().unwrap()
+        ));
     }
 }
