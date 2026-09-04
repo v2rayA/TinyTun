@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
