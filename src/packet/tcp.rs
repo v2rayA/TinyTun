@@ -12,7 +12,7 @@ use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpStream,
 };
-use tokio::sync::{mpsc, mpsc::error::TryRecvError, Mutex};
+use tokio::sync::{mpsc, mpsc::error::TryRecvError};
 use tokio::time::timeout;
 
 use etherparse::{PacketBuilder, TcpHeaderSlice};
@@ -135,7 +135,7 @@ impl TcpHandler {
                 let mut should_notify_reverse = false;
 
                 {
-                    let mut state = session.state.lock().await;
+                    let mut state = session.state.lock();
 
                     if tcp_header.fin() {
                         let client_ns = state.client_next_seq.load(Ordering::Relaxed);
@@ -255,7 +255,7 @@ impl TcpHandler {
                 if let Some(forward_payload) = forward_payload {
                     if session.forward_tx.try_send(forward_payload).is_err() {
                         let (sequence_number, acknowledgment_number) = {
-                            let state = session.state.lock().await;
+                            let state = session.state.lock();
                             (
                                 state.server_next_seq.load(Ordering::Relaxed),
                                 state.client_next_seq.load(Ordering::Relaxed),
@@ -464,7 +464,7 @@ impl TcpHandler {
             .map(|entry| entry.value().clone())
         {
             let resend_syn_ack = {
-                let mut state = session.state.lock().await;
+                let mut state = session.state.lock();
                 state.last_activity = Instant::now();
                 if state.lifecycle == TcpLifecycle::SynReceived {
                     Some((
@@ -567,11 +567,10 @@ impl TcpHandler {
         tcp_sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
     ) {
         let (reader, writer) = stream.into_split();
-        let writer = Arc::new(Mutex::new(writer));
         let (forward_tx, forward_rx) = mpsc::channel::<Vec<u8>>(64);
 
         let session = Arc::new(TcpSession {
-            state: Arc::new(Mutex::new(TcpFlowState {
+            state: Arc::new(parking_lot::Mutex::new(TcpFlowState {
                 client_next_seq: AtomicU32::new(client_isn.wrapping_add(1)),
                 server_next_seq: AtomicU32::new(1),
                 server_acked_seq: AtomicU32::new(1),
@@ -586,7 +585,7 @@ impl TcpHandler {
         });
 
         let syn_ack_seq = {
-            let state = session.state.lock().await;
+            let state = session.state.lock();
             let seq = state.server_next_seq.load(Ordering::Relaxed);
             state
                 .server_next_seq
@@ -632,8 +631,8 @@ impl TcpHandler {
     fn spawn_forward_writer_task(
         flow_key: FlowKey,
         mut forward_rx: mpsc::Receiver<Vec<u8>>,
-        writer: Arc<Mutex<OwnedWriteHalf>>,
-        state: Arc<Mutex<TcpFlowState>>,
+        mut writer: OwnedWriteHalf,
+        state: Arc<parking_lot::Mutex<TcpFlowState>>,
         sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
         tun_packet_tx: mpsc::Sender<Vec<u8>>,
     ) {
@@ -676,10 +675,9 @@ impl TcpHandler {
                 }
 
                 let write_result = {
-                    let mut w = writer.lock().await;
                     let mut write_error = None;
                     for payload in &batch {
-                        if let Err(err) = w.write_all(payload).await {
+                        if let Err(err) = writer.write_all(payload).await {
                             write_error = Some(err);
                             break;
                         }
@@ -689,7 +687,7 @@ impl TcpHandler {
 
                 if let Some(err) = write_result {
                     let (sequence_number, acknowledgment_number) = {
-                        let s = state.lock().await;
+                        let s = state.lock();
                         (
                             s.server_next_seq.load(Ordering::Relaxed),
                             s.client_next_seq.load(Ordering::Relaxed),
@@ -712,7 +710,7 @@ impl TcpHandler {
 
                 // ACK all forwarded payloads in this coalesced batch.
                 let (ack_seq, ack_ack) = {
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     s.last_activity = Instant::now();
                     if s.lifecycle == TcpLifecycle::SynReceived {
                         s.lifecycle = TcpLifecycle::Established;
@@ -778,7 +776,7 @@ impl TcpHandler {
                     loop {
                         let notified = session.window_notify.notified();
                         let (terminated, can_send) = {
-                            let state = session.state.lock().await;
+                            let state = session.state.lock();
                             if state.lifecycle == TcpLifecycle::Closed
                                 || state.lifecycle == TcpLifecycle::FinSent
                             {
@@ -811,7 +809,7 @@ impl TcpHandler {
                     }
 
                     let (sequence_number, acknowledgment_number) = {
-                        let mut state = session.state.lock().await;
+                        let mut state = session.state.lock();
                         if state.lifecycle == TcpLifecycle::SynReceived {
                             state.lifecycle = TcpLifecycle::Established;
                         }
@@ -877,7 +875,7 @@ impl TcpHandler {
             }
 
             let (should_send_fin, sequence_number, acknowledgment_number) = {
-                let mut state = session.state.lock().await;
+                let mut state = session.state.lock();
                 if state.lifecycle == TcpLifecycle::Established {
                     let seq = state.server_next_seq.load(Ordering::Relaxed);
                     state
@@ -925,7 +923,7 @@ impl TcpHandler {
             }
 
             let should_remove = {
-                let state = session.state.lock().await;
+                let state = session.state.lock();
                 state.lifecycle == TcpLifecycle::Closed
             };
 
@@ -951,7 +949,7 @@ impl TcpHandler {
         let mut expired = Vec::with_capacity(snapshot.len().min(64));
 
         for (flow_key, session) in snapshot {
-            let mut state = session.state.lock().await;
+            let mut state = session.state.lock();
             let is_fin_wait_expired = state.lifecycle == TcpLifecycle::FinSent
                 && now.duration_since(state.last_activity) >= TCP_FIN_WAIT_TIMEOUT;
             if state.lifecycle == TcpLifecycle::Closed

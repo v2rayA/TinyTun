@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -5,8 +6,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use log::{debug, warn};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use etherparse::{UdpHeader, UdpHeaderSlice};
 
@@ -21,11 +23,28 @@ use crate::socks5_client::{Socks5Client, Socks5UdpSession};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const UDP_PROXY_TIMEOUT: Duration = Duration::from_millis(1200);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const UDP_TIMEOUT_BACKOFF: Duration = Duration::from_secs(30);
 const DNS_TASK_CONCURRENCY_LIMIT: usize = 32;
-const UDP_TASK_CONCURRENCY_LIMIT: usize = 64;
+/// Upper bound on concurrently cached UDP ASSOCIATE sessions.  Each session
+/// pins one TCP control connection and one UDP socket.
+const UDP_MAX_SESSIONS: usize = 256;
+/// Upper bound on concurrently cached direct (interface-bound) UDP sessions.
+const DIRECT_UDP_MAX_SESSIONS: usize = 128;
+/// Per-session receive buffer; sized for the largest possible UDP payload so a
+/// datagram is never silently truncated.
+const MAX_UDP_DATAGRAM_SIZE: usize = 65_536;
+
+/// Entry in the direct (excluded-flow, interface-bound) UDP session table.
+pub(crate) struct DirectUdpSessionEntry {
+    /// Connected, interface-pinned UDP socket for the flow.
+    socket: Arc<tokio::net::UdpSocket>,
+    last_activity: Instant,
+    /// Signals the per-session relay task to stop when the entry is removed.
+    cancel: CancellationToken,
+    /// Global session-count slot, held for the lifetime of the entry.
+    _slot: Option<OwnedSemaphorePermit>,
+}
 
 // ── UdpHandler ────────────────────────────────────────────────────────────────
 
@@ -39,7 +58,9 @@ pub struct UdpHandler {
     pub udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
     pub pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
     pub udp_timeout_backoff: Arc<DashMap<UdpFlowKey, Instant>>,
-    pub udp_task_limiter: Arc<Semaphore>,
+    pub udp_session_slots: Arc<Semaphore>,
+    pub direct_udp_sessions: Arc<DashMap<UdpFlowKey, DirectUdpSessionEntry>>,
+    pub direct_udp_session_slots: Arc<Semaphore>,
     pub dns_task_limiter: Arc<Semaphore>,
     pub process_name_cache: Arc<DashMap<ProcessLookupKey, ProcessLookupEntry>>,
     pub process_lookup_options: ProcessLookupOptions,
@@ -66,7 +87,9 @@ impl UdpHandler {
             udp_sessions: Arc::new(DashMap::new()),
             pending_udp_sessions: Arc::new(DashSet::new()),
             udp_timeout_backoff: Arc::new(DashMap::new()),
-            udp_task_limiter: Arc::new(Semaphore::new(UDP_TASK_CONCURRENCY_LIMIT)),
+            udp_session_slots: Arc::new(Semaphore::new(UDP_MAX_SESSIONS)),
+            direct_udp_sessions: Arc::new(DashMap::new()),
+            direct_udp_session_slots: Arc::new(Semaphore::new(DIRECT_UDP_MAX_SESSIONS)),
             dns_task_limiter: Arc::new(Semaphore::new(DNS_TASK_CONCURRENCY_LIMIT)),
             process_name_cache: Arc::new(DashMap::new()),
             process_lookup_options,
@@ -134,63 +157,98 @@ impl UdpHandler {
             // execution falls through to the route-based bypass below.
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(iface) = self.outbound_interface.clone() {
-                let udp_permit = match self.udp_task_limiter.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        debug!(
-                            "Dropping excluded UDP packet (rate limit) {}:{} -> {}:{}",
-                            ip_packet.src, source_port, ip_packet.dst, dest_port
-                        );
+                let udp_flow_key = UdpFlowKey {
+                    src: source_addr,
+                    dst: target_addr,
+                };
+                let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
+
+                // ── Fast path: reuse a cached direct session. ──────────────
+                // The send is a non-blocking `try_send` on the connected
+                // socket; responses arrive via the session's relay task.
+                if let Some(mut entry) = self.direct_udp_sessions.get_mut(&udp_flow_key) {
+                    entry.last_activity = Instant::now();
+                    let socket = entry.socket.clone();
+                    drop(entry);
+                    if socket.try_send(&udp_payload).is_ok() {
                         return Ok(());
+                    }
+                    debug!(
+                        "Direct UDP send failed for excluded flow {}:{} -> {}:{}",
+                        ip_packet.src, source_port, ip_packet.dst, dest_port
+                    );
+                    return Ok(());
+                }
+
+                // ── Slow path: open a direct (interface-bound) session. ────
+                let slot = match self.direct_udp_session_slots.clone().try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        match timeout(
+                            Duration::from_millis(100),
+                            self.direct_udp_session_slots.clone().acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(slot)) => slot,
+                            Ok(Err(_)) => {
+                                debug!(
+                                    "Dropping excluded UDP packet (session slot error) {}:{} -> {}:{}",
+                                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                                );
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "Dropping excluded UDP packet (session limit, timed out waiting) {}:{} -> {}:{}",
+                                    ip_packet.src, source_port, ip_packet.dst, dest_port
+                                );
+                                return Ok(());
+                            }
+                        }
                     }
                 };
 
-                let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
                 let tun_packet_tx = self.tun_packet_tx.clone();
+                let direct_udp_sessions = self.direct_udp_sessions.clone();
                 let src_ip = ip_packet.src;
                 let dst_ip = ip_packet.dst;
 
                 tokio::spawn(async move {
-                    let _permit = udp_permit;
-
-                    match timeout(
-                        UDP_PROXY_TIMEOUT,
-                        packet::direct::direct_udp_exchange(target_addr, udp_payload, &iface),
-                    )
-                    .await
-                    {
-                        Ok(Ok(response_payload)) => {
-                            let response_packet = match packet::packet_build::build_udp_packet(
-                                std::net::SocketAddr::new(dst_ip, dest_port),
-                                std::net::SocketAddr::new(src_ip, source_port),
-                                &response_payload,
-                            ) {
-                                Some(packet) => packet,
-                                None => return,
-                            };
-                            let _ = packet::packet_build::write_tun_packet_with(
-                                &tun_packet_tx,
-                                response_packet,
-                            )
-                            .await;
-                            debug!(
-                                "Direct UDP exchange completed for excluded flow {}:{} -> {}:{}",
-                                src_ip, source_port, dst_ip, dest_port
-                            );
-                        }
-                        Ok(Err(err)) => {
-                            debug!(
-                                "Direct UDP exchange failed for excluded flow {}:{} -> {}:{}: {}",
+                    let socket = match packet::direct::open_direct_udp(target_addr, &iface).await {
+                        Ok(socket) => Arc::new(socket),
+                        Err(err) => {
+                            warn!(
+                                "Open direct UDP failed for excluded flow {}:{} -> {}:{}: {}",
                                 src_ip, source_port, dst_ip, dest_port, err
                             );
+                            return;
                         }
-                        Err(_) => {
-                            debug!(
-                                "Direct UDP exchange timed out for excluded flow {}:{} -> {}:{}",
-                                src_ip, source_port, dst_ip, dest_port
-                            );
-                        }
-                    }
+                    };
+
+                    let cancel = CancellationToken::new();
+                    Self::spawn_direct_udp_relay_task(
+                        socket.clone(),
+                        udp_flow_key.clone(),
+                        cancel.clone(),
+                        tun_packet_tx,
+                    );
+
+                    direct_udp_sessions.insert(
+                        udp_flow_key.clone(),
+                        DirectUdpSessionEntry {
+                            socket: socket.clone(),
+                            last_activity: Instant::now(),
+                            cancel,
+                            _slot: Some(slot),
+                        },
+                    );
+
+                    let _ = socket.try_send(&udp_payload);
+                    debug!(
+                        "Opened direct UDP session for excluded flow {}:{} -> {}:{} with {} bytes",
+                        src_ip, source_port, dst_ip, dest_port, udp_payload.len()
+                    );
                 });
 
                 debug!(
@@ -333,7 +391,7 @@ impl UdpHandler {
             dst: target_addr,
         };
 
-        if self.is_udp_flow_in_backoff(&udp_flow_key).await {
+        if self.is_udp_flow_in_backoff(&udp_flow_key) {
             debug!(
                 "Skipping UDP proxy during backoff for {}:{} -> {}:{}",
                 ip_packet.src, source_port, ip_packet.dst, dest_port
@@ -341,26 +399,39 @@ impl UdpHandler {
             return Ok(());
         }
 
-        let udp_permit = match self.udp_task_limiter.clone().try_acquire_owned() {
-            Ok(permit) => permit,
+        // ── Fast path: reuse a cached UDP ASSOCIATE session. ───────────────
+        // The send is a non-blocking `try_send_to`; responses are drained and
+        // injected by the session's relay task, so no task is spawned and no
+        // offer/response serialisation occurs on the packet hot path.
+        if let Some(mut entry) = self.udp_sessions.get_mut(&udp_flow_key) {
+            entry.last_activity = Instant::now();
+            let session = entry.session.clone();
+            drop(entry);
+            Self::try_send_udp_frame(&session, udp_flow_key.dst, &udp_payload);
+            return Ok(());
+        }
+
+        // ── Slow path: no cached session yet, open a UDP ASSOCIATE. ────────
+        let slot = match self.udp_session_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
             Err(_) => {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    self.udp_task_limiter.clone().acquire_owned(),
+                match timeout(
+                    Duration::from_millis(100),
+                    self.udp_session_slots.clone().acquire_owned(),
                 )
                 .await
                 {
-                    Ok(Ok(permit)) => permit,
+                    Ok(Ok(slot)) => slot,
                     Ok(Err(_)) => {
                         debug!(
-                            "Dropping UDP packet (semaphore error) {}:{} -> {}:{}",
+                            "Dropping UDP packet (session slot error) {}:{} -> {}:{}",
                             ip_packet.src, source_port, ip_packet.dst, dest_port
                         );
                         return Ok(());
                     }
                     Err(_) => {
                         debug!(
-                            "Dropping UDP packet (rate limit, timed out waiting) {}:{} -> {}:{}",
+                            "Dropping UDP packet (session limit, timed out waiting) {}:{} -> {}:{}",
                             ip_packet.src, source_port, ip_packet.dst, dest_port
                         );
                         return Ok(());
@@ -378,118 +449,101 @@ impl UdpHandler {
         let dst_ip = ip_packet.dst;
 
         tokio::spawn(async move {
-            let _permit = udp_permit;
-
-            // Keep a reference so the timeout branch can clean up a stale
-            // pending-session entry if the future is cancelled mid-way.
             let pending_for_cleanup = pending_udp_sessions.clone();
 
-            let response_payload = match timeout(
-                UDP_PROXY_TIMEOUT,
-                Self::proxy_udp_with_reused_session_shared(
-                    socks5_client,
-                    udp_sessions,
-                    pending_udp_sessions,
-                    udp_flow_key.clone(),
-                    udp_payload,
-                ),
+            let session = match Self::open_udp_session_guarded(
+                socks5_client,
+                udp_sessions.clone(),
+                pending_udp_sessions,
+                udp_flow_key.clone(),
             )
             .await
             {
-                Ok(Ok(resp)) => {
-                    Self::clear_udp_backoff_shared(udp_timeout_backoff.clone(), &udp_flow_key)
-                        .await;
-                    resp
-                }
-                Ok(Err(err)) => {
-                    Self::mark_udp_flow_backoff_shared(
-                        udp_timeout_backoff.clone(),
-                        udp_flow_key.clone(),
-                    )
-                    .await;
-                    warn!(
-                        "UDP proxying failed for {}:{} -> {}:{}: {}",
-                        src_ip, source_port, dst_ip, dest_port, err
-                    );
-                    return;
-                }
-                Err(_) => {
-                    // The future was dropped by timeout; it may not have had a
-                    // chance to remove the flow key from pending_udp_sessions.
+                Ok(session) => session,
+                Err(err) => {
+                    // The future may have been cancelled before it could clear
+                    // its pending marker; sweep a stale entry if present.
                     pending_for_cleanup.remove(&udp_flow_key);
                     Self::mark_udp_flow_backoff_shared(
                         udp_timeout_backoff.clone(),
                         udp_flow_key.clone(),
-                    )
-                    .await;
+                    );
                     warn!(
-                        "UDP proxy timeout for {}:{} -> {}:{}",
-                        src_ip, source_port, dst_ip, dest_port
+                        "UDP ASSOCIATE failed for {}:{} -> {}:{}: {}",
+                        src_ip, source_port, dst_ip, dest_port, err
                     );
                     return;
                 }
             };
 
-            let response_packet = match packet::packet_build::build_udp_packet(
-                std::net::SocketAddr::new(dst_ip, dest_port),
-                std::net::SocketAddr::new(src_ip, source_port),
-                &response_payload,
-            ) {
-                Some(packet) => packet,
-                None => return,
-            };
-            let response_len = response_packet.len();
-            if packet::packet_build::write_tun_packet_with(&tun_packet_tx, response_packet)
-                .await
-                .is_err()
-            {
-                return;
-            }
+            let cancel = CancellationToken::new();
+            Self::spawn_udp_relay_task(
+                session.udp_socket.clone(),
+                udp_flow_key.clone(),
+                cancel.clone(),
+                tun_packet_tx,
+            );
 
+            udp_sessions.insert(
+                udp_flow_key.clone(),
+                UdpSessionEntry {
+                    session: session.clone(),
+                    last_activity: Instant::now(),
+                    cancel,
+                    _slot: Some(slot),
+                },
+            );
+
+            Self::try_send_udp_frame(&session, udp_flow_key.dst, &udp_payload);
             debug!(
-                "Proxied UDP flow {}:{} -> {}:{} and injected {} bytes back to TUN",
-                src_ip, source_port, dst_ip, dest_port, response_len
+                "Opened UDP ASSOCIATE for {}:{} -> {}:{} with {} bytes",
+                src_ip, source_port, dst_ip, dest_port, udp_payload.len()
             );
         });
 
         Ok(())
     }
 
-    async fn proxy_udp_with_reused_session_shared(
+    /// Fire-and-forget a datagram through the cached SOCKS5 UDP session.
+    ///
+    /// The relay frame is built here and pushed with `try_send_to` so the
+    /// packet hot path never blocks.  A full kernel send buffer is treated as
+    /// a dropped datagram, which is exactly how UDP is expected to behave.
+    fn try_send_udp_frame(session: &Socks5UdpSession, target: std::net::SocketAddr, payload: &[u8]) {
+        let frame = Socks5Client::build_udp_request(target, payload);
+        match session.udp_socket.try_send_to(&frame, session.relay_addr) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                debug!(
+                    "UDP relay send buffer full for {} -> {}; dropping datagram",
+                    target, session.relay_addr
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "UDP relay send failed for {} -> {}: {}",
+                    target, session.relay_addr, e
+                );
+            }
+        }
+    }
+
+    /// Open a UDP ASSOCIATE session, guarding against concurrent creations for
+    /// the same flow (each attempt pins a TCP control connection and a UDP
+    /// socket, and on Windows abandoned socket pairs burn ephemeral ports).
+    async fn open_udp_session_guarded(
         socks5_client: Arc<Socks5Client>,
         udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
         pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
         flow_key: UdpFlowKey,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        if let Some(session) =
-            Self::get_cached_udp_session_shared(udp_sessions.clone(), &flow_key).await
-        {
-            match Self::exchange_udp_on_session_shared(
-                udp_sessions.clone(),
-                session,
-                &flow_key,
-                &payload,
-            )
-            .await
-            {
-                Ok(resp) => return Ok(resp),
-                Err(err) => {
-                    debug!(
-                        "Existing UDP ASSOCIATE session failed for {} -> {}: {}; recreating",
-                        flow_key.src, flow_key.dst, err
-                    );
-                    Self::remove_udp_session_shared(udp_sessions.clone(), &flow_key).await;
-                }
-            }
+    ) -> Result<Arc<Socks5UdpSession>> {
+        // A racing creation task may have won while this task waited for its
+        // session slot; prefer the already-open session if present.
+        if let Some(entry) = udp_sessions.get(&flow_key) {
+            return Ok(entry.session.clone());
         }
 
-        // Guard against concurrent tasks for the same flow all racing into
-        // open_udp_session simultaneously. Each call opens a TCP control socket + UDP
-        // socket to the SOCKS5 proxy; on Windows every abandoned socket pair enters
-        // TIME_WAIT and consumes ephemeral ports, exhausting the ~16 k port pool fast.
         let is_already_pending = !pending_udp_sessions.insert(flow_key.clone());
-
         if is_already_pending {
             return Err(anyhow::anyhow!(
                 "UDP ASSOCIATE already in progress for {} -> {}",
@@ -498,106 +552,164 @@ impl UdpHandler {
             ));
         }
 
-        let open_result = socks5_client.open_udp_session(flow_key.dst).await;
-
+        let result = socks5_client.open_udp_session(flow_key.dst).await;
         pending_udp_sessions.remove(&flow_key);
-
-        let session = open_result.map(|s| Arc::new(Mutex::new(s)))?;
-
-        {
-            udp_sessions.insert(
-                flow_key.clone(),
-                UdpSessionEntry {
-                    session: session.clone(),
-                    last_activity: Instant::now(),
-                },
-            );
-        }
-
-        Self::exchange_udp_on_session_shared(udp_sessions, session, &flow_key, &payload).await
+        Ok(result.map(Arc::new)?)
     }
 
-    async fn exchange_udp_on_session_shared(
-        udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
-        session: Arc<Mutex<Socks5UdpSession>>,
-        flow_key: &UdpFlowKey,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        let response = {
-            let mut guard = session.lock().await;
-            guard.exchange(flow_key.dst, payload).await
-        };
-
-        match response {
-            Ok(resp) => {
-                if let Some(mut entry) = udp_sessions.get_mut(flow_key) {
-                    entry.last_activity = Instant::now();
-                }
-                Ok(resp)
-            }
-            Err(err) => {
-                udp_sessions.remove(flow_key);
-                Err(err.into())
-            }
-        }
-    }
-
-    async fn get_cached_udp_session_shared(
-        udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
-        flow_key: &UdpFlowKey,
-    ) -> Option<Arc<Mutex<Socks5UdpSession>>> {
-        if let Some(mut entry) = udp_sessions.get_mut(flow_key) {
-            entry.last_activity = Instant::now();
-            return Some(entry.session.clone());
-        }
-        None
-    }
-
-    async fn remove_udp_session_shared(
-        udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
-        flow_key: &UdpFlowKey,
+    /// Spawn a relay task that continuously drains the session's UDP socket and
+    /// injects each response back into the TUN as a packet from the flow target
+    /// to the flow source.  Besides removing per-packet spawns, this also keeps
+    /// unsolicited server->client datagrams (e.g. QUIC or games) instead of
+    /// dropping them while no request is in flight.
+    fn spawn_udp_relay_task(
+        udp_socket: Arc<tokio::net::UdpSocket>,
+        flow_key: UdpFlowKey,
+        cancel: CancellationToken,
+        tun_packet_tx: mpsc::Sender<Vec<u8>>,
     ) {
-        udp_sessions.remove(flow_key);
+        tokio::spawn(async move {
+            let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+            loop {
+                let recv_result = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = udp_socket.recv_from(&mut recv_buf) => result,
+                };
+
+                let Ok((n, _src)) = recv_result else {
+                    break;
+                };
+
+                let Ok((_, payload)) = Socks5Client::parse_udp_response(&recv_buf[..n]) else {
+                    continue;
+                };
+
+                let Some(response_packet) = packet::packet_build::build_udp_packet(
+                    flow_key.dst,
+                    flow_key.src,
+                    &payload,
+                ) else {
+                    continue;
+                };
+
+                if packet::packet_build::write_tun_packet_with(&tun_packet_tx, response_packet)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Relay task for direct (excluded-flow) sessions: raw datagrams from the
+    /// connected outbound socket are injected into the TUN as packets from the
+    /// flow target to the flow source.  Unlike the SOCKS5 relay above there is
+    /// no relay framing to strip — every received datagram is application data.
+    fn spawn_direct_udp_relay_task(
+        udp_socket: Arc<tokio::net::UdpSocket>,
+        flow_key: UdpFlowKey,
+        cancel: CancellationToken,
+        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+    ) {
+        tokio::spawn(async move {
+            let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+            loop {
+                let recv_result = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = udp_socket.recv_from(&mut recv_buf) => result,
+                };
+
+                let Ok((n, _src)) = recv_result else {
+                    break;
+                };
+
+                let Some(response_packet) =
+                    packet::packet_build::build_udp_packet(flow_key.dst, flow_key.src, &recv_buf[..n])
+                else {
+                    continue;
+                };
+
+                if packet::packet_build::write_tun_packet_with(&tun_packet_tx, response_packet)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
     }
 
     pub async fn cleanup_expired_udp_sessions(&self) {
-        let removed = {
-            let now = Instant::now();
-            let before = self.udp_sessions.len();
-            self.udp_sessions.retain(|_, entry| {
-                now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT
-            });
-            before.saturating_sub(self.udp_sessions.len())
-        };
+        let now = Instant::now();
 
+        // Cancelled tokens, then a sweep of the map itself.  Cancelling before
+        // removal lets the relay tasks drop their socket/control references.
+        let removed = Self::sweep_idle_sessions(&self.udp_sessions, now);
         if removed > 0 {
             debug!("Cleaned up {} idle UDP ASSOCIATE sessions", removed);
         }
 
-        {
-            let now = Instant::now();
-            self.udp_timeout_backoff.retain(|_, until| *until > now);
+        // Same sweep for direct (excluded-flow) sessions.
+        let removed_direct = Self::sweep_idle_direct_sessions(&self.direct_udp_sessions, now);
+        if removed_direct > 0 {
+            debug!("Cleaned up {} idle direct UDP sessions", removed_direct);
         }
+
+        let now = Instant::now();
+        self.udp_timeout_backoff.retain(|_, until| *until > now);
     }
 
-    async fn is_udp_flow_in_backoff(&self, flow_key: &UdpFlowKey) -> bool {
+    fn sweep_idle_sessions(
+        sessions: &DashMap<UdpFlowKey, UdpSessionEntry>,
+        now: Instant,
+    ) -> usize {
+        let expired: Vec<CancellationToken> = sessions
+            .iter()
+            .filter(|entry| now.duration_since(entry.value().last_activity) >= UDP_SESSION_IDLE_TIMEOUT)
+            .map(|entry| entry.value().cancel.clone())
+            .collect();
+
+        for token in &expired {
+            token.cancel();
+        }
+
+        let before = sessions.len();
+        sessions.retain(|_, entry| now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT);
+        before.saturating_sub(sessions.len())
+    }
+
+    fn sweep_idle_direct_sessions(
+        sessions: &DashMap<UdpFlowKey, DirectUdpSessionEntry>,
+        now: Instant,
+    ) -> usize {
+        let expired: Vec<CancellationToken> = sessions
+            .iter()
+            .filter(|entry| now.duration_since(entry.value().last_activity) >= UDP_SESSION_IDLE_TIMEOUT)
+            .map(|entry| entry.value().cancel.clone())
+            .collect();
+
+        for token in &expired {
+            token.cancel();
+        }
+
+        let before = sessions.len();
+        sessions
+            .retain(|_, entry| now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT);
+        before.saturating_sub(sessions.len())
+    }
+
+    fn is_udp_flow_in_backoff(&self, flow_key: &UdpFlowKey) -> bool {
         let now = Instant::now();
         self.udp_timeout_backoff
             .get(flow_key)
             .is_some_and(|until| *until > now)
     }
 
-    async fn mark_udp_flow_backoff_shared(
+    fn mark_udp_flow_backoff_shared(
         udp_timeout_backoff: Arc<DashMap<UdpFlowKey, Instant>>,
         flow_key: UdpFlowKey,
     ) {
         udp_timeout_backoff.insert(flow_key, Instant::now() + UDP_TIMEOUT_BACKOFF);
-    }
-
-    async fn clear_udp_backoff_shared(
-        udp_timeout_backoff: Arc<DashMap<UdpFlowKey, Instant>>,
-        flow_key: &UdpFlowKey,
-    ) {
-        udp_timeout_backoff.remove(flow_key);
     }
 }

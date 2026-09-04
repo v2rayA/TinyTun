@@ -9,9 +9,10 @@ use crate::common::error::TinyTunError;
 
 type Result<T> = std::result::Result<T, TinyTunError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ipv6Mode {
+    #[default]
     Auto,
     On,
     Off,
@@ -119,11 +120,12 @@ pub struct DnsGroup {
     pub sni: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Debug,
     Info,
+    #[default]
     Warning,
     Error,
     None,
@@ -153,7 +155,7 @@ fn default_proxy_name() -> String {
     "proxy".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub log: LogConfig,
@@ -363,25 +365,11 @@ pub struct RouteConfig {
     pub default_interface: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogConfig {
     pub loglevel: LogLevel,
     pub hide_timestamp: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            log: LogConfig::default(),
-            tun: TunConfig::default(),
-            socks5: ProxyConfig::default(),
-            proxies: Vec::new(),
-            dns: DnsConfig::default(),
-            filtering: FilteringConfig::default(),
-            route: RouteConfig::default(),
-        }
-    }
 }
 
 impl Default for ProxyConfig {
@@ -407,12 +395,6 @@ impl Default for TunConfig {
             auto_route: false,
             mtu: 1500,
         }
-    }
-}
-
-impl Default for Ipv6Mode {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
@@ -601,21 +583,6 @@ impl Config {
             let excluded_name = excluded.rsplit(['/', '\\']).next().unwrap_or(excluded);
             excluded_name.eq_ignore_ascii_case(candidate)
         })
-    }
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Warning
-    }
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            loglevel: LogLevel::default(),
-            hide_timestamp: false,
-        }
     }
 }
 

@@ -159,7 +159,7 @@ pub fn apply_skip_network_routes(
     }
 
     let mut manager = new_route_manager()?;
-    apply_skip_prefixes(&mut manager, prefixes.into_iter(), outbound_interface)
+    apply_skip_prefixes(&mut manager, prefixes, outbound_interface)
 }
 
 pub fn cleanup_skip_network_routes(skip_networks: &[String]) -> Result<()> {

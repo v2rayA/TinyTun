@@ -124,17 +124,19 @@ pub async fn open_direct_tcp(
     ))
 }
 
-/// Send a single UDP datagram directly to `dst` via the physical outbound
-/// interface and return the first response datagram. Uses `SO_BINDTODEVICE`
-/// (Linux) or `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS) to prevent
-/// the socket from re-entering the TUN device.
-#[allow(dead_code)]
-#[allow(unreachable_code)]
-pub async fn direct_udp_exchange(
+/// Open a UDP socket pinned to the physical outbound interface and connected
+/// to `dst`, bypassing the TUN device.  Uses `SO_BINDTODEVICE` (Linux) or
+/// `IP_BOUND_IF`/`IPV6_BOUND_IF` (macOS) so the socket never re-enters the
+/// TUN routing path.
+///
+/// The returned socket is *connected* to `dst`, so the caller can use
+/// `send`/`recv` and push datagrams with the non-blocking `try_send` on the
+/// packet hot path while a per-session reader task drains responses.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub async fn open_direct_udp(
     dst: std::net::SocketAddr,
-    payload: Vec<u8>,
     outbound_interface: &str,
-) -> Result<Vec<u8>> {
+) -> Result<tokio::net::UdpSocket> {
     use tokio::net::UdpSocket;
 
     let bind_addr: std::net::SocketAddr = if dst.is_ipv6() {
@@ -221,27 +223,6 @@ pub async fn direct_udp_exchange(
         }
     }
 
-    // Same safety net as open_direct_tcp: platforms that reach this point
-    // have no interface binding, so return Err rather than doing a plain
-    // connect that may re-enter the TUN device.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (&dst, &payload, &outbound_interface, &socket);
-        return Err(anyhow::anyhow!(
-            "direct UDP: socket-level interface binding is not supported on this platform"
-        ));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     socket.connect(dst).await?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    socket.send(&payload).await?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let mut buf = vec![0u8; 65535];
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let n = socket.recv(&mut buf).await?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    buf.truncate(n);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    Ok(buf)
+    Ok(socket)
 }

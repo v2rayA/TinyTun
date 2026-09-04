@@ -71,7 +71,10 @@ pub struct ProcessLookupEntry {
 
 /// A TCP session with its state and forward channel.
 pub struct TcpSession {
-    pub state: Arc<tokio::sync::Mutex<TcpFlowState>>,
+    /// Protocol state guarded by a low-latency synchronous mutex.  The locked
+    /// sections are short and never span an `.await`, so a synchronous guard is
+    /// markedly cheaper than a fair-queued tokio mutex on the packet hot path.
+    pub state: Arc<parking_lot::Mutex<TcpFlowState>>,
     /// Channel used to pass forward payloads to the per-session writer task,
     /// keeping the main packet loop non-blocking.
     pub forward_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -100,10 +103,14 @@ impl Hash for UdpFlowKey {
 }
 
 /// Entry in the UDP session table.
-#[derive(Clone)]
 pub struct UdpSessionEntry {
-    pub session: Arc<tokio::sync::Mutex<crate::socks5_client::Socks5UdpSession>>,
+    /// Shareable session handle; sending is lock-free via `try_send_to`.
+    pub session: Arc<crate::socks5_client::Socks5UdpSession>,
     pub last_activity: Instant,
+    /// Signals the per-session relay task to stop when the entry is removed.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Global session-count slot, held for the lifetime of the entry.
+    pub _slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// State of a TCP flow.

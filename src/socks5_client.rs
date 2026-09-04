@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use log::debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,11 +10,16 @@ use crate::config::ProxyConfig;
 
 type Result<T> = std::result::Result<T, TinyTunError>;
 
-pub struct Socks5UdpSession {
+/// A SOCKS5 UDP ASSOCIATE session.
+///
+/// Sending reads only, so the whole handle is shareable via `Arc` with no
+/// mutex: outbound datagrams are pushed with `try_send_to` straight from the
+/// packet hot path and responses are drained by a per-session relay task.
+pub(crate) struct Socks5UdpSession {
     // Keep the TCP control channel alive for this UDP ASSOCIATE session.
     _control: TcpStream,
-    relay_addr: SocketAddr,
-    udp_socket: UdpSocket,
+    pub(crate) relay_addr: SocketAddr,
+    pub(crate) udp_socket: Arc<UdpSocket>,
 }
 
 #[derive(Clone)]
@@ -134,7 +140,7 @@ impl Socks5Client {
 
         let relay_addr = self.udp_associate(&mut control).await?;
         let bind_addr = if relay_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-        let udp_socket = UdpSocket::bind(bind_addr).await?;
+        let udp_socket = Arc::new(UdpSocket::bind(bind_addr).await?);
 
         Ok(Socks5UdpSession {
             _control: control,
@@ -385,7 +391,8 @@ impl Socks5Client {
         Ok(SocketAddr::new(addr, u16::from_be_bytes(port)))
     }
 
-    fn build_udp_request(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    /// Build a SOCKS5 UDP relay datagram: RSV(2) + FRAG(1) + address + payload.
+    pub(crate) fn build_udp_request(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
         let mut request = vec![0x00, 0x00, 0x00]; // RSV(2), FRAG(1)
         match target_addr {
             SocketAddr::V4(v4) => {
@@ -403,7 +410,7 @@ impl Socks5Client {
         request
     }
 
-    fn parse_udp_response(packet: &[u8]) -> Result<(SocketAddr, Vec<u8>)> {
+    pub(crate) fn parse_udp_response(packet: &[u8]) -> Result<(SocketAddr, Vec<u8>)> {
         if packet.len() < 4 {
             return Err(TinyTunError::Socks5(format!(
                 "SOCKS5 UDP response too short ({} bytes, need at least 4)",
@@ -470,18 +477,6 @@ impl Socks5Client {
         pos += 2;
 
         Ok((SocketAddr::new(addr, port), packet[pos..].to_vec()))
-    }
-}
-
-impl Socks5UdpSession {
-    pub async fn exchange(&mut self, target_addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
-        let request = Socks5Client::build_udp_request(target_addr, payload);
-        self.udp_socket.send_to(&request, self.relay_addr).await?;
-
-        let mut recv_buf = vec![0u8; 8192];
-        let (n, _) = self.udp_socket.recv_from(&mut recv_buf).await?;
-        let (_, response_payload) = Socks5Client::parse_udp_response(&recv_buf[..n])?;
-        Ok(response_payload)
     }
 }
 

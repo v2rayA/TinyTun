@@ -35,9 +35,13 @@ pub fn build_udp_packet(
 }
 
 /// Build a TCP/IP packet with the given parameters.
+/// Build a TCP packet for local injection.
 ///
 /// Returns `None` when the address family is mixed (e.g. IPv4 src + IPv6 dst),
 /// which should never happen in normal operation.
+// The boolean flag quartet is kept explicit so that every call site reads as a
+// control-message shape (SYN/FIN/RST/PSH) without an extra indirection.
+#[allow(clippy::too_many_arguments)]
 pub fn build_tcp_packet(
     flow_key: &FlowKey,
     sequence_number: u32,

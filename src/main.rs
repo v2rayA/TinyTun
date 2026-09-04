@@ -151,6 +151,10 @@ enum Commands {
         #[arg(long)]
         mtu: Option<u32>,
 
+        /// Number of tokio worker threads (default: available CPU count)
+        #[arg(long)]
+        worker_threads: Option<usize>,
+
         /// Skip IPs from proxy handling (repeatable)
         #[arg(long = "skip-ip")]
         skip_ip: Vec<IpAddr>,
@@ -181,10 +185,36 @@ enum Commands {
     },
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+/// Build the tokio multi-thread runtime with a configurable worker count and
+/// run the proxy.  A manual runtime is used (rather than `#[tokio::main]`) so
+/// the thread pool size can follow the CLI override instead of a fixed number.
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let worker_threads = match &cli.command {
+        Commands::Run {
+            worker_threads, ..
+        } => worker_threads.unwrap_or_else(default_worker_threads),
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .build()
+        .map_err(|e| anyhow!("failed to build tokio runtime: {}", e))?;
+
+    runtime.block_on(run(cli))
+}
+
+/// Default tokio worker count: number of available CPUs, floored at 2.
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(2)
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Run {
             config,
@@ -217,6 +247,7 @@ async fn main() -> Result<()> {
             exclude_process,
             auto_detect_interface,
             default_interface,
+            ..
         } => {
             let overrides = ConfigOverrides {
                 config_path: config,
@@ -391,23 +422,18 @@ async fn run_proxy(config: Config) -> Result<()> {
         let mut shutdown_error: Option<String> = None;
         let mut restart_reason: Option<String> = None;
 
-        loop {
-            tokio::select! {
-                _ = wait_for_shutdown_signal() => {
-                    info!("Received shutdown signal");
-                    info!("Shutting down...");
-                    break;
-                }
-                event = runtime_rx.recv() => {
-                    match event {
-                        Some(RuntimeEvent::PhysicalNetworkDown(reason)) => {
-                            restart_reason = Some(reason);
-                            break;
-                        }
-                        None => {
-                            shutdown_error = Some("runtime monitor channel closed unexpectedly".to_string());
-                            break;
-                        }
+        tokio::select! {
+            _ = wait_for_shutdown_signal() => {
+                info!("Received shutdown signal");
+                info!("Shutting down...");
+            }
+            event = runtime_rx.recv() => {
+                match event {
+                    Some(RuntimeEvent::PhysicalNetworkDown(reason)) => {
+                        restart_reason = Some(reason);
+                    }
+                    None => {
+                        shutdown_error = Some("runtime monitor channel closed unexpectedly".to_string());
                     }
                 }
             }
@@ -771,6 +797,9 @@ async fn wait_for_network_recovery_or_shutdown(config: &Config) -> Result<bool> 
             }
         }
 
+        // `is_multiple_of` is only stable on Rust 1.87+; keep `%` to honour the
+        // documented 1.70 MSRV.
+        #[allow(clippy::manual_is_multiple_of)]
         if probe_attempt % 10 == 0 {
             info!(
                 "Still waiting for physical network recovery... (next probe in {}s)",

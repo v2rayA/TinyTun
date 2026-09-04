@@ -236,9 +236,9 @@ fn netlink_find_pid(
 fn linux_pid_from_inode(inode: u64, uid: u32) -> Option<u32> {
     use std::sync::{Mutex, OnceLock};
 
-    // (inode, uid) → (pid, recorded_at)
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u64, u32), (u32, Instant)>>> =
-        OnceLock::new();
+    /// (inode, uid) → (pid, recorded_at)
+    type InodePidCache = std::collections::HashMap<(u64, u32), (u32, Instant)>;
+    static CACHE: OnceLock<Mutex<InodePidCache>> = OnceLock::new();
     const CACHE_TTL: Duration = Duration::from_secs(5);
 
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));

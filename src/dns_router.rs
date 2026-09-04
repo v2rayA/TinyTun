@@ -122,6 +122,10 @@ pub struct DnsRouter {
     outbound_interface: Option<String>,
     cache: Arc<DashMap<CacheKey, CacheEntry>>,
     cache_capacity: usize,
+    /// Insert counter used to amortise full cache prunes so that the packet /
+    /// resolution hot path stays O(1) instead of sorting the whole map on every
+    /// insert past capacity.
+    inserts_since_prune: std::sync::atomic::AtomicUsize,
     /// Shared TLS client config for DoT (DNS over TLS).
     tls_config: Arc<rustls::ClientConfig>,
     /// QUIC-specific TLS client config for DoQ (ALPN = "doq").
@@ -318,6 +322,7 @@ impl DnsRouter {
             groups,
             cache: Arc::new(cache),
             cache_capacity,
+            inserts_since_prune: std::sync::atomic::AtomicUsize::new(0),
             tls_config,
             doq_tls_config,
             http_client,
@@ -464,14 +469,25 @@ impl DnsRouter {
 
     fn insert_cache_entry(&self, key: CacheKey, entry: CacheEntry) {
         self.cache.insert(key, entry);
-        self.prune_cache_if_needed();
+
+        const PRUNE_EVERY_N_INSERTS: usize = 256;
+
+        let insert_count = self
+            .inserts_since_prune
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if insert_count >= PRUNE_EVERY_N_INSERTS
+            || self.cache.len() > self.cache_capacity * 2
+        {
+            self.inserts_since_prune.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.prune_cache();
+        }
     }
 
-    fn prune_cache_if_needed(&self) {
-        if self.cache.len() <= self.cache_capacity {
-            return;
-        }
-
+    /// Drop expired entries and, if still over capacity, evict the entries
+    /// with the nearest expiration time.  Called on an amortised cadence rather
+    /// than on every insert so the resolve hot path stays O(1).
+    fn prune_cache(&self) {
         let now = Instant::now();
         self.cache.retain(|_, entry| entry.expires_at > now);
 
