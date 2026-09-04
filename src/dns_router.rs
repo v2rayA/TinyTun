@@ -13,6 +13,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Key for the persistent UDP socket cache.
+type UdpSocketKey = (SocketAddr, Option<String>);
+/// Persistent UDP socket guarded by an async mutex so concurrent queries to
+/// the same upstream are serialised without response demuxing.
+type CachedUdpSocket = Arc<tokio::sync::Mutex<UdpSocket>>;
+
 use dashmap::DashMap;
 use log::{debug, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +67,7 @@ struct DnsQueryInfo {
 // ---------------------------------------------------------------------------
 
 /// Compiled form of a [`crate::config::DnsMatcher`].
+#[derive(Clone)]
 enum CompiledMatcher {
     DomainFull(String),
     DomainSuffix(String),
@@ -72,6 +79,7 @@ enum CompiledMatcher {
 
 /// Pre-compiled domain set built from one geosite category tag.
 /// Uses typed buckets so the common cases (exact & suffix) are O(1).
+#[derive(Clone)]
 struct CompiledGeositeSet {
     exact: HashSet<String>,     // DomainType::Full
     suffixes: HashSet<String>,  // DomainType::Domain
@@ -80,6 +88,7 @@ struct CompiledGeositeSet {
 }
 
 /// Action taken when a routing rule matches.
+#[derive(Clone)]
 enum CompiledAction {
     /// Forward to the named DNS group.
     Forward(String),
@@ -87,6 +96,7 @@ enum CompiledAction {
     Reject,
 }
 
+#[derive(Clone)]
 struct CompiledRule {
     matcher: CompiledMatcher,
     action: CompiledAction,
@@ -135,6 +145,33 @@ pub struct DnsRouter {
     /// HTTP client per proxy for DoH queries routed via a SOCKS5 proxy.
     /// Keyed by proxy name.
     http_proxy_clients: HashMap<String, reqwest::Client>,
+    /// Persistent UDP sockets keyed by (upstream address, bound interface).
+    /// A per-socket mutex serialises concurrent queries to the same upstream
+    /// so response demuxing is not required.
+    udp_sockets: Arc<DashMap<UdpSocketKey, CachedUdpSocket>>,
+}
+
+impl Clone for DnsRouter {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            proxy_clients: self.proxy_clients.clone(),
+            rules: self.rules.clone(),
+            groups: self.groups.clone(),
+            outbound_interface: self.outbound_interface.clone(),
+            cache: self.cache.clone(),
+            cache_capacity: self.cache_capacity,
+            inserts_since_prune: std::sync::atomic::AtomicUsize::new(
+                self.inserts_since_prune
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            tls_config: self.tls_config.clone(),
+            doq_tls_config: self.doq_tls_config.clone(),
+            http_client: self.http_client.clone(),
+            http_proxy_clients: self.http_proxy_clients.clone(),
+            udp_sockets: self.udp_sockets.clone(),
+        }
+    }
 }
 
 impl DnsRouter {
@@ -328,6 +365,7 @@ impl DnsRouter {
             http_client,
             http_proxy_clients,
             outbound_interface,
+            udp_sockets: Arc::new(DashMap::<UdpSocketKey, CachedUdpSocket>::new()),
         })
     }
 
@@ -347,8 +385,8 @@ impl DnsRouter {
     /// The returned bytes are raw DNS wire-format.  The transaction ID in the
     /// response intentionally matches the *upstream*'s reply (not the query),
     /// so callers should call `normalize_dns_response_for_query` if needed.
-    pub async fn resolve(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        let query_info = Self::parse_query_info(payload);
+    pub async fn resolve(&self, payload: Arc<[u8]>) -> Result<Vec<u8>> {
+        let query_info = Self::parse_query_info(&payload);
 
         // --- Cache lookup ---------------------------------------------------
         if self.config.routing.enable_cache {
@@ -384,7 +422,7 @@ impl DnsRouter {
                         .map(|i| i.domain.as_str())
                         .unwrap_or("(unknown)")
                 );
-                let nxdomain = Self::build_nxdomain_response(payload);
+                let nxdomain = Self::build_nxdomain_response(&payload);
                 // Cache the NXDOMAIN with a 1-hour TTL so repeated queries
                 // for blocked domains are served instantly from cache.
                 if self.config.routing.enable_cache {
@@ -435,14 +473,16 @@ impl DnsRouter {
 
         let response = match group.strategy {
             DnsQueryStrategy::Concurrent => {
-                self.query_concurrent(payload, group, timeout_duration)
+                self.query_concurrent(&payload, group, timeout_duration)
                     .await?
             }
             DnsQueryStrategy::Sequential => {
-                self.query_sequential(payload, group, timeout_duration)
+                self.query_sequential(&payload, group, timeout_duration)
                     .await?
             }
-            DnsQueryStrategy::Random => self.query_random(payload, group, timeout_duration).await?,
+            DnsQueryStrategy::Random => {
+                self.query_random(&payload, group, timeout_duration).await?
+            }
         };
 
         // --- Cache insert ---------------------------------------------------
@@ -476,10 +516,9 @@ impl DnsRouter {
             .inserts_since_prune
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        if insert_count >= PRUNE_EVERY_N_INSERTS
-            || self.cache.len() > self.cache_capacity * 2
-        {
-            self.inserts_since_prune.store(0, std::sync::atomic::Ordering::Relaxed);
+        if insert_count >= PRUNE_EVERY_N_INSERTS || self.cache.len() > self.cache_capacity * 2 {
+            self.inserts_since_prune
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             self.prune_cache();
         }
     }
@@ -656,29 +695,31 @@ impl DnsRouter {
     ) -> Result<Vec<u8>> {
         use futures::FutureExt;
 
+        let router = self.clone();
         let proxy_client = group
             .upstream
             .proxy_name()
-            .and_then(|n| self.proxy_clients.get(n))
+            .and_then(|n| router.proxy_clients.get(n))
             .cloned();
         let http_proxy = group
             .upstream
             .proxy_name()
-            .and_then(|n| self.http_proxy_clients.get(n))
+            .and_then(|n| router.http_proxy_clients.get(n))
             .cloned();
-        let tls_config = self.tls_config.clone();
-        let doq_tls_config = self.doq_tls_config.clone();
-        let http_client = self.http_client.clone();
+        let tls_config = router.tls_config.clone();
+        let doq_tls_config = router.doq_tls_config.clone();
+        let http_client = router.http_client.clone();
         let protocol = group.protocol;
         let upstream = group.upstream.clone();
         let sni = group.sni.clone();
         let payload = payload.to_vec();
 
-        let outbound_interface = self.outbound_interface.clone();
+        let outbound_interface = router.outbound_interface.clone();
         let futs: Vec<_> = group
             .servers
             .iter()
             .map(|server| {
+                let router = router.clone();
                 let pc = proxy_client.clone();
                 let tc = tls_config.clone();
                 let dqc = doq_tls_config.clone();
@@ -690,21 +731,22 @@ impl DnsRouter {
                 let up = upstream.clone();
                 let oiface = outbound_interface.clone();
                 async move {
-                    Self::query_server_static(
-                        pc.as_ref(),
-                        &tc,
-                        &dqc,
-                        &hc,
-                        hp.as_ref(),
-                        &p,
-                        &sv,
-                        protocol,
-                        sni.as_deref(),
-                        &up,
-                        timeout_duration,
-                        oiface.as_deref(),
-                    )
-                    .await
+                    router
+                        .query_server_static(
+                            pc.as_ref(),
+                            &tc,
+                            &dqc,
+                            &hc,
+                            hp.as_ref(),
+                            &p,
+                            &sv,
+                            protocol,
+                            sni.as_deref(),
+                            &up,
+                            timeout_duration,
+                            oiface.as_deref(),
+                        )
+                        .await
                 }
                 .boxed()
             })
@@ -790,7 +832,7 @@ impl DnsRouter {
             .upstream
             .proxy_name()
             .and_then(|n| self.http_proxy_clients.get(n));
-        Self::query_server_static(
+        self.query_server_static(
             proxy_client,
             &self.tls_config,
             &self.doq_tls_config,
@@ -807,9 +849,10 @@ impl DnsRouter {
         .await
     }
 
-    /// Statically-dispatched per-server query — handles all protocol variants.
+    /// Per-server query — handles all protocol variants.
     #[allow(clippy::too_many_arguments)]
     async fn query_server_static(
+        &self,
         proxy_client: Option<&Socks5Client>,
         tls_config: &Arc<rustls::ClientConfig>,
         doq_tls_config: &Arc<rustls::ClientConfig>,
@@ -835,7 +878,7 @@ impl DnsRouter {
                     })?;
                     Self::query_via_socks(sc.clone(), payload, addr, timeout_duration).await
                 } else {
-                    Self::query_udp_direct(payload, addr, timeout_duration, outbound_interface)
+                    self.query_udp_direct(payload, addr, timeout_duration, outbound_interface)
                         .await
                 }
             }
@@ -912,20 +955,47 @@ impl DnsRouter {
     // Direct UDP upstream
     // -----------------------------------------------------------------------
 
-    #[allow(unused_variables)]
     async fn query_udp_direct(
+        &self,
         payload: &[u8],
         upstream: SocketAddr,
         timeout_duration: Duration,
         outbound_interface: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let bind_addr: std::net::SocketAddr = match upstream {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        let key: UdpSocketKey = (upstream, outbound_interface.map(|s| s.to_string()));
+
+        // Fast path: reuse a cached socket.
+        let socket = if let Some(entry) = self.udp_sockets.get(&key) {
+            entry.value().clone()
+        } else {
+            let bind_addr: std::net::SocketAddr = match upstream {
+                SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+                SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+            };
+
+            let socket = UdpSocket::bind(bind_addr).await?;
+            Self::bind_udp_socket_to_interface(&socket, upstream, outbound_interface)?;
+
+            let socket = Arc::new(tokio::sync::Mutex::new(socket));
+            self.udp_sockets.insert(key, socket.clone());
+            socket
         };
 
-        let socket = UdpSocket::bind(bind_addr).await?;
+        let guard = socket.lock().await;
+        timeout(timeout_duration, guard.send_to(payload, upstream)).await??;
 
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = timeout(timeout_duration, guard.recv_from(&mut buf)).await??;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    #[allow(unused_variables)]
+    fn bind_udp_socket_to_interface(
+        socket: &UdpSocket,
+        upstream: SocketAddr,
+        outbound_interface: Option<&str>,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(iface) = outbound_interface {
             use std::os::unix::io::AsRawFd;
@@ -997,12 +1067,7 @@ impl DnsRouter {
             }
         }
 
-        timeout(timeout_duration, socket.send_to(payload, upstream)).await??;
-
-        let mut buf = vec![0u8; 4096];
-        let (n, _) = timeout(timeout_duration, socket.recv_from(&mut buf)).await??;
-        buf.truncate(n);
-        Ok(buf)
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

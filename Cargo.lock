@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "tinytun"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1928,6 +1928,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "smallvec",
  "socket2 0.5.10",
  "socks5-impl",
  "sysinfo",

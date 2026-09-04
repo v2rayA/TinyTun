@@ -1,7 +1,8 @@
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -12,14 +13,16 @@ use crate::dns_router::DnsRouter;
 use crate::packet;
 use crate::packet::shared::ParsedIpPacket;
 use crate::packet::tcp::TcpHandler;
+use crate::packet::tun_tx::TunPacketTx;
 use crate::packet::udp::UdpHandler;
 use crate::socks5_client::Socks5Client;
 
+#[derive(Clone)]
 pub struct PacketProcessor {
     pub config: Arc<Config>,
     pub outbound_interface: Option<Arc<str>>,
-    pub tcp_handler: TcpHandler,
-    pub udp_handler: UdpHandler,
+    pub tcp_handler: Arc<TcpHandler>,
+    pub udp_handler: Arc<UdpHandler>,
 }
 
 #[derive(Debug)]
@@ -39,13 +42,24 @@ impl std::fmt::Display for PacketProcessError {
 
 impl std::error::Error for PacketProcessError {}
 
+/// Per-packet task submitted to the worker pool.
+///
+/// The IP header is parsed once by the reader loop; workers reuse `parsed`
+/// so the transport handlers do not re-parse it.
+struct WorkerPacket {
+    data: Vec<u8>,
+    parsed: ParsedIpPacket,
+}
+
 impl PacketProcessor {
     const TCP_SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     const DYNAMIC_BYPASS_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const UDP_SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const PROCESS_CACHE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const PROCESS_CACHE_MAX_ENTRIES: usize = 1024;
-    const TUN_WRITE_QUEUE_CAPACITY: usize = 2048;
+    /// Capacity of each per-worker input queue.  A full queue creates back-pressure
+    /// on the reader but does not block other workers.
+    const WORKER_QUEUE_CAPACITY: usize = 1024;
 
     pub fn new(
         config: Config,
@@ -64,33 +78,24 @@ impl PacketProcessor {
             &config,
             outbound_interface.clone(),
         )?);
-        let (tun_packet_tx, mut tun_packet_rx) =
-            mpsc::channel::<Vec<u8>>(Self::TUN_WRITE_QUEUE_CAPACITY);
+        let tun_packet_tx = TunPacketTx::new(tun_writer);
 
-        tokio::spawn(async move {
-            while let Some(packet) = tun_packet_rx.recv().await {
-                if let Err(err) = tun_writer.send(&packet).await {
-                    warn!("Failed to write packet to TUN from writer queue: {}", err);
-                }
-            }
-        });
-
-        let tcp_handler = TcpHandler::new(
+        let tcp_handler = Arc::new(TcpHandler::new(
             config.clone(),
             socks5_client.clone(),
             outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
             enable_user_space_process_exclusion,
-        );
+        ));
 
-        let udp_handler = UdpHandler::new(
+        let udp_handler = Arc::new(UdpHandler::new(
             config.clone(),
             socks5_client.clone(),
             dns_router.clone(),
             outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
             enable_user_space_process_exclusion,
-        );
+        ));
 
         Ok(Self {
             config,
@@ -132,6 +137,29 @@ impl PacketProcessor {
         udp_cleanup_tick.tick().await;
         process_cache_cleanup_tick.tick().await;
 
+        // Spawn a pool of packet workers.  The reader loop only reads from TUN
+        // and dispatches packets; slow paths (process lookup, DNS resolution,
+        // route installation, session setup) run inside workers and cannot
+        // block the next TUN recv().
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .max(2);
+
+        let mut worker_txs = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (tx, mut rx) = mpsc::channel::<WorkerPacket>(Self::WORKER_QUEUE_CAPACITY);
+            let processor = self.clone();
+            tokio::spawn(async move {
+                while let Some(task) = rx.recv().await {
+                    if let Err(e) = processor.process_packet(&task.data, &task.parsed).await {
+                        error!("Error processing packet: {}", e);
+                    }
+                }
+            });
+            worker_txs.push(tx);
+        }
+
         loop {
             tokio::select! {
                 _ = tcp_cleanup_tick.tick() => {
@@ -162,17 +190,31 @@ impl PacketProcessor {
                     }
 
                     let packet = &buffer[..bytes_read];
+                    let parsed = match Self::parse_ip_packet(packet) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            error!("Error parsing packet: {}", e);
+                            continue;
+                        }
+                    };
 
-                    if let Err(e) = self.process_packet(packet).await {
-                        error!("Error processing packet: {}", e);
+                    let worker_idx = Self::packet_worker_index(&parsed, packet, worker_count);
+                    let task = WorkerPacket {
+                        data: packet.to_vec(),
+                        parsed,
+                    };
+
+                    if let Err(e) = worker_txs[worker_idx].send(task).await {
+                        error!("Packet worker channel closed: {}", e);
+                        return Err(anyhow::anyhow!("packet worker channel closed"));
                     }
                 }
             }
         }
     }
 
-    async fn process_packet(&self, packet: &[u8]) -> Result<(), PacketProcessError> {
-        // Parse IP header
+    fn parse_ip_packet(packet: &[u8]) -> Result<Option<ParsedIpPacket>, PacketProcessError> {
         if packet.len() < 20 {
             return Err(PacketProcessError::TooShort);
         }
@@ -203,9 +245,41 @@ impl PacketProcessor {
                     header_len: 40,
                 }
             }
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
 
+        Ok(Some(parsed))
+    }
+
+    /// Pick a worker for a packet.
+    ///
+    /// TCP and UDP packets are routed by 4-tuple so that every packet of the
+    /// same flow is handled by the same worker, preserving in-order processing.
+    /// Non-transport packets are spread by destination IP.
+    fn packet_worker_index(parsed: &ParsedIpPacket, packet: &[u8], worker_count: usize) -> usize {
+        let transport = &packet[parsed.header_len.min(packet.len())..];
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        parsed.src.hash(&mut hasher);
+        parsed.dst.hash(&mut hasher);
+
+        match parsed.protocol {
+            6 | 17 if transport.len() >= 4 => {
+                let src_port = u16::from_be_bytes([transport[0], transport[1]]);
+                let dst_port = u16::from_be_bytes([transport[2], transport[3]]);
+                src_port.hash(&mut hasher);
+                dst_port.hash(&mut hasher);
+            }
+            _ => {}
+        }
+
+        (hasher.finish() as usize) % worker_count
+    }
+
+    async fn process_packet(
+        &self,
+        packet: &[u8],
+        parsed: &ParsedIpPacket,
+    ) -> Result<(), PacketProcessError> {
         // Check if we should skip this IP
         let dest_ip = parsed.dst;
         let is_transport = parsed.protocol == 6 || parsed.protocol == 17;
@@ -227,14 +301,14 @@ impl PacketProcessor {
         match parsed.protocol {
             6 => {
                 self.tcp_handler
-                    .handle_tcp_packet(packet, &parsed, is_static_bypass)
+                    .handle_tcp_packet(packet, parsed, is_static_bypass)
                     .await
                     .map_err(|e| PacketProcessError::ParseError(e.to_string()))?;
                 Ok(())
             }
             17 => {
                 self.udp_handler
-                    .handle_udp_packet(packet, &parsed, is_static_bypass)
+                    .handle_udp_packet(packet, parsed, is_static_bypass)
                     .await
                     .map_err(|e| PacketProcessError::ParseError(e.to_string()))?;
                 Ok(())

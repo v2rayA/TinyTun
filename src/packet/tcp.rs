@@ -12,7 +12,8 @@ use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpStream,
 };
-use tokio::sync::{mpsc, mpsc::error::TryRecvError};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::timeout;
 
 use etherparse::{PacketBuilder, TcpHeaderSlice};
@@ -24,6 +25,7 @@ use crate::packet::shared::{
     ProcessLookupKey, TcpFlowState, TcpLifecycle, TcpSession, IPV4_TCP_HEADER_OVERHEAD,
     IPV6_TCP_HEADER_OVERHEAD, MAX_TCP_PAYLOAD, MIN_TCP_PAYLOAD, READ_BUF_MAX, READ_BUF_MIN,
 };
+use crate::packet::tun_tx::TunPacketTx;
 use crate::process_lookup::{ProcessLookupOptions, TransportProtocol};
 use crate::socks5_client::Socks5Client;
 
@@ -37,12 +39,13 @@ const TCP_ACK_MAX_BATCH_WRITES: usize = 8;
 
 // ── TcpHandler ────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct TcpHandler {
     pub config: Arc<Config>,
     pub socks5_client: Arc<Socks5Client>,
     pub outbound_interface: Option<Arc<str>>,
     pub enable_user_space_process_exclusion: bool,
-    pub tun_packet_tx: mpsc::Sender<Vec<u8>>,
+    pub tun_packet_tx: TunPacketTx,
     pub tcp_sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
     pub pending_connections: Arc<DashSet<FlowKey>>,
     pub process_name_cache: Arc<DashMap<ProcessLookupKey, ProcessLookupEntry>>,
@@ -55,7 +58,7 @@ impl TcpHandler {
         config: Arc<Config>,
         socks5_client: Arc<Socks5Client>,
         outbound_interface: Option<Arc<str>>,
-        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
         enable_user_space_process_exclusion: bool,
     ) -> Self {
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
@@ -542,7 +545,7 @@ impl TcpHandler {
     }
 
     async fn send_connect_failure_rst(
-        tun_packet_tx: &mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: &TunPacketTx,
         flow_key: &FlowKey,
         client_isn: u32,
     ) {
@@ -563,7 +566,7 @@ impl TcpHandler {
         client_isn: u32,
         stream: TcpStream,
         mtu: usize,
-        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
         tcp_sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
     ) {
         let (reader, writer) = stream.into_split();
@@ -634,7 +637,7 @@ impl TcpHandler {
         mut writer: OwnedWriteHalf,
         state: Arc<parking_lot::Mutex<TcpFlowState>>,
         sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
-        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
     ) {
         tokio::spawn(async move {
             let mut batch: Vec<Vec<u8>> = Vec::with_capacity(TCP_ACK_MAX_BATCH_WRITES);
@@ -743,7 +746,7 @@ impl TcpHandler {
         mut reader: OwnedReadHalf,
         session: Arc<TcpSession>,
         sessions: Arc<DashMap<FlowKey, Arc<TcpSession>>>,
-        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
         mtu: usize,
     ) {
         tokio::spawn(async move {

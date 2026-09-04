@@ -97,10 +97,7 @@ pub async fn cleanup_expired_dynamic_bypass_routes(
 
     match cleanup_result {
         Ok(Ok(())) => {
-            log::debug!(
-                "Cleaned up {} expired dynamic bypass routes",
-                expired_count
-            );
+            log::debug!("Cleaned up {} expired dynamic bypass routes", expired_count);
         }
         Ok(Err(err)) => {
             log::warn!("Failed to cleanup expired dynamic bypass routes: {}", err);

@@ -50,8 +50,7 @@ impl TunDevice {
 
     /// Get a shared handle to the TUN device for reading
     pub fn get_reader(&self) -> Arc<AsyncDevice> {
-        self
-            .device
+        self.device
             .as_ref()
             .expect("TUN reader requested after device cleanup")
             .clone()
@@ -59,8 +58,7 @@ impl TunDevice {
 
     /// Get a shared handle to the TUN device for writing
     pub fn get_writer(&self) -> Arc<AsyncDevice> {
-        self
-            .device
+        self.device
             .as_ref()
             .expect("TUN writer requested after device cleanup")
             .clone()

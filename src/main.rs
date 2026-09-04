@@ -192,9 +192,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let worker_threads = match &cli.command {
-        Commands::Run {
-            worker_threads, ..
-        } => worker_threads.unwrap_or_else(default_worker_threads),
+        Commands::Run { worker_threads, .. } => {
+            worker_threads.unwrap_or_else(default_worker_threads)
+        }
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

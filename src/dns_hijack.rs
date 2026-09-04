@@ -145,7 +145,15 @@ pub fn apply_dns_hijack(config: &Config, tun_name: &str) -> Result<Option<DnsHij
         .output();
 
     let route_add = Command::new("ip")
-        .args(["route", "add", "default", "dev", tun_name, "table", &table_id_s])
+        .args([
+            "route",
+            "add",
+            "default",
+            "dev",
+            tun_name,
+            "table",
+            &table_id_s,
+        ])
         .output()?;
     if !route_add.status.success() {
         return Err(anyhow::anyhow!(
@@ -221,9 +229,18 @@ pub fn cleanup_dns_hijack(state: Option<&DnsHijackState>) -> Result<()> {
         .output();
 
     let results: [(&str, &[&str]); 3] = [
-        ("iptables -D OUTPUT", &["-t", "mangle", "-D", "OUTPUT", "-j", "TINYTUN_DNS_HIJACK"]),
-        ("iptables -F chain",  &["-t", "mangle", "-F", "TINYTUN_DNS_HIJACK"]),
-        ("iptables -X chain",  &["-t", "mangle", "-X", "TINYTUN_DNS_HIJACK"]),
+        (
+            "iptables -D OUTPUT",
+            &["-t", "mangle", "-D", "OUTPUT", "-j", "TINYTUN_DNS_HIJACK"],
+        ),
+        (
+            "iptables -F chain",
+            &["-t", "mangle", "-F", "TINYTUN_DNS_HIJACK"],
+        ),
+        (
+            "iptables -X chain",
+            &["-t", "mangle", "-X", "TINYTUN_DNS_HIJACK"],
+        ),
     ];
 
     for (label, args) in &results {
@@ -274,8 +291,11 @@ pub fn apply_dns_hijack(config: &Config, tun_name: &str) -> Result<Option<DnsHij
     // the returned interface pointer is valid and checked via `ok()?`. `policy.Rules()`
     // returns a valid `INetFwRules` interface. All COM calls use the `windows-rs` safe
     // wrappers which handle reference counting.
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()?; }
-    let policy: INetFwPolicy2 = unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)? };
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+    }
+    let policy: INetFwPolicy2 =
+        unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)? };
     let rules = unsafe { policy.Rules()? };
 
     cleanup_windows_dns_hijack_rules(&rules)?;
@@ -371,7 +391,9 @@ pub fn apply_dns_hijack(config: &Config, tun_name: &str) -> Result<Option<DnsHij
 
 #[cfg(target_os = "windows")]
 pub fn cleanup_dns_hijack(_state: Option<&DnsHijackState>) -> Result<()> {
-    use windows::Win32::NetworkManagement::WindowsFirewall::{INetFwPolicy2, INetFwRules, NetFwPolicy2};
+    use windows::Win32::NetworkManagement::WindowsFirewall::{
+        INetFwPolicy2, INetFwRules, NetFwPolicy2,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
@@ -380,10 +402,11 @@ pub fn cleanup_dns_hijack(_state: Option<&DnsHijackState>) -> Result<()> {
     // SAFETY: Same COM initialization pattern as `apply_dns_hijack` on Windows.
     // `CoInitializeEx`/`CoUninitialize` are properly paired. COM interface pointers
     // are managed by `windows-rs` safe wrappers.
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()?; }
-    let policy: INetFwPolicy2 = unsafe {
-        CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)?
-    };
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+    }
+    let policy: INetFwPolicy2 =
+        unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)? };
     let rules: INetFwRules = unsafe { policy.Rules()? };
     let result = cleanup_windows_dns_hijack_rules(&rules);
     // SAFETY: Paired `CoUninitialize` for the `CoInitializeEx` above.
@@ -422,9 +445,7 @@ fn add_windows_dns_rule(
     // `INetFwRule` interface pointer is valid. All subsequent `Set*` calls are
     // COM method invocations on a valid interface; `windows-rs` handles the
     // underlying vtable dispatch safely.
-    let rule: INetFwRule = unsafe {
-        CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)?
-    };
+    let rule: INetFwRule = unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)? };
 
     unsafe {
         rule.SetName(&BSTR::from(name))?;
@@ -482,15 +503,19 @@ fn cleanup_windows_dns_hijack_rules(
             }
             // SAFETY: Same pattern as static names above. `rules.Remove` is a COM method call
             // with a valid `BSTR` parameter. The `_ =` discards the `Result` as this is best-effort cleanup.
-            let _ = unsafe { rules.Remove(&windows::core::BSTR::from(format!(
-                "TinyTun DNS Hijack Block UDP [{}]",
-                alias
-            ))) };
+            let _ = unsafe {
+                rules.Remove(&windows::core::BSTR::from(format!(
+                    "TinyTun DNS Hijack Block UDP [{}]",
+                    alias
+                )))
+            };
             // SAFETY: Same as above for TCP variant.
-            let _ = unsafe { rules.Remove(&windows::core::BSTR::from(format!(
-                "TinyTun DNS Hijack Block TCP [{}]",
-                alias
-            ))) };
+            let _ = unsafe {
+                rules.Remove(&windows::core::BSTR::from(format!(
+                    "TinyTun DNS Hijack Block TCP [{}]",
+                    alias
+                )))
+            };
         }
     }
 

@@ -1,7 +1,7 @@
 use ::route_manager::{Route as SysRoute, RouteManager as SysRouteManager};
 use anyhow::{anyhow, Result};
-use log::warn;
 use ipnetwork::IpNetwork;
+use log::warn;
 use std::cmp::Ordering;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -25,7 +25,10 @@ pub fn resolve_route_interface(
     if let Some(interface) = default_interface {
         let route = find_default_route_v4(Some(interface))?
             .ok_or_else(|| anyhow!("selected interface '{}' is not routable", interface))?;
-        let if_name = route.if_name().cloned().unwrap_or_else(|| interface.to_string());
+        let if_name = route
+            .if_name()
+            .cloned()
+            .unwrap_or_else(|| interface.to_string());
         return Ok(Some(if_name));
     }
 
@@ -55,11 +58,7 @@ pub fn apply_auto_routes(interface: &str, ipv6_enabled: bool) -> Result<()> {
         )?;
         add_or_replace(
             &mut manager,
-            &route_with_interface(
-                "8000::".parse::<Ipv6Addr>()?.into(),
-                1,
-                interface,
-            ),
+            &route_with_interface("8000::".parse::<Ipv6Addr>()?.into(), 1, interface),
         )?;
     }
 
@@ -215,10 +214,14 @@ where
     // (e.g. ensure_dynamic_bypass_for_ip) must receive an error so they can
     // send a RST instead of silently dropping the packet.
     if has_v4_targets && v4_base.is_none() {
-        return Err(anyhow!("no usable IPv4 default route found for bypass setup"));
+        return Err(anyhow!(
+            "no usable IPv4 default route found for bypass setup"
+        ));
     }
     if has_v6_targets && v6_base.is_none() {
-        return Err(anyhow!("no usable IPv6 default route found for bypass setup"));
+        return Err(anyhow!(
+            "no usable IPv6 default route found for bypass setup"
+        ));
     }
     let _ = (has_v4_default, has_v6_default); // queried above for diagnostic purposes only
 
@@ -242,7 +245,10 @@ where
     Ok(())
 }
 
-fn select_default_with_fallback(is_v4: bool, outbound_interface: Option<&str>) -> Result<Option<SysRoute>> {
+fn select_default_with_fallback(
+    is_v4: bool,
+    outbound_interface: Option<&str>,
+) -> Result<Option<SysRoute>> {
     if is_v4 {
         if let Some(route) = find_default_route_v4(outbound_interface)? {
             return Ok(Some(route));
@@ -305,10 +311,13 @@ fn filter_connected_windows_routes(routes: &mut Vec<SysRoute>, is_v4: bool) -> R
         .into_iter()
         .filter(|adapter| adapter.oper_status() == OperStatus::IfOperStatusUp)
         .filter(|adapter| {
-            adapter
-                .gateways()
-                .iter()
-                .any(|gateway| if is_v4 { gateway.is_ipv4() } else { gateway.is_ipv6() })
+            adapter.gateways().iter().any(|gateway| {
+                if is_v4 {
+                    gateway.is_ipv4()
+                } else {
+                    gateway.is_ipv6()
+                }
+            })
         })
         .map(|adapter| adapter.friendly_name().to_ascii_lowercase())
         .collect::<Vec<_>>();

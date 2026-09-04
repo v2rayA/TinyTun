@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use log::{debug, warn};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,7 @@ use crate::packet;
 use crate::packet::shared::{
     ParsedIpPacket, ProcessLookupEntry, ProcessLookupKey, UdpFlowKey, UdpSessionEntry,
 };
+use crate::packet::tun_tx::TunPacketTx;
 use crate::process_lookup::{ProcessLookupOptions, TransportProtocol};
 use crate::socks5_client::{Socks5Client, Socks5UdpSession};
 
@@ -48,13 +49,14 @@ pub(crate) struct DirectUdpSessionEntry {
 
 // ── UdpHandler ────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct UdpHandler {
     pub config: Arc<Config>,
     pub socks5_client: Arc<Socks5Client>,
     pub dns_router: Arc<DnsRouter>,
     pub outbound_interface: Option<Arc<str>>,
     pub enable_user_space_process_exclusion: bool,
-    pub tun_packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub tun_packet_tx: TunPacketTx,
     pub udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
     pub pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
     pub udp_timeout_backoff: Arc<DashMap<UdpFlowKey, Instant>>,
@@ -73,7 +75,7 @@ impl UdpHandler {
         socks5_client: Arc<Socks5Client>,
         dns_router: Arc<DnsRouter>,
         outbound_interface: Option<Arc<str>>,
-        tun_packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
         enable_user_space_process_exclusion: bool,
     ) -> Self {
         let process_lookup_options = ProcessLookupOptions::from_config(&config);
@@ -247,7 +249,11 @@ impl UdpHandler {
                     let _ = socket.try_send(&udp_payload);
                     debug!(
                         "Opened direct UDP session for excluded flow {}:{} -> {}:{} with {} bytes",
-                        src_ip, source_port, dst_ip, dest_port, udp_payload.len()
+                        src_ip,
+                        source_port,
+                        dst_ip,
+                        dest_port,
+                        udp_payload.len()
                     );
                 });
 
@@ -332,7 +338,7 @@ impl UdpHandler {
                 }
             };
 
-            let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
+            let udp_payload = Arc::<[u8]>::from(&udp_data[UdpHeader::LEN..]);
             let dns_router = self.dns_router.clone();
             let tun_packet_tx = self.tun_packet_tx.clone();
             let src_ip = ip_packet.src;
@@ -342,7 +348,7 @@ impl UdpHandler {
                 let _permit = dns_permit;
 
                 let dns_txid = packet::shared::dns_txid(&udp_payload);
-                let response_payload = match dns_router.resolve(&udp_payload).await {
+                let response_payload = match dns_router.resolve(udp_payload.clone()).await {
                     Ok(resp) => {
                         packet::shared::normalize_dns_response_for_query(&udp_payload, resp)
                     }
@@ -385,7 +391,7 @@ impl UdpHandler {
             return Ok(());
         }
 
-        let udp_payload = udp_data[UdpHeader::LEN..].to_vec();
+        let udp_payload = Arc::<[u8]>::from(&udp_data[UdpHeader::LEN..]);
         let udp_flow_key = UdpFlowKey {
             src: source_addr,
             dst: target_addr,
@@ -497,8 +503,13 @@ impl UdpHandler {
             Self::try_send_udp_frame(&session, udp_flow_key.dst, &udp_payload);
             debug!(
                 "Opened UDP ASSOCIATE for {}:{} -> {}:{} with {} bytes",
-                src_ip, source_port, dst_ip, dest_port, udp_payload.len()
+                src_ip,
+                source_port,
+                dst_ip,
+                dest_port,
+                udp_payload.len()
             );
+            let _ = udp_payload;
         });
 
         Ok(())
@@ -509,7 +520,11 @@ impl UdpHandler {
     /// The relay frame is built here and pushed with `try_send_to` so the
     /// packet hot path never blocks.  A full kernel send buffer is treated as
     /// a dropped datagram, which is exactly how UDP is expected to behave.
-    fn try_send_udp_frame(session: &Socks5UdpSession, target: std::net::SocketAddr, payload: &[u8]) {
+    fn try_send_udp_frame(
+        session: &Socks5UdpSession,
+        target: std::net::SocketAddr,
+        payload: &[u8],
+    ) {
         let frame = Socks5Client::build_udp_request(target, payload);
         match session.udp_socket.try_send_to(&frame, session.relay_addr) {
             Ok(_) => {}
@@ -566,7 +581,7 @@ impl UdpHandler {
         udp_socket: Arc<tokio::net::UdpSocket>,
         flow_key: UdpFlowKey,
         cancel: CancellationToken,
-        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
     ) {
         tokio::spawn(async move {
             let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -584,11 +599,9 @@ impl UdpHandler {
                     continue;
                 };
 
-                let Some(response_packet) = packet::packet_build::build_udp_packet(
-                    flow_key.dst,
-                    flow_key.src,
-                    &payload,
-                ) else {
+                let Some(response_packet) =
+                    packet::packet_build::build_udp_packet(flow_key.dst, flow_key.src, &payload)
+                else {
                     continue;
                 };
 
@@ -610,7 +623,7 @@ impl UdpHandler {
         udp_socket: Arc<tokio::net::UdpSocket>,
         flow_key: UdpFlowKey,
         cancel: CancellationToken,
-        tun_packet_tx: mpsc::Sender<Vec<u8>>,
+        tun_packet_tx: TunPacketTx,
     ) {
         tokio::spawn(async move {
             let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -624,9 +637,11 @@ impl UdpHandler {
                     break;
                 };
 
-                let Some(response_packet) =
-                    packet::packet_build::build_udp_packet(flow_key.dst, flow_key.src, &recv_buf[..n])
-                else {
+                let Some(response_packet) = packet::packet_build::build_udp_packet(
+                    flow_key.dst,
+                    flow_key.src,
+                    &recv_buf[..n],
+                ) else {
                     continue;
                 };
 
@@ -660,13 +675,12 @@ impl UdpHandler {
         self.udp_timeout_backoff.retain(|_, until| *until > now);
     }
 
-    fn sweep_idle_sessions(
-        sessions: &DashMap<UdpFlowKey, UdpSessionEntry>,
-        now: Instant,
-    ) -> usize {
+    fn sweep_idle_sessions(sessions: &DashMap<UdpFlowKey, UdpSessionEntry>, now: Instant) -> usize {
         let expired: Vec<CancellationToken> = sessions
             .iter()
-            .filter(|entry| now.duration_since(entry.value().last_activity) >= UDP_SESSION_IDLE_TIMEOUT)
+            .filter(|entry| {
+                now.duration_since(entry.value().last_activity) >= UDP_SESSION_IDLE_TIMEOUT
+            })
             .map(|entry| entry.value().cancel.clone())
             .collect();
 
@@ -675,7 +689,8 @@ impl UdpHandler {
         }
 
         let before = sessions.len();
-        sessions.retain(|_, entry| now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT);
+        sessions
+            .retain(|_, entry| now.duration_since(entry.last_activity) < UDP_SESSION_IDLE_TIMEOUT);
         before.saturating_sub(sessions.len())
     }
 
@@ -685,7 +700,9 @@ impl UdpHandler {
     ) -> usize {
         let expired: Vec<CancellationToken> = sessions
             .iter()
-            .filter(|entry| now.duration_since(entry.value().last_activity) >= UDP_SESSION_IDLE_TIMEOUT)
+            .filter(|entry| {
+                now.duration_since(entry.value().last_activity) >= UDP_SESSION_IDLE_TIMEOUT
+            })
             .map(|entry| entry.value().cancel.clone())
             .collect();
 

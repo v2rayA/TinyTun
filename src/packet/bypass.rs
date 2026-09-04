@@ -42,7 +42,10 @@ pub async fn should_exclude_process_flow(
                 if config.is_excluded_process_name(name) {
                     log::debug!(
                         "Excluded process matched (cached): process={} protocol={:?} flow={} -> {}",
-                        name, protocol, src, dst
+                        name,
+                        protocol,
+                        src,
+                        dst
                     );
                     return true;
                 }
@@ -101,9 +104,8 @@ pub async fn cleanup_process_lookup_cache(
 ) {
     let now = Instant::now();
 
-    process_name_cache.retain(|_, entry| {
-        now.duration_since(entry.recorded_at) <= PROCESS_LOOKUP_CACHE_TTL
-    });
+    process_name_cache
+        .retain(|_, entry| now.duration_since(entry.recorded_at) <= PROCESS_LOOKUP_CACHE_TTL);
 
     let cache_len = process_name_cache.len();
     if cache_len > max_entries {

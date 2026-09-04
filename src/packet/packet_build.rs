@@ -1,10 +1,9 @@
 use anyhow::Result;
 use etherparse::PacketBuilder;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
 
-use crate::packet::shared::{FlowKey, DEFAULT_TCP_WINDOW, DEFAULT_TTL, TUN_WRITE_ENQUEUE_TIMEOUT};
+use crate::packet::shared::{FlowKey, DEFAULT_TCP_WINDOW, DEFAULT_TTL};
+use crate::packet::tun_tx::TunPacketTx;
 
 /// Build a UDP/IP packet from source to destination with payload.
 ///
@@ -99,7 +98,7 @@ pub fn build_tcp_packet(
 
 /// Build and enqueue a TCP control packet (SYN, FIN, RST, or pure ACK).
 pub async fn inject_tcp_control(
-    tun_packet_tx: &mpsc::Sender<Vec<u8>>,
+    tun_tx: &TunPacketTx,
     flow_key: &FlowKey,
     sequence_number: u32,
     acknowledgment_number: u32,
@@ -125,7 +124,14 @@ pub async fn inject_tcp_control(
         )
     })?;
 
-    enqueue_tun_packet_with_timeout(tun_packet_tx, packet)
+    tun_tx
+        .send_with_hash(
+            packet,
+            flow_key.src.ip(),
+            flow_key.dst.ip(),
+            flow_key.src.port(),
+            flow_key.dst.port(),
+        )
         .await
         .map_err(|err| {
             anyhow::anyhow!(
@@ -137,24 +143,6 @@ pub async fn inject_tcp_control(
 }
 
 /// Write a packet to the TUN device via the channel.
-pub async fn write_tun_packet_with(
-    tun_packet_tx: &mpsc::Sender<Vec<u8>>,
-    packet: Vec<u8>,
-) -> Result<()> {
-    enqueue_tun_packet_with_timeout(tun_packet_tx, packet).await
-}
-
-/// Enqueue a packet for TUN write with a timeout.
-pub async fn enqueue_tun_packet_with_timeout(
-    tun_packet_tx: &mpsc::Sender<Vec<u8>>,
-    packet: Vec<u8>,
-) -> Result<()> {
-    match timeout(TUN_WRITE_ENQUEUE_TIMEOUT, tun_packet_tx.send(packet)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(anyhow::anyhow!(
-            "failed to enqueue packet for TUN write: {}",
-            err
-        )),
-        Err(_) => Err(anyhow::anyhow!("timed out enqueuing packet for TUN write")),
-    }
+pub async fn write_tun_packet_with(tun_tx: &TunPacketTx, packet: Vec<u8>) -> Result<()> {
+    tun_tx.send(packet).await
 }

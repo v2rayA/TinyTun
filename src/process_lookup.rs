@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
@@ -33,11 +34,7 @@ pub fn find_process_name_for_flow(
 }
 
 /// Look up the PID owning the given network flow using platform-native APIs.
-fn find_pid_for_flow(
-    protocol: TransportProtocol,
-    src: SocketAddr,
-    dst: SocketAddr,
-) -> Option<u32> {
+fn find_pid_for_flow(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         return linux_find_pid(protocol, src, dst);
@@ -76,16 +73,33 @@ fn linux_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr)
     };
 
     match (src.ip(), dst.ip()) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => {
-            netlink_find_pid(libc::AF_INET as u8, ipproto, &s.octets(), src.port(), &d.octets(), dst.port())
-        }
-        (IpAddr::V6(s), IpAddr::V6(d)) => {
-            netlink_find_pid(libc::AF_INET6 as u8, ipproto, &s.octets(), src.port(), &d.octets(), dst.port())
-        }
+        (IpAddr::V4(s), IpAddr::V4(d)) => netlink_find_pid(
+            libc::AF_INET as u8,
+            ipproto,
+            &s.octets(),
+            src.port(),
+            &d.octets(),
+            dst.port(),
+        ),
+        (IpAddr::V6(s), IpAddr::V6(d)) => netlink_find_pid(
+            libc::AF_INET6 as u8,
+            ipproto,
+            &s.octets(),
+            src.port(),
+            &d.octets(),
+            dst.port(),
+        ),
         // IPv4-mapped IPv6 → try both families
         (IpAddr::V6(s), IpAddr::V4(d)) => {
             if let Some(s4) = s.to_ipv4_mapped() {
-                netlink_find_pid(libc::AF_INET as u8, ipproto, &s4.octets(), src.port(), &d.octets(), dst.port())
+                netlink_find_pid(
+                    libc::AF_INET as u8,
+                    ipproto,
+                    &s4.octets(),
+                    src.port(),
+                    &d.octets(),
+                    dst.port(),
+                )
             } else {
                 None
             }
@@ -94,9 +108,179 @@ fn linux_find_pid(protocol: TransportProtocol, src: SocketAddr, dst: SocketAddr)
     }
 }
 
+// ── Reusable netlink socket pool ─────────────────────────────────────────────
+//
+// Creating and destroying a netlink socket for every flow lookup dominates the
+// lookup cost under high connection churn.  We keep a small pool of persistent
+// NETLINK_INET_DIAG sockets and return them after each request/response pair.
+// The pool is protected by a short-duration mutex only around acquire/release;
+// actual send/recv happens while the socket is owned exclusively by one caller.
+//
+// If the pool is empty or socket creation fails, callers fall back to a
+// one-shot socket so correctness is never sacrificed.
+
+#[cfg(target_os = "linux")]
+mod netlink {
+    use std::os::fd::RawFd;
+    use std::sync::{Mutex, OnceLock};
+
+    /// A single NETLINK_INET_DIAG socket.
+    pub struct Socket {
+        fd: RawFd,
+    }
+
+    impl Socket {
+        pub fn new() -> Option<Self> {
+            let fd = unsafe {
+                libc::socket(
+                    libc::AF_NETLINK,
+                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                    libc::NETLINK_INET_DIAG,
+                )
+            };
+            if fd < 0 {
+                None
+            } else {
+                Some(Self { fd })
+            }
+        }
+
+        /// Build and send an inet_diag_req_v2 for the given 5-tuple, then read
+        /// and parse the response.  Returns `(uid, inode)` on success.
+        pub fn query_inode(
+            &self,
+            family: u8,
+            ipproto: u8,
+            src_ip: &[u8],
+            src_port: u16,
+            dst_ip: &[u8],
+            dst_port: u16,
+        ) -> Option<(u32, u64)> {
+            // struct inet_diag_req_v2 layout (total 56 bytes, see linux/inet_diag.h):
+            //   u8   sdiag_family
+            //   u8   sdiag_protocol
+            //   u8   idiag_ext
+            //   u8   pad
+            //   u32  idiag_states   (0xffffffff = all)
+            //   struct inet_diag_sockid (48 bytes):
+            //     be16 idiag_sport
+            //     be16 idiag_dport
+            //     u32  idiag_src[4]
+            //     u32  idiag_dst[4]
+            //     u32  idiag_if
+            //     u32  idiag_cookie[2]
+            const INET_DIAG_REQ_V2_LEN: usize = 56;
+            const NLMSG_HDR_LEN: usize = 16;
+            const TOTAL_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_REQ_V2_LEN;
+            const SOCK_DIAG_BY_FAMILY: u16 = 20;
+
+            let mut buf = [0u8; TOTAL_LEN];
+            let nlmsg_len = (TOTAL_LEN as u32).to_ne_bytes();
+            buf[0..4].copy_from_slice(&nlmsg_len);
+            buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+            buf[6..8].copy_from_slice(&(libc::NLM_F_REQUEST as u16).to_ne_bytes());
+
+            let req = &mut buf[NLMSG_HDR_LEN..];
+            req[0] = family;
+            req[1] = ipproto;
+            req[4..8].copy_from_slice(&0xffffffffu32.to_ne_bytes());
+
+            let sid = &mut req[8..];
+            sid[0..2].copy_from_slice(&src_port.to_be_bytes());
+            sid[2..4].copy_from_slice(&dst_port.to_be_bytes());
+
+            let ip_len = src_ip.len().min(16);
+            sid[4..4 + ip_len].copy_from_slice(&src_ip[..ip_len]);
+            let ip_len = dst_ip.len().min(16);
+            sid[20..20 + ip_len].copy_from_slice(&dst_ip[..ip_len]);
+
+            // SAFETY: `self.fd` is a valid netlink socket; `buf` is initialized
+            // and only read by `send`.  No other thread uses this fd while the
+            // socket is checked out of the pool.
+            let sent =
+                unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
+            if sent < 0 {
+                return None;
+            }
+
+            // Response nlmsghdr + inet_diag_msg (minimum 72 bytes total)
+            const INET_DIAG_MSG_LEN: usize = 56;
+            const RESP_BUF_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_MSG_LEN;
+
+            let mut resp = [0u8; 512];
+            let rcvd = unsafe {
+                libc::recv(
+                    self.fd,
+                    resp.as_mut_ptr() as *mut libc::c_void,
+                    resp.len(),
+                    0,
+                )
+            };
+            if rcvd < RESP_BUF_LEN as isize {
+                return None;
+            }
+
+            let nlmsg_type = u16::from_ne_bytes([resp[4], resp[5]]);
+            if nlmsg_type == 2 {
+                return None; // NLMSG_ERROR
+            }
+
+            let msg = &resp[NLMSG_HDR_LEN..];
+            let uid = u32::from_ne_bytes([msg[48], msg[49], msg[50], msg[51]]);
+            let inode = u32::from_ne_bytes([msg[52], msg[53], msg[54], msg[55]]);
+
+            if inode == 0 {
+                return None;
+            }
+            Some((uid, inode as u64))
+        }
+    }
+
+    impl Drop for Socket {
+        fn drop(&mut self) {
+            // SAFETY: `self.fd` was created by `socket()` and is no longer shared.
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    pub struct Pool {
+        sockets: Vec<Socket>,
+    }
+
+    impl Pool {
+        pub fn global() -> &'static Mutex<Pool> {
+            static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
+            POOL.get_or_init(|| {
+                let target = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    .clamp(2, 8);
+                let mut sockets = Vec::with_capacity(target);
+                for _ in 0..target {
+                    if let Some(s) = Socket::new() {
+                        sockets.push(s);
+                    }
+                }
+                Mutex::new(Pool { sockets })
+            })
+        }
+
+        pub fn acquire(&mut self) -> Option<Socket> {
+            self.sockets.pop()
+        }
+
+        pub fn release(&mut self, socket: Socket) {
+            self.sockets.push(socket);
+        }
+    }
+}
+
 /// Send an NETLINK_INET_DIAG request and parse the response to obtain
-/// (uid, inode) for the socket matching the given 5-tuple.
-/// Then walk /proc to find the PID that owns that inode.
+/// (uid, inode) for the socket matching the given 5-tuple, then resolve the
+/// inode to a PID.  Uses the reusable netlink socket pool and a sharded
+/// inode→PID cache to avoid repeated /proc walks.
 #[cfg(target_os = "linux")]
 fn netlink_find_pid(
     family: u8,
@@ -106,162 +290,76 @@ fn netlink_find_pid(
     dst_ip: &[u8],
     dst_port: u16,
 ) -> Option<u32> {
-    // ── Build the netlink request ────────────────────────────────────────────
-    // struct inet_diag_req_v2 layout (total 56 bytes, see linux/inet_diag.h):
-    //   u8   sdiag_family
-    //   u8   sdiag_protocol
-    //   u8   idiag_ext
-    //   u8   pad
-    //   u32  idiag_states   (0xffffffff = all)
-    //   struct inet_diag_sockid (48 bytes):
-    //     be16 idiag_sport
-    //     be16 idiag_dport
-    //     u32  idiag_src[4]
-    //     u32  idiag_dst[4]
-    //     u32  idiag_if
-    //     u32  idiag_cookie[2]
-    const INET_DIAG_REQ_V2_LEN: usize = 56;
-    const NLMSG_HDR_LEN: usize = 16; // struct nlmsghdr
-    const TOTAL_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_REQ_V2_LEN;
-    const SOCK_DIAG_BY_FAMILY: u16 = 20; // SOCK_DIAG_BY_FAMILY
+    let (uid, inode) = {
+        let mut from_pool = false;
+        let socket = if let Ok(mut pool) = netlink::Pool::global().lock() {
+            if let Some(socket) = pool.acquire() {
+                from_pool = true;
+                socket
+            } else {
+                netlink::Socket::new()?
+            }
+        } else {
+            netlink::Socket::new()?
+        };
 
-    let mut buf = [0u8; TOTAL_LEN];
+        let result = socket.query_inode(family, ipproto, src_ip, src_port, dst_ip, dst_port);
 
-    // nlmsghdr: len, type, flags, seq, pid
-    let nlmsg_len = (TOTAL_LEN as u32).to_ne_bytes();
-    buf[0..4].copy_from_slice(&nlmsg_len);
-    buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-    buf[6..8].copy_from_slice(&(libc::NLM_F_REQUEST as u16).to_ne_bytes());
-    // seq=1, pid=0
+        // Return the socket to the pool if it came from there.
+        if from_pool {
+            if let Ok(mut pool) = netlink::Pool::global().lock() {
+                pool.release(socket);
+            }
+        }
 
-    // inet_diag_req_v2
-    let req = &mut buf[NLMSG_HDR_LEN..];
-    req[0] = family;
-    req[1] = ipproto;
-    // idiag_ext = 0, pad = 0
-    req[4..8].copy_from_slice(&0xffffffffu32.to_ne_bytes()); // idiag_states
-
-    // idiag_sockid starts at offset 8 within req
-    let sid = &mut req[8..];
-    sid[0..2].copy_from_slice(&src_port.to_be_bytes());
-    sid[2..4].copy_from_slice(&dst_port.to_be_bytes());
-
-    // src addr: always stored as 16 bytes (for IPv4, left-pad to 4 bytes, rest zero)
-    let ip_len = src_ip.len().min(16);
-    sid[4..4 + ip_len].copy_from_slice(&src_ip[..ip_len]);
-    let ip_len = dst_ip.len().min(16);
-    sid[20..20 + ip_len].copy_from_slice(&dst_ip[..ip_len]);
-    // idiag_if = 0, idiag_cookie = INET_DIAG_NOCOOKIE
-
-    // ── Open netlink socket and send ─────────────────────────────────────────
-    // SAFETY: `libc::socket()` is a FFI call that returns a raw file descriptor.
-    // All arguments are valid constants; `SOCK_CLOEXEC` is safe and prevents fd leaks.
-    // The return value is checked (< 0) to detect errors before any use.
-    let fd = unsafe {
-        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_INET_DIAG)
+        result?
     };
-    if fd < 0 {
-        return None;
-    }
-    struct SocketGuard(libc::c_int);
-    impl Drop for SocketGuard {
-        // SAFETY: `self.0` is a valid file descriptor from `libc::socket()` above.
-        // `SocketGuard` is not `Clone`, ensuring `close()` is called exactly once.
-        // No other code holds a reference to this fd at drop time.
-        fn drop(&mut self) { unsafe { libc::close(self.0); } }
-    }
-    let _guard = SocketGuard(fd);
 
-    // SAFETY: `fd` is a valid netlink socket. `buf.as_ptr()` points to a valid,
-    // initialized buffer of `buf.len()` bytes. `libc::send()` only reads from the
-    // buffer; no concurrent writes occur. Return value is checked for errors.
-    let sent = unsafe {
-        libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0)
-    };
-    if sent < 0 {
-        return None;
-    }
+    linux_pid_from_inode(inode, uid)
+}
 
-    // ── Read response ────────────────────────────────────────────────────────
-    // Response nlmsghdr + inet_diag_msg (minimum 72 bytes total)
-    // struct inet_diag_msg layout (56 bytes):
-    //   u8  idiag_family
-    //   u8  idiag_state
-    //   u8  idiag_timer
-    //   u8  idiag_retrans
-    //   struct inet_diag_sockid  (48 bytes, same as above)
-    //   u32 idiag_expires
-    //   u32 idiag_rqueue
-    //   u32 idiag_wqueue
-    //   u32 idiag_uid
-    //   u32 idiag_inode
-    const INET_DIAG_MSG_LEN: usize = 56;
-    const RESP_BUF_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_MSG_LEN;
+/// (inode, uid) → (pid, recorded_at) cache backed by a sharded concurrent map.
+/// Multiple flows from the same socket hit this cache, eliminating repeated
+/// /proc scans.  Entries are TTL-validated against `/proc/<pid>` existence.
+#[cfg(target_os = "linux")]
+static INODE_PID_CACHE: OnceLock<dashmap::DashMap<(u64, u32), (u32, Instant)>> = OnceLock::new();
 
-    let mut resp = [0u8; 512];
-    // SAFETY: `fd` is a valid netlink socket. `resp.as_mut_ptr()` points to a valid,
-    // properly aligned buffer of `resp.len()` bytes. `libc::recv()` writes into this
-    // buffer; no other thread reads from `resp` concurrently. Return value is checked.
-    let rcvd = unsafe {
-        libc::recv(fd, resp.as_mut_ptr() as *mut libc::c_void, resp.len(), 0)
-    };
-    if rcvd < RESP_BUF_LEN as isize {
-        return None;
-    }
-
-    let msg = &resp[NLMSG_HDR_LEN..];
-    // Check for NLMSG_ERROR (type 2)
-    let nlmsg_type = u16::from_ne_bytes([resp[4], resp[5]]);
-    if nlmsg_type == 2 {
-        return None; // NLMSG_ERROR
-    }
-
-    let uid = u32::from_ne_bytes([msg[48], msg[49], msg[50], msg[51]]);
-    let inode = u32::from_ne_bytes([msg[52], msg[53], msg[54], msg[55]]);
-
-    if inode == 0 {
-        return None;
-    }
-
-    linux_pid_from_inode(inode as u64, uid)
+#[cfg(target_os = "linux")]
+fn inode_pid_cache() -> &'static dashmap::DashMap<(u64, u32), (u32, Instant)> {
+    INODE_PID_CACHE.get_or_init(dashmap::DashMap::new)
 }
 
 /// Walk /proc/<pid>/fd/ to find which process owns the given socket inode.
 /// Pre-filters by UID to avoid stat-ing every FD of every process.
-///
-/// Results are cached in a module-level static for `INODE_PID_CACHE_TTL`.
-/// Multiple connections from the same process hit the cache for the inode →
-/// pid mapping, avoiding repeated /proc walks.
 #[cfg(target_os = "linux")]
 fn linux_pid_from_inode(inode: u64, uid: u32) -> Option<u32> {
-    use std::sync::{Mutex, OnceLock};
-
-    /// (inode, uid) → (pid, recorded_at)
-    type InodePidCache = std::collections::HashMap<(u64, u32), (u32, Instant)>;
-    static CACHE: OnceLock<Mutex<InodePidCache>> = OnceLock::new();
     const CACHE_TTL: Duration = Duration::from_secs(5);
-
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let cache = inode_pid_cache();
 
     // Fast path: check cache.
-    if let Ok(guard) = cache.lock() {
-        if let Some(&(pid, recorded_at)) = guard.get(&(inode, uid)) {
-            if recorded_at.elapsed() < CACHE_TTL {
-                // Verify the pid is still alive (cheap stat check).
-                if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-                    return Some(pid);
-                }
-            }
+    if let Some(entry) = cache.get(&(inode, uid)) {
+        let (pid, recorded_at) = *entry.value();
+        if recorded_at.elapsed() < CACHE_TTL
+            && std::path::Path::new(&format!("/proc/{}", pid)).exists()
+        {
+            return Some(pid);
         }
     }
 
-    // Slow path: walk /proc.
-    let pid = linux_pid_from_inode_slow(inode, uid)?;
-
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert((inode, uid), (pid, Instant::now()));
+    // Slow path: walk /proc.  Re-check the cache after acquiring the inode
+    // from netlink but before scanning, because another thread may have just
+    // resolved the same inode.
+    if let Some(entry) = cache.get(&(inode, uid)) {
+        let (pid, recorded_at) = *entry.value();
+        if recorded_at.elapsed() < CACHE_TTL
+            && std::path::Path::new(&format!("/proc/{}", pid)).exists()
+        {
+            return Some(pid);
+        }
     }
 
+    let pid = linux_pid_from_inode_slow(inode, uid)?;
+    cache.insert((inode, uid), (pid, Instant::now()));
     Some(pid)
 }
 
@@ -280,8 +378,6 @@ fn linux_pid_from_inode_slow(inode: u64, uid: u32) -> Option<u32> {
         };
 
         // Quick UID pre-filter: check /proc/<pid>/status for Uid: line.
-        // Skip processes whose real UID doesn't match to avoid unnecessary
-        // fd enumeration (same optimisation as mihomo).
         if !linux_pid_uid_matches(pid, uid) {
             continue;
         }
@@ -479,9 +575,7 @@ impl HeapBuffer {
         // SAFETY: `GetProcessHeap()` returns the default process heap, which is always
         // available. `HeapAlloc` with `HEAP_ZERO_MEMORY` zero-initializes the buffer.
         // The returned pointer is checked for null to detect allocation failure.
-        let heap = unsafe {
-            windows::Win32::System::Memory::GetProcessHeap().unwrap()
-        };
+        let heap = unsafe { windows::Win32::System::Memory::GetProcessHeap().unwrap() };
         let ptr = unsafe {
             windows::Win32::System::Memory::HeapAlloc(
                 heap,
@@ -520,9 +614,7 @@ impl Drop for HeapBuffer {
         // because no other thread is concurrently freeing this same pointer (each
         // `HeapBuffer` owns a unique allocation). The process heap remains valid for
         // the entire lifetime of the process.
-        let heap = unsafe {
-            windows::Win32::System::Memory::GetProcessHeap().unwrap()
-        };
+        let heap = unsafe { windows::Win32::System::Memory::GetProcessHeap().unwrap() };
         let _ = unsafe {
             windows::Win32::System::Memory::HeapFree(
                 heap,
@@ -584,15 +676,11 @@ fn windows_find_pid(protocol: TransportProtocol, src: SocketAddr, _dst: SocketAd
         (TransportProtocol::Tcp, IpAddr::V4(src_v4)) => {
             windows_tcp_pid_v4(src_v4, src.port(), _dst)
         }
-        (TransportProtocol::Udp, IpAddr::V4(src_v4)) => {
-            windows_udp_pid_v4(src_v4, src.port())
-        }
+        (TransportProtocol::Udp, IpAddr::V4(src_v4)) => windows_udp_pid_v4(src_v4, src.port()),
         (TransportProtocol::Tcp, IpAddr::V6(src_v6)) => {
             windows_tcp_pid_v6(src_v6, src.port(), _dst)
         }
-        (TransportProtocol::Udp, IpAddr::V6(src_v6)) => {
-            windows_udp_pid_v6(src_v6, src.port())
-        }
+        (TransportProtocol::Udp, IpAddr::V6(src_v6)) => windows_udp_pid_v6(src_v6, src.port()),
     }
 }
 
@@ -612,11 +700,7 @@ fn win_ipv4(dw: u32) -> std::net::Ipv4Addr {
 }
 
 #[cfg(windows)]
-fn windows_tcp_pid_v4(
-    src_ip: std::net::Ipv4Addr,
-    src_port: u16,
-    dst: SocketAddr,
-) -> Option<u32> {
+fn windows_tcp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16, dst: SocketAddr) -> Option<u32> {
     // MIB_TCPROW_OWNER_PID layout (24 bytes):
     //   u32 dwState, u32 dwLocalAddr, u32 dwLocalPort,
     //   u32 dwRemoteAddr, u32 dwRemotePort, u32 dwOwningPid
@@ -717,9 +801,7 @@ fn windows_tcp_pid_v4(
             let dw = std::ptr::read_unaligned(ptr.add(16) as *const u32);
             win_port(dw)
         };
-        let pid = unsafe {
-            std::ptr::read_unaligned(ptr.add(20) as *const u32)
-        };
+        let pid = unsafe { std::ptr::read_unaligned(ptr.add(20) as *const u32) };
 
         if local_addr == src_ip
             && local_port == src_port
@@ -812,9 +894,7 @@ fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> 
             let dw = std::ptr::read_unaligned(ptr.add(4) as *const u32);
             win_port(dw)
         };
-        let pid = unsafe {
-            std::ptr::read_unaligned(ptr.add(8) as *const u32)
-        };
+        let pid = unsafe { std::ptr::read_unaligned(ptr.add(8) as *const u32) };
 
         if local_addr == src_ip && local_port == src_port {
             return Some(pid);
@@ -836,11 +916,7 @@ fn windows_udp_pid_v4(src_ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> 
 ///   dwState         u32 – connection state (ignored)
 ///   dwOwningPid     u32 – owning process ID
 #[cfg(windows)]
-fn windows_tcp_pid_v6(
-    src_ip: std::net::Ipv6Addr,
-    src_port: u16,
-    dst: SocketAddr,
-) -> Option<u32> {
+fn windows_tcp_pid_v6(src_ip: std::net::Ipv6Addr, src_port: u16, dst: SocketAddr) -> Option<u32> {
     const ROW_SIZE: usize = 56;
     const AF_INET6: u32 = 23;
     const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
@@ -930,9 +1006,7 @@ fn windows_tcp_pid_v6(
             let dw = std::ptr::read_unaligned(ptr.add(44) as *const u32);
             win_port(dw)
         };
-        let pid = unsafe {
-            std::ptr::read_unaligned(ptr.add(52) as *const u32)
-        };
+        let pid = unsafe { std::ptr::read_unaligned(ptr.add(52) as *const u32) };
 
         if local_addr == src_octets
             && local_port == src_port
@@ -1030,9 +1104,7 @@ fn windows_udp_pid_v6(src_ip: std::net::Ipv6Addr, src_port: u16) -> Option<u32> 
             let dw = std::ptr::read_unaligned(ptr.add(20) as *const u32);
             win_port(dw)
         };
-        let pid = unsafe {
-            std::ptr::read_unaligned(ptr.add(24) as *const u32)
-        };
+        let pid = unsafe { std::ptr::read_unaligned(ptr.add(24) as *const u32) };
 
         if local_addr == src_octets && local_port == src_port {
             return Some(pid);
@@ -1087,7 +1159,11 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     };
 
     let name = name.trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Windows: resolve process name from PID using `OpenProcess` +
@@ -1098,8 +1174,8 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     // SAFETY: `OpenProcess` is a FFI call with valid parameters.
@@ -1108,9 +1184,7 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     // to ensure it is closed on all paths. A null handle (failure) is handled by
     // `ProcessHandle::drop` which checks `is_invalid()`.
     let handle = unsafe {
-        ProcessHandle::new(
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap(),
-        )
+        ProcessHandle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap())
     };
     if handle.as_raw().is_invalid() {
         return None;
@@ -1138,7 +1212,11 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     };
 
     let name = name.trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
     // ProcessHandle::drop 自动调用 CloseHandle
 }
 
@@ -1162,4 +1240,3 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
         Some(name.to_string())
     }
 }
-

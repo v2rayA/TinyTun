@@ -33,7 +33,10 @@ pub struct Socks5Client {
 
 impl Socks5Client {
     pub fn new(config: ProxyConfig, outbound_interface: Option<String>) -> Self {
-        Self { config, outbound_interface }
+        Self {
+            config,
+            outbound_interface,
+        }
     }
 
     /// Return a `socks5h://[user:pass@]host:port` URL for use with HTTP clients
@@ -98,8 +101,9 @@ impl Socks5Client {
                 TcpSocket::new_v4()?
             };
             let fd = socket.as_raw_fd();
-            let iface_c = std::ffi::CString::new(iface.as_str())
-                .map_err(|_| TinyTunError::Socks5("outbound interface name contains null byte".to_string()))?;
+            let iface_c = std::ffi::CString::new(iface.as_str()).map_err(|_| {
+                TinyTunError::Socks5("outbound interface name contains null byte".to_string())
+            })?;
             // SAFETY: `fd` is a valid raw file descriptor obtained from `socket.as_raw_fd()`.
             // `iface_c.as_ptr()` is a valid, NUL-terminated C string pointer.
             // `to_bytes_with_nul().len()` gives the correct buffer size including the NUL terminator.
@@ -128,7 +132,10 @@ impl Socks5Client {
     }
 
     pub async fn connect(&self, target_addr: SocketAddr) -> Result<TcpStream> {
-        debug!("Connecting to SOCKS5 proxy {}: target {}", self.config.address, target_addr);
+        debug!(
+            "Connecting to SOCKS5 proxy {}: target {}",
+            self.config.address, target_addr
+        );
 
         let mut stream = self.open_tcp_to_proxy().await?;
         stream.set_nodelay(true)?;
@@ -142,8 +149,7 @@ impl Socks5Client {
     pub async fn open_udp_session(&self, target_hint: SocketAddr) -> Result<Socks5UdpSession> {
         debug!(
             "Opening SOCKS5 UDP ASSOCIATE session (proxy={}, target family={})",
-            self.config.address,
-            target_hint
+            self.config.address, target_hint
         );
 
         let mut control = self.open_tcp_to_proxy().await?;
@@ -151,7 +157,11 @@ impl Socks5Client {
         self.perform_handshake(&mut control).await?;
 
         let relay_addr = self.udp_associate(&mut control).await?;
-        let bind_addr = if relay_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind_addr = if relay_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let udp_socket = Arc::new(UdpSocket::bind(bind_addr).await?);
 
         Ok(Socks5UdpSession {
@@ -178,8 +188,9 @@ impl Socks5Client {
         drop(greeting); // free
 
         let mut method_resp = [0u8; 2];
-        stream.read_exact(&mut method_resp).await
-            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 method selection: {}", e)))?;
+        stream.read_exact(&mut method_resp).await.map_err(|e| {
+            TinyTunError::Socks5(format!("Failed to read SOCKS5 method selection: {}", e))
+        })?;
 
         if method_resp[0] != 0x05 {
             return Err(TinyTunError::Socks5(format!(
@@ -190,7 +201,7 @@ impl Socks5Client {
 
         match method_resp[1] {
             0xFF => Err(TinyTunError::Socks5(
-                "SOCKS5 server rejected all offered authentication methods".to_string()
+                "SOCKS5 server rejected all offered authentication methods".to_string(),
             )),
             0x02 => self.authenticate(stream).await,
             0x00 => Ok(()),
@@ -203,13 +214,21 @@ impl Socks5Client {
 
     /// Perform SOCKS5 username/password sub-negotiation (RFC 1929).
     async fn authenticate(&self, stream: &mut TcpStream) -> Result<()> {
-        let username = self.config.username.as_deref()
-            .ok_or_else(|| TinyTunError::Socks5("Proxy selected username/password auth but no username configured".to_string()))?;
-        let password = self.config.password.as_deref()
-            .ok_or_else(|| TinyTunError::Socks5("Proxy selected username/password auth but no password configured".to_string()))?;
+        let username = self.config.username.as_deref().ok_or_else(|| {
+            TinyTunError::Socks5(
+                "Proxy selected username/password auth but no username configured".to_string(),
+            )
+        })?;
+        let password = self.config.password.as_deref().ok_or_else(|| {
+            TinyTunError::Socks5(
+                "Proxy selected username/password auth but no password configured".to_string(),
+            )
+        })?;
 
         if username.len() > 255 || password.len() > 255 {
-            return Err(TinyTunError::Socks5("SOCKS5 username or password exceeds 255 bytes".to_string()));
+            return Err(TinyTunError::Socks5(
+                "SOCKS5 username or password exceeds 255 bytes".to_string(),
+            ));
         }
 
         // Build auth sub-negotiation request in one buffer.
@@ -223,8 +242,9 @@ impl Socks5Client {
         stream.write_all(&req).await?;
 
         let mut resp = [0u8; 2];
-        stream.read_exact(&mut resp).await
-            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 auth response: {}", e)))?;
+        stream.read_exact(&mut resp).await.map_err(|e| {
+            TinyTunError::Socks5(format!("Failed to read SOCKS5 auth response: {}", e))
+        })?;
 
         if resp[1] != 0x00 {
             return Err(TinyTunError::Socks5(format!(
@@ -237,7 +257,11 @@ impl Socks5Client {
     }
 
     /// Send a SOCKS5 CONNECT request and read the server reply.
-    async fn connect_to_target(&self, stream: &mut TcpStream, target_addr: SocketAddr) -> Result<()> {
+    async fn connect_to_target(
+        &self,
+        stream: &mut TcpStream,
+        target_addr: SocketAddr,
+    ) -> Result<()> {
         // Build the full CONNECT request in one buffer to avoid extra RTTs.
         let mut request = Vec::with_capacity(22);
         request.extend_from_slice(&[
@@ -261,8 +285,9 @@ impl Socks5Client {
 
         // Read the fixed 4-byte reply header.
         let mut head = [0u8; 4];
-        stream.read_exact(&mut head).await
-            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 CONNECT reply header: {}", e)))?;
+        stream.read_exact(&mut head).await.map_err(|e| {
+            TinyTunError::Socks5(format!("Failed to read SOCKS5 CONNECT reply header: {}", e))
+        })?;
 
         if head[0] != 0x05 {
             return Err(TinyTunError::Socks5(format!(
@@ -298,21 +323,28 @@ impl Socks5Client {
         match atyp {
             0x01 => {
                 let mut buf = [0u8; 6]; // 4-byte IPv4 + 2-byte port
-                stream.read_exact(&mut buf).await
-                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound IPv4 address: {}", e)))?;
+                stream.read_exact(&mut buf).await.map_err(|e| {
+                    TinyTunError::Socks5(format!("Failed to read SOCKS5 bound IPv4 address: {}", e))
+                })?;
             }
             0x04 => {
                 let mut buf = [0u8; 18]; // 16-byte IPv6 + 2-byte port
-                stream.read_exact(&mut buf).await
-                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound IPv6 address: {}", e)))?;
+                stream.read_exact(&mut buf).await.map_err(|e| {
+                    TinyTunError::Socks5(format!("Failed to read SOCKS5 bound IPv6 address: {}", e))
+                })?;
             }
             0x03 => {
                 let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await
-                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound domain length: {}", e)))?;
+                stream.read_exact(&mut len).await.map_err(|e| {
+                    TinyTunError::Socks5(format!(
+                        "Failed to read SOCKS5 bound domain length: {}",
+                        e
+                    ))
+                })?;
                 let mut buf = vec![0u8; len[0] as usize + 2]; // domain + 2-byte port
-                stream.read_exact(&mut buf).await
-                    .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 bound domain: {}", e)))?;
+                stream.read_exact(&mut buf).await.map_err(|e| {
+                    TinyTunError::Socks5(format!("Failed to read SOCKS5 bound domain: {}", e))
+                })?;
             }
             other => {
                 return Err(TinyTunError::Socks5(format!(
@@ -335,8 +367,12 @@ impl Socks5Client {
         stream.write_all(&request).await?;
 
         let mut head = [0u8; 4];
-        stream.read_exact(&mut head).await
-            .map_err(|e| TinyTunError::Socks5(format!("Failed to read SOCKS5 UDP ASSOCIATE reply header: {}", e)))?;
+        stream.read_exact(&mut head).await.map_err(|e| {
+            TinyTunError::Socks5(format!(
+                "Failed to read SOCKS5 UDP ASSOCIATE reply header: {}",
+                e
+            ))
+        })?;
 
         if head[0] != 0x05 {
             return Err(TinyTunError::Socks5(format!(
@@ -381,12 +417,18 @@ impl Socks5Client {
                 stream.read_exact(&mut len).await?;
                 let mut domain = vec![0u8; len[0] as usize];
                 stream.read_exact(&mut domain).await?;
-                let text = String::from_utf8(domain)
-                    .map_err(|_| TinyTunError::Socks5("SOCKS5 relay address contained invalid UTF-8".to_string()))?;
+                let text = String::from_utf8(domain).map_err(|_| {
+                    TinyTunError::Socks5("SOCKS5 relay address contained invalid UTF-8".to_string())
+                })?;
                 let resolved = tokio::net::lookup_host((text.as_str(), 0))
                     .await?
                     .next()
-                    .ok_or_else(|| TinyTunError::Socks5(format!("Failed to resolve SOCKS5 relay domain '{}'", text)))?
+                    .ok_or_else(|| {
+                        TinyTunError::Socks5(format!(
+                            "Failed to resolve SOCKS5 relay domain '{}'",
+                            text
+                        ))
+                    })?
                     .ip();
                 resolved
             }
@@ -402,10 +444,24 @@ impl Socks5Client {
         stream.read_exact(&mut port).await?;
         Ok(SocketAddr::new(addr, u16::from_be_bytes(port)))
     }
+}
 
+/// A SOCKS5 UDP relay frame, usually stack-allocated for MTU-sized payloads.
+pub(crate) type UdpRequestFrame = smallvec::SmallVec<[u8; 1500]>;
+
+impl Socks5Client {
     /// Build a SOCKS5 UDP relay datagram: RSV(2) + FRAG(1) + address + payload.
-    pub(crate) fn build_udp_request(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
-        let mut request = vec![0x00, 0x00, 0x00]; // RSV(2), FRAG(1)
+    ///
+    /// Uses a `SmallVec<[u8; 1500]>` so common MTU-sized payloads avoid a heap
+    /// allocation.  The header is at most 22 bytes (IPv6 + port), so the inline
+    /// 1500-byte buffer covers the vast majority of real-world datagrams.
+    pub(crate) fn build_udp_request(target_addr: SocketAddr, payload: &[u8]) -> UdpRequestFrame {
+        let header_len = 3 + match target_addr {
+            SocketAddr::V4(_) => 1 + 4 + 2,
+            SocketAddr::V6(_) => 1 + 16 + 2,
+        };
+        let mut request = smallvec::SmallVec::with_capacity(header_len + payload.len());
+        request.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV(2), FRAG(1)
         match target_addr {
             SocketAddr::V4(v4) => {
                 request.push(0x01);
@@ -442,15 +498,24 @@ impl Socks5Client {
         let addr = match atyp {
             0x01 => {
                 if packet.len() < pos + 4 {
-                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in IPv4 address field".to_string()));
+                    return Err(TinyTunError::Socks5(
+                        "SOCKS5 UDP datagram truncated in IPv4 address field".to_string(),
+                    ));
                 }
-                let ip = Ipv4Addr::new(packet[pos], packet[pos + 1], packet[pos + 2], packet[pos + 3]);
+                let ip = Ipv4Addr::new(
+                    packet[pos],
+                    packet[pos + 1],
+                    packet[pos + 2],
+                    packet[pos + 3],
+                );
                 pos += 4;
                 IpAddr::V4(ip)
             }
             0x04 => {
                 if packet.len() < pos + 16 {
-                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in IPv6 address field".to_string()));
+                    return Err(TinyTunError::Socks5(
+                        "SOCKS5 UDP datagram truncated in IPv6 address field".to_string(),
+                    ));
                 }
                 let mut raw = [0u8; 16];
                 raw.copy_from_slice(&packet[pos..pos + 16]);
@@ -459,19 +524,31 @@ impl Socks5Client {
             }
             0x03 => {
                 if packet.len() < pos + 1 {
-                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in domain length field".to_string()));
+                    return Err(TinyTunError::Socks5(
+                        "SOCKS5 UDP datagram truncated in domain length field".to_string(),
+                    ));
                 }
                 let len = packet[pos] as usize;
                 pos += 1;
                 if packet.len() < pos + len {
-                    return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in domain field".to_string()));
+                    return Err(TinyTunError::Socks5(
+                        "SOCKS5 UDP datagram truncated in domain field".to_string(),
+                    ));
                 }
-                let domain = String::from_utf8(packet[pos..pos + len].to_vec())
-                    .map_err(|_| TinyTunError::Socks5("SOCKS5 UDP datagram domain contained invalid UTF-8".to_string()))?;
+                let domain = String::from_utf8(packet[pos..pos + len].to_vec()).map_err(|_| {
+                    TinyTunError::Socks5(
+                        "SOCKS5 UDP datagram domain contained invalid UTF-8".to_string(),
+                    )
+                })?;
                 pos += len;
                 std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), 0))?
                     .next()
-                    .ok_or_else(|| TinyTunError::Socks5(format!("Failed to resolve SOCKS5 UDP domain '{}'", domain)))?
+                    .ok_or_else(|| {
+                        TinyTunError::Socks5(format!(
+                            "Failed to resolve SOCKS5 UDP domain '{}'",
+                            domain
+                        ))
+                    })?
                     .ip()
             }
             other => {
@@ -483,7 +560,9 @@ impl Socks5Client {
         };
 
         if packet.len() < pos + 2 {
-            return Err(TinyTunError::Socks5("SOCKS5 UDP datagram truncated in port field".to_string()));
+            return Err(TinyTunError::Socks5(
+                "SOCKS5 UDP datagram truncated in port field".to_string(),
+            ));
         }
         let port = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
         pos += 2;
