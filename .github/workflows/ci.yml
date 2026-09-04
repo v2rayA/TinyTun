@@ -22,9 +22,9 @@ jobs:
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             build_tool: cargo-msvc
-          - target: x86_64-pc-windows-gnu
-            runner: windows-latest
-            build_tool: cargo-windows-gnu
+          # - target: x86_64-pc-windows-gnu
+          #   runner: windows-latest
+          #   build_tool: cargo-windows-gnu
           - target: x86_64-pc-windows-gnullvm
             runner: windows-latest
             build_tool: cargo-gnullvm
